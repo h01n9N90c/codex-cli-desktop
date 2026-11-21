@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Real-time, strictly read-only compatibility, health & behavioral security diagnostic for
     Codex Dual-Lane & Security Kit on Windows.

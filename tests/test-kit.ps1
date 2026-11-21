@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Comprehensive automated security, integrity, AST, and end-to-end smoke test suite for
     Codex Dual-Lane & Security Kit on Windows.
@@ -482,12 +482,91 @@ theme = "light"
         Assert-True ($sandboxAllow.Count -eq 0) "CodexSandboxUsers Allow ACE still present on $aclFile"
     }
 
+    # Verify -ReapplyAclOnly re-locks a simulated post-Codex inheritance reset without altering config content.
+    $cfg1Path = Join-Path $l1 'config.toml'
+    $cfg1PreReapplyHash = (Get-FileHash -LiteralPath $cfg1Path -Algorithm SHA256).Hash
+    $null = & icacls.exe $cfg1Path /inheritance:e 2>&1
+    $global:LASTEXITCODE = 0
+    Assert-True (-not [bool](Get-Acl -LiteralPath $cfg1Path).AreAccessRulesProtected) 'Simulated Codex atomic rewrite should have re-enabled NTFS inheritance'
+    $resReapply = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
+        '-Lane1Home', $l1, '-Lane2Home', $l2, '-LocalBin', $bin, '-ReapplyAclOnly'
+    )
+    Assert-True ($resReapply.ExitCode -eq 0) "-ReapplyAclOnly failed (exit=$($resReapply.ExitCode)):`n$($resReapply.Output)"
+    Assert-True ([bool](Get-Acl -LiteralPath $cfg1Path).AreAccessRulesProtected) '-ReapplyAclOnly did not re-lock NTFS inheritance on Lane1 config.toml'
+    Assert-True ((Get-FileHash -LiteralPath $cfg1Path -Algorithm SHA256).Hash -eq $cfg1PreReapplyHash) '-ReapplyAclOnly must not alter file contents'
+
+    # Verify worktree wrapper isolation handles root, nested subdirectories (including spaces/'&'/'(v1)'),
+    # non-matching sibling dirs, and explicit -C/--cd/--add-dir targeting primary repo.
+    $wtRepo  = Join-Path $tmpRoot 'Git Repo & (v1)'
+    $wtSub   = Join-Path $wtRepo  'src\nested & (sub)'
+    $wtSib   = Join-Path $tmpRoot 'Git Repo & (v1) sibling\inner'
+    $wtL1    = Join-Path $tmpRoot 'wt lane 1'
+    $wtL2    = Join-Path $tmpRoot 'wt lane 2'
+    $wtBin   = Join-Path $tmpRoot 'wt bin'
+    $wtCwdBat = Join-Path $tmpRoot 'fake-cwd-codex.cmd'
+    New-Item -ItemType Directory -Path $wtRepo, $wtSub, $wtSib, $wtL1, $wtL2, $wtBin -Force | Out-Null
+    [System.IO.File]::WriteAllText($wtCwdBat, ("@echo off`r`nif `"%~1`"==`"--version`" (echo codex-cli 0.171.0-test & exit /b 0)`r`nif `"%~1`"==`"features`" (echo memories stable true & exit /b 0)`r`necho WT_ACTIVE_CWD=`"%CD%`"`r`nexit /b 0`r`n"), [System.Text.Encoding]::ASCII)
+    git -C $wtRepo init -q
+    git -C $wtRepo config user.email 'ci@example.invalid'
+    git -C $wtRepo config user.name 'CI'
+    [System.IO.File]::WriteAllText((Join-Path $wtSub 'file.txt'), "init`n")
+    git -C $wtRepo add .
+    git -C $wtRepo commit -q -m 'init'
+    try {
+        $resWt = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
+            '-RepoPath', $wtRepo, '-CodexPath', $wtCwdBat,
+            '-Lane1Home', $wtL1, '-Lane2Home', $wtL2, '-LocalBin', $wtBin,
+            '-UseGitWorktree', '-SkipPathUpdate'
+        )
+        Assert-True ($resWt.ExitCode -eq 0) "Worktree setup failed (exit=$($resWt.ExitCode)):`n$($resWt.Output)"
+        $expectedWtRoot = "$wtRepo-lane2"
+        $expectedWtSub  = Join-Path $expectedWtRoot 'src\nested & (sub)'
+        Push-Location $wtSub
+        try {
+            $outSub = (& (Join-Path $wtBin 'codex.cmd') 'run' 2>&1) -join "`n"
+            Assert-True ($LASTEXITCODE -eq 0 -and $outSub.Contains("WT_ACTIVE_CWD=`"$expectedWtSub`"")) "Lane 2 wrapper failed to map subdirectory into worktree! Got: $outSub"
+            $outT3 = (& (Join-Path $wtBin 'codex-t3.cmd') 'run' 2>&1) -join "`n"
+            Assert-True ($LASTEXITCODE -eq 0 -and $outT3.Contains("WT_ACTIVE_CWD=`"$wtSub`"")) "Lane 1 wrapper should remain in primary repo subdir! Got: $outT3"
+        } finally { Pop-Location }
+        Push-Location $wtSib
+        try {
+            $outSib = (& (Join-Path $wtBin 'codex.cmd') 'run' 2>&1) -join "`n"
+            Assert-True ($LASTEXITCODE -eq 0 -and $outSib.Contains("WT_ACTIVE_CWD=`"$wtSib`"")) "Lane 2 wrapper falsely matched sibling directory! Got: $outSib"
+            # Block tests: codex.cmd must EXIT 1 when given -C/--cd/--add-dir targeting the primary repo.
+            # We temporarily set ErrorActionPreference = 'Continue' so PowerShell does NOT throw
+            # NativeCommandError on the non-zero exit code before we can inspect $LASTEXITCODE.
+            $prevEapBlk = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $outBlk1 = (& (Join-Path $wtBin 'codex.cmd') '-C' $wtRepo 'status' 2>&1) -join "`n"
+                $blk1Exit = $LASTEXITCODE
+                $outBlk2 = (& (Join-Path $wtBin 'codex.cmd') "--cd=$wtSub" 'status' 2>&1) -join "`n"
+                $blk2Exit = $LASTEXITCODE
+                $outBlk3 = (& (Join-Path $wtBin 'codex.cmd') '--add-dir' $wtRepo 'status' 2>&1) -join "`n"
+                $blk3Exit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prevEapBlk
+            }
+            Assert-True ($blk1Exit -ne 0) "Lane 2 wrapper MUST reject '-C <PrimaryRepo>' (exit=$blk1Exit)`n$outBlk1"
+            Assert-True ($blk2Exit -ne 0) "Lane 2 wrapper MUST reject '--cd=<PrimaryRepoSub>' (exit=$blk2Exit)`n$outBlk2"
+            Assert-True ($blk3Exit -ne 0) "Lane 2 wrapper MUST reject '--add-dir <PrimaryRepo>' (exit=$blk3Exit)`n$outBlk3"
+        } finally { Pop-Location }
+    } finally {
+        foreach ($d in @('memories','memories_v2','sessions','archived_sessions','skills','plugins')) {
+            $jp = Join-Path $wtL2 $d
+            if (Test-Path -LiteralPath $jp) {
+                try { [System.IO.Directory]::Delete($jp, $false) } catch {}
+            }
+        }
+        try { git -C $wtRepo worktree remove -f "$wtRepo-lane2" 2>$null } catch {}
+    }
+
     # Verify generated codex.cmd wrapper executes cleanly despite spaces and '&' in paths.
     $wrapperCmd = Join-Path $bin 'codex.cmd'
     Assert-True (Test-Path -LiteralPath $wrapperCmd -PathType Leaf) 'codex.cmd wrapper was not created'
     $wrapperOut = (& $wrapperCmd --version 2>&1) -join "`n"
     Assert-True ($LASTEXITCODE -eq 0 -and $wrapperOut -match 'codex-cli 0\.171\.0-test') "codex.cmd wrapper failed on path with spaces/'&': $wrapperOut"
-    Write-Host "    [OK] TOML merge, env_key secret purge, UTF-8 no-BOM, Protect-SensitiveFileAcl, and wrapper verified" -ForegroundColor Green
+    Write-Host "    [OK] TOML merge, env_key secret purge, UTF-8 no-BOM, Protect-SensitiveFileAcl, -ReapplyAclOnly, worktree subdir/-C isolation, and wrapper verified" -ForegroundColor Green
 
     # ========================================================================
     # TEST 6: doctor.ps1 Health Checks, Read-Only Advisory & Zero Secret Leakage

@@ -269,13 +269,21 @@ jobs:
           LOCAL_BIN="${WORK_DIR}/local bin"
           OUTSIDE_VICTIM="${TMP_ROOT}/outside_victim.txt"
 
-          mkdir -p "${REPO_DIR}" "${FAKE_BIN}" "${LANE1}/sessions" "${LANE2}" "${LOCAL_BIN}"
+          mkdir -p "${REPO_DIR}/src/sub dir" "${FAKE_BIN}" "${LANE1}/sessions" "${LANE2}" "${LOCAL_BIN}"
+          git -C "${REPO_DIR}" init -q
+          git -C "${REPO_DIR}" config user.email "ci@example.invalid"
+          git -C "${REPO_DIR}" config user.name "CI"
+          echo "repo-init" > "${REPO_DIR}/src/sub dir/app.txt"
+          git -C "${REPO_DIR}" add .
+          git -C "${REPO_DIR}" commit -q -m "init"
+
           echo '{"id":"s1"}' > "${LANE1}/sessions/keep.jsonl"
           SESSION_HASH="$(sha256_of "${LANE1}/sessions/keep.jsonl")"
           echo 'DO_NOT_DELETE' > "${OUTSIDE_VICTIM}"
           VICTIM_HASH="$(sha256_of "${OUTSIDE_VICTIM}")"
           printf '#!/usr/bin/env bash\necho PRE_EXISTING_UNIX_LAUNCHER\n' > "${LOCAL_BIN}/codex-t3"
-          chmod 700 "${LOCAL_BIN}/codex-t3"
+          # Deliberately use 755 (not 700) to verify rollback preserves exact pre-existing POSIX mode.
+          chmod 755 "${LOCAL_BIN}/codex-t3"
           ORIG_LAUNCHER_HASH="$(sha256_of "${LOCAL_BIN}/codex-t3")"
 
           cat > "${FAKE_BIN}/codex" <<'EOF'
@@ -283,6 +291,7 @@ jobs:
           if [ "${1:-}" = "--version" ]; then echo "codex-cli 0.171.0-ci"; exit 0; fi
           if [ "${1:-}" = "features" ]; then echo "memories stable true"; exit 0; fi
           if [ "${1:-}" = "execpolicy" ]; then echo '{"decision":"forbidden"}'; exit 0; fi
+          if [ "${1:-}" = "pwd-check" ]; then pwd -P; exit 0; fi
           exit 0
           EOF
           chmod +x "${FAKE_BIN}/codex"
@@ -293,6 +302,8 @@ jobs:
           [mcp_servers.custom_ci]
           command = "node"
           EOF
+          # Deliberately use 644 (not 600) to verify rollback restores exact original config.toml mode.
+          chmod 644 "${LANE2}/config.toml"
           ORIG_HASH="$(sha256_of "${LANE2}/config.toml")"
 
           SECRET_CANARY="sk-CANARY-UNIX-DOCTOR-NEVER-ECHO-991122"
@@ -304,17 +315,19 @@ jobs:
           CODEX_LANE1_HOME="${LANE1}" \
           CODEX_LANE2_HOME="${LANE2}" \
           CODEX_LOCAL_BIN="${LOCAL_BIN}" \
-          ./scripts/setup-dual-lane.sh --repo "${REPO_DIR}" --install-bridge --dry-run
+          ./scripts/setup-dual-lane.sh --repo "${REPO_DIR}" --use-git-worktree --install-bridge --dry-run
           [ "$(sha256_of "${LANE2}/config.toml")" = "${ORIG_HASH}" ]
           [ ! -e "${LOCAL_BIN}/codex" ]
           [ ! -L "${LANE2}/sessions" ]
+          [ ! -d "${REPO_DIR}-lane2" ]
 
-          # 2) Full install preserves top-level keys & custom sections, enforces 0600, creates manifest.
+          # 2) Full install with --use-git-worktree preserves top-level keys & custom sections,
+          #    enforces 0600 while live, creates 5-col manifest, and routes subdirs + blocks -C primary.
           PATH="${FAKE_BIN}:${PATH}" \
           CODEX_LANE1_HOME="${LANE1}" \
           CODEX_LANE2_HOME="${LANE2}" \
           CODEX_LOCAL_BIN="${LOCAL_BIN}" \
-          ./scripts/setup-dual-lane.sh --repo "${REPO_DIR}" --install-bridge
+          ./scripts/setup-dual-lane.sh --repo "${REPO_DIR}" --use-git-worktree --install-bridge
 
           grep -q 'approval_policy = "on-request"' "${LANE2}/config.toml"
           grep -q 'network_access = false' "${LANE2}/config.toml"
@@ -322,6 +335,19 @@ jobs:
           grep -q '\[mcp_servers\.custom_ci\]' "${LANE2}/config.toml"
           [ -f "${LANE2}/.rollback/latest.tsv" ]
           python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600' "${LANE2}/config.toml"
+
+          # Verify nested subdirectory switches to matching worktree subdirectory & -C/--cd/--add-dir fails closed.
+          WT_SUB_CWD="$(cd "${REPO_DIR}/src/sub dir" && "${LOCAL_BIN}/codex" pwd-check)"
+          case "${WT_SUB_CWD}" in
+            *-lane2/src/sub\ dir) ;;
+            *) echo "[FAIL] Expected worktree subdir, got ${WT_SUB_CWD}" >&2; exit 1 ;;
+          esac
+          if "${LOCAL_BIN}/codex" -C "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
+            echo "[FAIL] Unix wrapper failed to block -C targeting primary repo!" >&2; exit 1
+          fi
+          if "${LOCAL_BIN}/codex" --cd="${REPO_DIR}/src/sub dir" pwd-check >/dev/null 2>&1; then
+            echo "[FAIL] Unix wrapper failed to block --cd= targeting primary subdir!" >&2; exit 1
+          fi
 
           # 3) doctor.sh passes and never echoes auth secret canary.
           DOC_OUT="$(
@@ -337,9 +363,9 @@ jobs:
             exit 1
           fi
 
-          # 4) Adversarial path-traversal manifest must fail closed with zero side effects.
+          # 4) Adversarial manifests (path traversal AND invalid/SUID mode 4755) fail closed with zero side effects.
           BAD_SNAP="${TMP_ROOT}/bad-traversal.tsv"
-          printf '# schema=1\n0\t-\t%s/../outside_victim.txt\t-\n' "${LANE2}" > "${BAD_SNAP}"
+          printf '# schema=1\n0\t-\t%s/../outside_victim.txt\t-\t-\n' "${LANE2}" > "${BAD_SNAP}"
           set +e
           TRAV_ERR="$(
             CODEX_LANE1_HOME="${LANE1}" \
@@ -358,6 +384,14 @@ jobs:
           [ "$(sha256_of "${OUTSIDE_VICTIM}")" = "${VICTIM_HASH}" ]
           [ -L "${LANE2}/sessions" ]
 
+          BAD_MODE_SNAP="${TMP_ROOT}/bad-mode.tsv"
+          printf '# schema=1\n1\t%s\t%s/config.toml\t%s/config.toml\t4755\n' "${ORIG_HASH}" "${LANE2}" "${LANE2}" > "${BAD_MODE_SNAP}"
+          if CODEX_LANE1_HOME="${LANE1}" CODEX_LANE2_HOME="${LANE2}" CODEX_LOCAL_BIN="${LOCAL_BIN}" \
+             ./scripts/restore-original.sh --snapshot "${BAD_MODE_SNAP}" >/dev/null 2>&1; then
+            echo "[FAIL] restore-original.sh accepted SUID mode 4755 in manifest!" >&2
+            exit 1
+          fi
+
           # 5) restore-original.sh --dry-run must perform zero mutations.
           PRE_RESTORE_HASH="$(sha256_of "${LANE2}/config.toml")"
           CODEX_LANE1_HOME="${LANE1}" \
@@ -367,18 +401,20 @@ jobs:
           [ "$(sha256_of "${LANE2}/config.toml")" = "${PRE_RESTORE_HASH}" ]
           [ -L "${LANE2}/sessions" ]
 
-          # 6) Real deterministic SHA-256 rollback restores exact original config & keeps Lane 1 intact.
+          # 6) Real deterministic rollback restores exact SHA-256 AND exact pre-existing POSIX modes (0755 & 0644).
           CODEX_LANE1_HOME="${LANE1}" \
           CODEX_LANE2_HOME="${LANE2}" \
           CODEX_LOCAL_BIN="${LOCAL_BIN}" \
           ./scripts/restore-original.sh
           RESTORED_HASH="$(sha256_of "${LANE2}/config.toml")"
           [ "${ORIG_HASH}" = "${RESTORED_HASH}" ]
+          python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o644' "${LANE2}/config.toml"
           [ ! -L "${LANE2}/sessions" ]
           [ ! -e "${LOCAL_BIN}/codex" ]
           [ ! -e "${LOCAL_BIN}/codex-official" ]
           [ -x "${LOCAL_BIN}/codex-t3" ]
           [ "$(sha256_of "${LOCAL_BIN}/codex-t3")" = "${ORIG_LAUNCHER_HASH}" ]
+          python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o755' "${LOCAL_BIN}/codex-t3"
           [ -f "${LANE1}/sessions/keep.jsonl" ]
           [ "$(sha256_of "${LANE1}/sessions/keep.jsonl")" = "${SESSION_HASH}" ]
-          echo "[PASS] Unix smoke, traversal defense, and deterministic SHA-256 rollback passed!"
+          echo "[PASS] Unix smoke, worktree routing, traversal/mode defense, and exact SHA-256 + POSIX mode rollback passed!"

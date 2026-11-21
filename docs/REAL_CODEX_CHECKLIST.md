@@ -84,7 +84,8 @@ foreach ($f in @("$env:USERPROFILE\.codex\auth.json","$env:USERPROFILE\.codex\co
 }
 ```
 * **Kỳ vọng:** `CodexSandboxUsers Allow ACEs: 0` (và `doctor.ps1` báo `kernel_acl=locked`, đồng thời không báo nhầm trên Deny ACE bảo vệ nếu có).
-* **Lưu ý thực tế:** Sau khi chạy `codex features ...` hoặc sửa Settings trên Codex Desktop (ghi đè atomic lên `config.toml`), Windows có thể áp lại quyền kế thừa `CodexSandboxUsers:(OI)(CI)(RX)` từ thư mục cha. Chạy lại `doctor.ps1` sau mỗi lần đổi cấu hình trong Codex để kiểm chứng kịp thời.
+* **Lưu ý thực tế:** Khi `codex` CLI/Desktop chạy `codex features ...`, sửa Settings trên App, hoặc tạo mới `auth.json` bằng ghi đè atomic, Windows sẽ áp lại quyền kế thừa `CodexSandboxUsers:(OI)(CI)(RX)` từ thư mục cha (script bên ngoài không thể ngăn trước thao tác ghi của chính Codex). Hãy chạy `.\scripts\doctor.ps1` và nếu thấy `kernel_acl=EXPOSED`, chạy ngay `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -ReapplyAclOnly` (và giữ `env_key` + `cli_auth_credentials_store = "keyring"`).
+* **Ranh giới CI vs. Codex thật:** Bộ test trong `tests/test-kit.ps1` và GitHub Actions CI chạy trên mock CLI để kiểm tra logic/portable nhanh; hãy luôn chạy các lệnh ở Mục 1–4 trên máy bạn với chính binary Codex thật sau khi cài.
 
 **macOS / Linux / WSL (Bash):**
 ```bash

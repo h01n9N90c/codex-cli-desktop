@@ -177,6 +177,35 @@ escape_toml() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# Portably read standard POSIX owner/group/other octal permission bits (3 digits:
+# 000..777, stripping any special SUID/SGID/sticky leading digit) across GNU `stat -c %a`
+# and BSD/macOS `stat -f %Lp`. Returns empty string if unavailable.
+get_octal_mode() {
+  local path="$1"
+  local mode=""
+  if mode="$(stat -c '%a' "${path}" 2>/dev/null)"; then
+    :
+  elif mode="$(stat -f '%Lp' "${path}" 2>/dev/null)"; then
+    :
+  else
+    printf ''
+    return 0
+  fi
+  if printf '%s' "${mode}" | grep -Eq '^[0-7]{4}$'; then
+    mode="${mode#?}"
+  fi
+  if printf '%s' "${mode}" | grep -Eq '^[0-7]{1,2}$'; then
+    while [ "${#mode}" -lt 3 ]; do
+      mode="0${mode}"
+    done
+  fi
+  if printf '%s' "${mode}" | grep -Eq '^[0-7]{3}$'; then
+    printf '%s' "${mode}"
+  else
+    printf ''
+  fi
+}
+
 # Compute a lowercase 64-hex SHA-256 digest portably across Linux (`sha256sum`),
 # macOS (`shasum -a 256`), and minimal Unix (`openssl dgst -sha256`).
 # Reading via stdin (`< "$file"`) prevents leading-dash option injection and
@@ -229,8 +258,9 @@ atomic_write_from_stdin() {
 }
 
 # Back up a pre-existing target file (such as a CLI launcher in LOCAL_BIN)
-# before overwriting it, recording its SHA-256 and backup path in MANIFEST_ROWS
-# so restore-original.sh restores pre-existing files instead of deleting them.
+# before overwriting it, recording its SHA-256, backup path, and original POSIX
+# mode (column 5) in MANIFEST_ROWS so restore-original.sh restores both content
+# and permissions (e.g. 755) instead of forcing 700 or deleting the launcher.
 record_target_for_rollback() {
   local dst="$1"
   local bkp_mode="${2:-600}"
@@ -243,28 +273,38 @@ record_target_for_rollback() {
     exit 1
   fi
   if [ -f "${dst}" ]; then
-    local orig_hash bkp bkp_hash
+    local orig_hash orig_mode effective_bkp_mode bkp bkp_hash
     orig_hash="$(sha256_file "${dst}")"
+    orig_mode="$(get_octal_mode "${dst}")"
+    [ -z "${orig_mode}" ] && orig_mode="-"
+    effective_bkp_mode="${bkp_mode}"
+    if [ "${bkp_mode}" = "preserve" ]; then
+      if [ "${orig_mode}" != "-" ]; then
+        effective_bkp_mode="${orig_mode}"
+      else
+        effective_bkp_mode="700"
+      fi
+    fi
     bkp="${dst}.backup-${stamp}"
     if [ "${DRY_RUN}" -eq 0 ]; then
-      atomic_write_from_stdin "${bkp}" "${bkp_mode}" < "${dst}"
+      atomic_write_from_stdin "${bkp}" "${effective_bkp_mode}" < "${dst}"
       bkp_hash="$(sha256_file "${bkp}")"
       if [ "${bkp_hash}" != "${orig_hash}" ]; then
         echo "[FAIL] Backup integrity verification failed for ${bkp}." >&2
         exit 1
       fi
-      echo "    Backup saved: ${bkp} (SHA256=${orig_hash:0:12}...)"
+      echo "    Backup saved: ${bkp} (SHA256=${orig_hash:0:12}..., mode=${orig_mode})"
     else
-      echo "    [DRY-RUN] Would save backup: ${bkp} (SHA256=${orig_hash:0:12}...)"
+      echo "    [DRY-RUN] Would save backup: ${bkp} (SHA256=${orig_hash:0:12}..., mode=${orig_mode})"
     fi
-    MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s' "${orig_hash}" "${dst}" "${bkp}")")
+    MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s\t%s' "${orig_hash}" "${dst}" "${bkp}" "${orig_mode}")")
   else
-    MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-' "${dst}")")
+    MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${dst}")")
   fi
 }
 
 # Back up an existing file with SHA-256 verification and atomically install a
-# replacement template, recording the transition in MANIFEST_ROWS for rollback.
+# replacement template, recording the transition and original mode in MANIFEST_ROWS.
 backup_and_copy() {
   local src="$1"
   local dst="$2"
@@ -278,8 +318,10 @@ backup_and_copy() {
     exit 1
   fi
   if [ -f "${dst}" ]; then
-    local orig_hash bkp bkp_hash
+    local orig_hash orig_mode bkp bkp_hash
     orig_hash="$(sha256_file "${dst}")"
+    orig_mode="$(get_octal_mode "${dst}")"
+    [ -z "${orig_mode}" ] && orig_mode="-"
     bkp="${dst}.backup-${stamp}"
     if [ "${DRY_RUN}" -eq 0 ]; then
       atomic_write_from_stdin "${bkp}" 600 < "${dst}"
@@ -292,9 +334,9 @@ backup_and_copy() {
     else
       echo "    [DRY-RUN] Would save backup: ${bkp} (SHA256=${orig_hash:0:12}...)"
     fi
-    MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s' "${orig_hash}" "${dst}" "${bkp}")")
+    MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s\t%s' "${orig_hash}" "${dst}" "${bkp}" "${orig_mode}")")
   else
-    MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-' "${dst}")")
+    MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${dst}")")
   fi
   if [ "${DRY_RUN}" -eq 0 ]; then
     atomic_write_from_stdin "${dst}" "${mode}" < "${src}"
@@ -623,6 +665,8 @@ fi
 
 if [ -f "${CFG2}" ]; then
   CFG2_ORIG_HASH="$(sha256_file "${CFG2}")"
+  CFG2_ORIG_MODE="$(get_octal_mode "${CFG2}")"
+  [ -z "${CFG2_ORIG_MODE}" ] && CFG2_ORIG_MODE="-"
   CFG2_BKP="${CFG2}.backup-${stamp}"
   if [ "${DRY_RUN}" -eq 0 ]; then
     atomic_write_from_stdin "${CFG2_BKP}" 600 < "${CFG2}"
@@ -635,7 +679,7 @@ if [ -f "${CFG2}" ]; then
   else
     echo "    [DRY-RUN] Would save backup: ${CFG2_BKP} (SHA256=${CFG2_ORIG_HASH:0:12}...)"
   fi
-  MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s' "${CFG2_ORIG_HASH}" "${CFG2}" "${CFG2_BKP}")")
+  MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s\t%s' "${CFG2_ORIG_HASH}" "${CFG2}" "${CFG2_BKP}" "${CFG2_ORIG_MODE}")")
 
   # Preserve custom user top-level keys (e.g. model, service_tier,
   # cli_auth_credentials_store) except installer-managed sandbox/approval keys.
@@ -721,7 +765,7 @@ if [ -f "${CFG2}" ]; then
     keep == 1 { print $0 }
   ' "${CFG2}" || true)"
 else
-  MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-' "${CFG2}")")
+  MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${CFG2}")")
 fi
 
 ESC_REPO="$(escape_toml "${REPO_PATH}")"
@@ -806,7 +850,7 @@ Q_PRIMARY_REPO="$(shell_quote "${REPO_PATH}")"
 Q_LANE2_REPO="$(shell_quote "${EFFECTIVE_LANE2_REPO}")"
 
 for name in codex codex-official codex-t3; do
-  record_target_for_rollback "${LOCAL_BIN}/${name}" 700
+  record_target_for_rollback "${LOCAL_BIN}/${name}" preserve
 done
 
 if [ "${DRY_RUN}" -eq 0 ]; then
@@ -820,11 +864,65 @@ if [ "${DRY_RUN}" -eq 0 ]; then
       if [ "${USE_GIT_WORKTREE}" -eq 1 ] && [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ]; then
         printf 'export CODEX_PRIMARY_REPO=%s\n' "${Q_PRIMARY_REPO}"
         printf 'export CODEX_LANE2_WORKTREE=%s\n' "${Q_LANE2_REPO}"
-        printf '# Enforce OS workspace-write boundary: switch cwd from primary repo to Lane 2 worktree.\n'
+        printf '# Enforce OS workspace-write boundary:\n'
+        printf '#   1. Switch cwd from primary repo root OR any nested subdirectory to matching worktree path.\n'
+        printf '#   2. Block explicit -C/--cd/--add-dir arguments (before `--`) targeting primary repo.\n'
         printf 'if [ -z "${CODEX_NO_AUTO_WORKTREE_CD:-}" ] && [ -d "${CODEX_LANE2_WORKTREE}" ]; then\n'
-        printf '  case "$(pwd -P 2>/dev/null || pwd)/" in\n'
-        printf '    "${CODEX_PRIMARY_REPO}/"*) cd "${CODEX_LANE2_WORKTREE}" || exit 1 ;;\n'
+        printf '  _dl_prim="$(cd -P -- "${CODEX_PRIMARY_REPO}" 2>/dev/null && pwd -P || printf '\''%%s'\'' "${CODEX_PRIMARY_REPO}")"\n'
+        printf '  _dl_prim="${_dl_prim%%/}"\n'
+        printf '  _dl_cur="$(pwd -P 2>/dev/null || pwd)"\n'
+        printf '  _dl_cur="${_dl_cur%%/}"\n'
+        printf '  case "${_dl_cur}/" in\n'
+        printf '    "${_dl_prim}/"*)\n'
+        printf '      _dl_rel="${_dl_cur#"${_dl_prim}"}"\n'
+        printf '      _dl_rel="${_dl_rel#/}"\n'
+        printf '      if [ -n "${_dl_rel}" ] && [ -d "${CODEX_LANE2_WORKTREE}/${_dl_rel}" ]; then\n'
+        printf '        cd "${CODEX_LANE2_WORKTREE}/${_dl_rel}" || exit 1\n'
+        printf '      else\n'
+        printf '        cd "${CODEX_LANE2_WORKTREE}" || exit 1\n'
+        printf '      fi\n'
+        printf '      ;;\n'
         printf '  esac\n'
+        printf '  _dl_check_target_arg() {\n'
+        printf '    local cand="$1" abs="" cdir cbase cpar\n'
+        printf '    [ -z "${cand}" ] && return 0\n'
+        printf '    if [ -d "${cand}" ]; then\n'
+        printf '      abs="$(cd -P -- "${cand}" 2>/dev/null && pwd -P || printf '\''%%s'\'' "${cand}")"\n'
+        printf '    else\n'
+        printf '      cdir="$(dirname -- "${cand}")"\n'
+        printf '      cbase="$(basename -- "${cand}")"\n'
+        printf '      if [ -d "${cdir}" ]; then\n'
+        printf '        cpar="$(cd -P -- "${cdir}" 2>/dev/null && pwd -P || printf '\''%%s'\'' "${cdir}")"\n'
+        printf '        abs="${cpar%%/}/${cbase}"\n'
+        printf '      else\n'
+        printf '        case "${cand}" in\n'
+        printf '          /*) abs="${cand}" ;;\n'
+        printf '          *)  cpar="$(pwd -P 2>/dev/null || pwd)"; abs="${cpar%%/}/${cand}" ;;\n'
+        printf '        esac\n'
+        printf '      fi\n'
+        printf '    fi\n'
+        printf '    abs="${abs%%/}"\n'
+        printf '    case "${abs}/" in\n'
+        printf '      "${_dl_prim}/"*)\n'
+        printf '        printf '\''%%s\\n'\'' "[FAIL] Lane 2 worktree isolation blocked -C/--cd/--add-dir targeting primary repo '\''${CODEX_PRIMARY_REPO}'\''. Use '\''${CODEX_LANE2_WORKTREE}'\'' instead." >&2\n'
+        printf '        exit 1\n'
+        printf '        ;;\n'
+        printf '    esac\n'
+        printf '  }\n'
+        printf '  _dl_expect_val=0\n'
+        printf '  for _dl_arg in "$@"; do\n'
+        printf '    if [ "${_dl_expect_val}" -eq 1 ]; then\n'
+        printf '      _dl_check_target_arg "${_dl_arg}"\n'
+        printf '      _dl_expect_val=0\n'
+        printf '      continue\n'
+        printf '    fi\n'
+        printf '    case "${_dl_arg}" in\n'
+        printf '      --) break ;;\n'
+        printf '      -C|--cd|--add-dir) _dl_expect_val=1 ;;\n'
+        printf '      --cd=*) _dl_check_target_arg "${_dl_arg#--cd=}" ;;\n'
+        printf '      --add-dir=*) _dl_check_target_arg "${_dl_arg#--add-dir=}" ;;\n'
+        printf '    esac\n'
+        printf '  done\n'
         printf 'fi\n'
       fi
       printf 'exec %s "$@"\n' "${Q_CODEX_BIN}"
@@ -916,7 +1014,7 @@ if [ "${DRY_RUN}" -eq 0 ]; then
     printf '# schema_version=1\n'
     printf '# timestamp=%s\n' "${stamp}"
     printf '# created_at_utc=%s\n' "${UTC_NOW}"
-    printf '# columns: existed_prior<TAB>original_sha256<TAB>target_path<TAB>backup_path\n'
+    printf '# columns: existed_prior<TAB>original_sha256<TAB>target_path<TAB>backup_path<TAB>original_mode\n'
     if [ "${#MANIFEST_ROWS[@]}" -gt 0 ]; then
       local row
       for row in "${MANIFEST_ROWS[@]}"; do

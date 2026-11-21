@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Universal, hardware-adaptive, security-hardened installer for Codex Dual-Lane & Security Kit on Windows.
 
@@ -124,6 +124,13 @@
     Copies templates\DUAL_LANE_BRIDGE.md into <RepoPath>\artifacts\dual-lane\DUAL_LANE_BRIDGE.md
     if not already present (never overwrites an existing bridge file).
 
+.PARAMETER ReapplyAclOnly
+    Fast maintenance mode: skips installing templates/configs/Junctions/wrappers and only
+    re-applies fail-closed two-step NTFS ACL locking (`icacls /inheritance:d` then
+    `/remove:g "CodexSandboxUsers"`) across existing sensitive files in Lane 1 & Lane 2.
+    Useful immediately after `codex features`, `codex login`, or Codex Desktop settings edits
+    whose atomic file replacement resets NTFS inheritance.
+
 .PARAMETER SkipPathUpdate
     Skips modifying the Windows User PATH environment variable (ideal for CI/sandbox tests).
 
@@ -139,6 +146,9 @@
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -ProjectRoot "C:\Projects\my-app" -UseGitWorktree -SyncSessions
+
+.EXAMPLE
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -ReapplyAclOnly
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -RepoPath "C:\Projects\my-app" -ConfigureGateway -GatewayBaseUrl "https://gateway.example.invalid/v1" -PromptGatewayApiKey
@@ -177,6 +187,7 @@ param(
     [switch]$SyncSessions,
     [switch]$PinnedOnlySync,
     [switch]$InstallBridgeTemplate,
+    [switch]$ReapplyAclOnly,
     [switch]$SkipPathUpdate,
     [switch]$DryRun
 )
@@ -1044,6 +1055,44 @@ foreach ($rootCheck in @(@('Lane1Home', $Lane1Home), @('Lane2Home', $Lane2Home),
     Assert-NotReparsePoint -PathValue $rootCheck[1] -Label "-$($rootCheck[0])"
 }
 
+# ============================================================================
+# Fast Maintenance Path: -ReapplyAclOnly
+# ============================================================================
+# WHY: When Codex Desktop or CLI later rewrites config.toml (e.g. `codex features`)
+# or recreates auth.json via atomic replacement, Windows re-inherits parent DACLs.
+# -ReapplyAclOnly re-locks existing sensitive files across both lanes in <1s without
+# touching templates, Junctions, wrappers, or PATH.
+if ($ReapplyAclOnly) {
+    Write-Step 'Re-applying fail-closed two-step NTFS ACL lockdown across existing sensitive files...'
+    $aclTargets = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($candidate in @(
+        (Join-Path $Lane1Home 'auth.json'),
+        (Join-Path $Lane1Home 'config.toml'),
+        (Join-Path $Lane1Home 'config.backup.toml'),
+        (Join-Path $Lane2Home 'auth.json'),
+        (Join-Path $Lane2Home 'config.toml')
+    )) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $aclTargets.Add($candidate) }
+    }
+    $rbDir = Join-Path $Lane2Home '.rollback'
+    if (Test-Path -LiteralPath $rbDir -PathType Container) {
+        Assert-NotReparsePoint -PathValue $rbDir -Label '.rollback directory'
+        foreach ($mf in @(Get-ChildItem -LiteralPath $rbDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            $aclTargets.Add($mf.FullName)
+        }
+    }
+    foreach ($tFile in $aclTargets) {
+        if (-not $script:IsDryRun) {
+            Protect-SensitiveFileAcl $tFile
+            Write-Host "    Locked NTFS DACL: $tFile" -ForegroundColor Green
+        } else {
+            Write-Host "    [DRY-RUN] Would lock NTFS DACL: $tFile" -ForegroundColor DarkGray
+        }
+    }
+    Write-Host "`n[OK] ACL re-lock finished ($($aclTargets.Count) file(s) processed)." -ForegroundColor Green
+    exit 0
+}
+
 # Validate optional TOML string parameters against control characters / TOML newline injection.
 Assert-NoControlChars -Value $OfficialModel       -ParamName 'OfficialModel'
 Assert-NoControlChars -Value $OfficialReasoning   -ParamName 'OfficialReasoning'
@@ -1584,17 +1633,81 @@ $cmdCodexExe  = Escape-CmdSetValue -Value $CodexExe           -Label 'CodexExe'
 $cmdRepoPath  = Escape-CmdSetValue -Value $RepoPath           -Label 'RepoPath'
 $cmdLane2Repo = Escape-CmdSetValue -Value $effectiveLane2Repo -Label 'Lane2WorktreePath'
 
-# When -UseGitWorktree is enabled, enforce OS workspace-write isolation by automatically switching
-# the Lane 2 process working directory from the primary repo root into the dedicated Lane 2 worktree.
+# When -UseGitWorktree is enabled, enforce OS workspace-write isolation using zero-parenthesis
+# batch labels (safe with spaces, '&', '(', ')', '!', '%', and Unicode):
+#   Guard 1: If launched from PrimaryRepo root OR ANY nested subdirectory (`PrimaryRepo\src\...`),
+#            automatically switch cwd to the matching worktree subdirectory (or worktree root).
+#   Guard 2: Scan CLI flags (before `--`) for `-C`, `--cd`, or `--add-dir` pointing inside
+#            PrimaryRepo and fail closed instead of letting Codex target PrimaryRepo directly.
 $worktreeCdBlock = if ($UseGitWorktree -and ($effectiveLane2Repo -ne $RepoPath)) {
 @"
 set "CODEX_PRIMARY_REPO=$cmdRepoPath"
 set "CODEX_LANE2_WORKTREE=$cmdLane2Repo"
-if not defined CODEX_NO_AUTO_WORKTREE_CD (
-    if /I "%CD%"=="%CODEX_PRIMARY_REPO%" (
-        if exist "%CODEX_LANE2_WORKTREE%\" cd /d "%CODEX_LANE2_WORKTREE%"
-    )
-)
+if defined CODEX_NO_AUTO_WORKTREE_CD goto :_dl_wt_done
+if not exist "%CODEX_LANE2_WORKTREE%\" goto :_dl_wt_done
+set "_DL_CUR=%CD%"
+if "%_DL_CUR:~-1%"=="\" if not "%_DL_CUR:~-2%"==":\" set "_DL_CUR=%_DL_CUR:~0,-1%"
+set "_DL_REL="
+:_dl_wt_loop
+if /I "%_DL_CUR%"=="%CODEX_PRIMARY_REPO%" goto :_dl_wt_hit
+for %%A in ("%_DL_CUR%") do set "_DL_PAR=%%~dpA" & set "_DL_LEAF=%%~nxA"
+if "%_DL_LEAF%"=="" goto :_dl_wt_scan_args
+if "%_DL_PAR:~-2%"==":\" goto :_dl_wt_scan_args
+set "_DL_CUR=%_DL_PAR:~0,-1%"
+if "%_DL_REL%"=="" goto :_dl_rel_first
+set "_DL_REL=%_DL_LEAF%\%_DL_REL%"
+goto :_dl_wt_loop
+:_dl_rel_first
+set "_DL_REL=%_DL_LEAF%"
+goto :_dl_wt_loop
+:_dl_wt_hit
+if "%_DL_REL%"=="" goto :_dl_wt_root
+if not exist "%CODEX_LANE2_WORKTREE%\%_DL_REL%\" goto :_dl_wt_root
+cd /d "%CODEX_LANE2_WORKTREE%\%_DL_REL%"
+goto :_dl_wt_scan_args
+:_dl_wt_root
+cd /d "%CODEX_LANE2_WORKTREE%"
+:_dl_wt_scan_args
+if "%~1"=="" goto :_dl_wt_done
+set "_DL_A=%~1"
+if "%_DL_A%"=="--" goto :_dl_wt_done
+if "%_DL_A%"=="-C" goto :_dl_chk_next
+if "%_DL_A%"=="--cd" goto :_dl_chk_next
+if "%_DL_A%"=="--add-dir" goto :_dl_chk_next
+if /I "%_DL_A:~0,5%"=="--cd=" goto :_dl_chk_eq5
+if /I "%_DL_A:~0,10%"=="--add-dir=" goto :_dl_chk_eq10
+shift
+goto :_dl_wt_scan_args
+:_dl_chk_next
+if "%~2"=="" goto :_dl_wt_done
+set "_DL_CAND=%~2"
+shift
+shift
+goto :_dl_chk_path
+:_dl_chk_eq5
+set "_DL_CAND=%_DL_A:~5%"
+shift
+goto :_dl_chk_path
+:_dl_chk_eq10
+set "_DL_CAND=%_DL_A:~10%"
+shift
+:_dl_chk_path
+if "%_DL_CAND%"=="" goto :_dl_wt_scan_args
+set "_DL_ABS="
+for %%P in ("%_DL_CAND%") do set "_DL_ABS=%%~fP"
+if "%_DL_ABS%"=="" goto :_dl_wt_scan_args
+if "%_DL_ABS:~-1%"=="\" if not "%_DL_ABS:~-2%"==":\" set "_DL_ABS=%_DL_ABS:~0,-1%"
+:_dl_cand_loop
+if /I "%_DL_ABS%"=="%CODEX_PRIMARY_REPO%" goto :_dl_block_primary
+for %%A in ("%_DL_ABS%") do set "_DL_CPAR=%%~dpA" & set "_DL_CLEAF=%%~nxA"
+if "%_DL_CLEAF%"=="" goto :_dl_wt_scan_args
+if "%_DL_CPAR:~-2%"==":\" goto :_dl_wt_scan_args
+set "_DL_ABS=%_DL_CPAR:~0,-1%"
+goto :_dl_cand_loop
+:_dl_block_primary
+echo [FAIL] Lane 2 worktree isolation blocked -C/--cd/--add-dir targeting primary repo "%CODEX_PRIMARY_REPO%". Use "%CODEX_LANE2_WORKTREE%" instead. >&2
+exit /b 1
+:_dl_wt_done
 "@
 } else { '' }
 

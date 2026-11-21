@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Deterministic, SHA-256 verified rollback & recovery tool for Codex Dual-Lane & Security Kit on Windows.
 

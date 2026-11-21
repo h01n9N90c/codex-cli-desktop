@@ -137,6 +137,53 @@ canonicalize_dir() {
   fi
 }
 
+# Portably read standard POSIX owner/group/other octal permission bits (3 digits:
+# 000..777, stripping any special SUID/SGID/sticky leading digit) across GNU `stat -c %a`
+# and BSD/macOS `stat -f %Lp`. Returns empty string if unavailable.
+get_octal_mode() {
+  local path="$1"
+  local mode=""
+  if mode="$(stat -c '%a' "${path}" 2>/dev/null)"; then
+    :
+  elif mode="$(stat -f '%Lp' "${path}" 2>/dev/null)"; then
+    :
+  else
+    printf ''
+    return 0
+  fi
+  if printf '%s' "${mode}" | grep -Eq '^[0-7]{4}$'; then
+    mode="${mode#?}"
+  fi
+  if printf '%s' "${mode}" | grep -Eq '^[0-7]{1,2}$'; then
+    while [ "${#mode}" -lt 3 ]; do
+      mode="0${mode}"
+    done
+  fi
+  if printf '%s' "${mode}" | grep -Eq '^[0-7]{3}$'; then
+    printf '%s' "${mode}"
+  else
+    printf ''
+  fi
+}
+
+# Validate optional manifest octal permission mode strictly to standard 3-digit
+# permission bits (000..777 or 0000..0777, never SUID/SGID/sticky 1xxx/2xxx/4xxx).
+normalize_restore_mode() {
+  local raw="$1"
+  if [ -z "${raw}" ] || [ "${raw}" = "-" ]; then
+    printf ''
+    return 0
+  fi
+  if printf '%s' "${raw}" | grep -Eq '^0[0-7]{3}$'; then
+    raw="${raw#0}"
+  fi
+  if printf '%s' "${raw}" | grep -Eq '^[0-7]{3}$'; then
+    printf '%s' "${raw}"
+    return 0
+  fi
+  return 1
+}
+
 # Portable lowercase 64-hex SHA-256 helper using stdin redirection to prevent
 # leading-dash option injection and GNU backslash-escaped filename prefixes.
 sha256_file() {
@@ -258,13 +305,15 @@ assert_safe_contained_path() {
   esac
 }
 
-# Atomically restore a verified backup file to its target path.
+# Atomically restore a verified backup file to its target path with exact
+# POSIX permission metadata restoration (when available in manifest or backup).
 # Checks SHA-256 on the backup BEFORE writing, on the staged temp file BEFORE
 # moving, and on the restored target AFTER moving, then removes the backup.
 atomic_restore_verified_file() {
   local bkp="$1"
   local target="$2"
   local expected_sha="$3"
+  local expected_mode="${4:-}"
 
   assert_safe_contained_path "backup file" "${bkp}"
   assert_safe_contained_path "restore target" "${target}"
@@ -286,19 +335,31 @@ atomic_restore_verified_file() {
     exit 1
   fi
 
+  local restore_mode="600"
+  local norm_expected_mode=""
+  if norm_expected_mode="$(normalize_restore_mode "${expected_mode}" 2>/dev/null)" && [ -n "${norm_expected_mode}" ]; then
+    restore_mode="${norm_expected_mode}"
+  else
+    local target_dir_only bkp_mode
+    target_dir_only="$(dirname "${target}")"
+    bkp_mode="$(get_octal_mode "${bkp}")"
+    if [ "${target_dir_only}" = "${LOCAL_BIN}" ] || [ -x "${bkp}" ]; then
+      if [ -n "${bkp_mode}" ]; then
+        restore_mode="${bkp_mode}"
+      else
+        restore_mode="700"
+      fi
+    fi
+  fi
+
   if [ "${DRY_RUN}" -eq 0 ]; then
-    local target_dir tmp staged_sha restored_sha restore_mode
+    local target_dir tmp staged_sha restored_sha post_mode
     target_dir="$(dirname "${target}")"
     mkdir -p -- "${target_dir}"
     tmp="$(mktemp "${target_dir}/.codex-restore.XXXXXX")"
     TEMP_ARTIFACTS+=("${tmp}")
     cp -- "${bkp}" "${tmp}"
-    # Preserve executable bit for CLI launchers in LOCAL_BIN (or executable backups);
-    # omit `--` on chmod for BSD/macOS compatibility.
-    restore_mode="600"
-    if [ -x "${bkp}" ] || [ "${target_dir}" = "${LOCAL_BIN}" ]; then
-      restore_mode="700"
-    fi
+    # Restore exact pre-existing POSIX mode (e.g. 755/644/600); omit `--` for BSD/macOS chmod.
     chmod "${restore_mode}" "${tmp}"
 
     staged_sha="$(sha256_file "${tmp}")"
@@ -315,22 +376,34 @@ atomic_restore_verified_file() {
       exit 1
     fi
 
-    # Remove the consumed backup only after post-restore checksum passes.
+    # Verify POSIX permission metadata on native Unix filesystems (skip on Windows MSYS/NTFS).
+    case "$(uname -s 2>/dev/null || echo '')" in
+      MINGW*|MSYS*|CYGWIN*) ;;
+      *)
+        post_mode="$(get_octal_mode "${target}")"
+        if [ -n "${post_mode}" ] && [ "${post_mode}" != "${restore_mode}" ]; then
+          echo "[FAIL] Post-restore permission verification failed for ${target}: expected ${restore_mode}, got ${post_mode}." >&2
+          exit 1
+        fi
+        ;;
+    esac
+
+    # Remove the consumed backup only after post-restore checksum & metadata checks pass.
     rm -f -- "${bkp}"
-    echo "    Restored & SHA-256 verified: ${target} (SHA256=${bkp_sha:0:12}...)"
+    echo "    Restored & SHA-256 verified: ${target} (SHA256=${bkp_sha:0:12}..., mode=${restore_mode})"
   else
-    echo "    [DRY-RUN] Verified backup & would restore: ${bkp} -> ${target} (SHA256=${bkp_sha:0:12}...)"
+    echo "    [DRY-RUN] Verified backup & would restore: ${bkp} -> ${target} (SHA256=${bkp_sha:0:12}..., mode=${restore_mode})"
   fi
 }
 
 # Read-only preflight validator for rollback manifests.
 # Runs BEFORE Step 1 touches any symlink, file, or wrapper so a tampered
-# manifest (path traversal, symlink escape, malformed row, or SHA-256 mismatch)
-# fails closed with ZERO disk side effects.
+# manifest (path traversal, symlink escape, malformed row, invalid mode, or
+# SHA-256 mismatch) fails closed with ZERO disk side effects.
 preflight_validate_manifest() {
   local manifest_path="$1"
   local line_num=0
-  local line existed orig_sha target bkp extra bkp_sha
+  local line existed orig_sha target bkp orig_mode extra bkp_sha
   while IFS= read -r line || [ -n "${line}" ]; do
     line_num=$((line_num + 1))
     line="${line%$'\r'}"
@@ -343,8 +416,9 @@ preflight_validate_manifest() {
     orig_sha=""
     target=""
     bkp=""
+    orig_mode=""
     extra=""
-    IFS=$'\t' read -r existed orig_sha target bkp extra <<< "${line}"
+    IFS=$'\t' read -r existed orig_sha target bkp orig_mode extra <<< "${line}"
 
     if [ -n "${extra}" ] || [ -z "${existed}" ] || [ -z "${target}" ]; then
       echo "[FAIL] Malformed manifest entry at ${manifest_path}:${line_num}." >&2
@@ -359,6 +433,12 @@ preflight_validate_manifest() {
         if ! printf '%s' "${orig_sha}" | grep -Eq '^[0-9a-f]{64}$'; then
           echo "[FAIL] Invalid SHA-256 hash in manifest at ${manifest_path}:${line_num}." >&2
           exit 1
+        fi
+        if [ -n "${orig_mode}" ] && [ "${orig_mode}" != "-" ]; then
+          if ! normalize_restore_mode "${orig_mode}" >/dev/null 2>&1; then
+            echo "[FAIL] Security violation: unsafe/invalid file mode '${orig_mode}' in manifest at ${manifest_path}:${line_num}." >&2
+            exit 1
+          fi
         fi
         assert_safe_contained_path "manifest backup" "${bkp}"
         if [ -f "${bkp}" ] && [ ! -L "${bkp}" ]; then
@@ -585,13 +665,14 @@ if [ -n "${MANIFEST_FILE}" ]; then
       \#*) continue ;;
     esac
 
-    # Strict 4-column TSV parsing: existed_prior, original_sha256, target_path, backup_path.
+    # Strict 4- or 5-column TSV parsing: existed_prior, original_sha256, target_path, backup_path[, original_mode].
     existed=""
     orig_sha=""
     target=""
     bkp=""
+    orig_mode=""
     extra=""
-    IFS=$'\t' read -r existed orig_sha target bkp extra <<< "${line}"
+    IFS=$'\t' read -r existed orig_sha target bkp orig_mode extra <<< "${line}"
 
     if [ -n "${extra}" ] || [ -z "${existed}" ] || [ -z "${target}" ]; then
       echo "[FAIL] Malformed manifest entry at ${MANIFEST_FILE}:${line_num}." >&2
@@ -609,7 +690,7 @@ if [ -n "${MANIFEST_FILE}" ]; then
           echo "[FAIL] Invalid SHA-256 hash in manifest at ${MANIFEST_FILE}:${line_num}." >&2
           exit 1
         fi
-        atomic_restore_verified_file "${bkp}" "${target}" "${orig_sha}"
+        atomic_restore_verified_file "${bkp}" "${target}" "${orig_sha}" "${orig_mode}"
         ;;
       0)
         if [ -e "${target}" ] || [ -L "${target}" ]; then
