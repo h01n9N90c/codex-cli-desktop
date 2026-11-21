@@ -1,22 +1,99 @@
-# Codex Execpolicy Command Firewall (Starlark rules)
+# ==============================================================================
+# Codex Execpolicy Command Firewall (Starlark rules) — Layer 3 Defense-in-Depth
+# ==============================================================================
 # Author    : Lê Hoàng Ngọc Tươi
 # Copyright : Copyright 2026 Lê Hoàng Ngọc Tươi
 # License   : Apache-2.0 (https://www.apache.org/licenses/LICENSE-2.0)
-# Place at: %USERPROFILE%\.codex\rules\default.rules
-#      and: %USERPROFILE%\.codex-official\rules\default.rules
+#
+# Installed to:
+#   Windows       : %USERPROFILE%\.codex\rules\default.rules
+#                   %USERPROFILE%\.codex-official\rules\default.rules
+#   macOS / Linux : ~/.codex/rules/default.rules
+#                   ~/.codex-official/rules/default.rules
+#
+# HOW THIS ENGINE WORKS (AND ITS HONEST TECHNICAL BOUNDARY):
+#   - Codex evaluates Starlark `prefix_rule(...)` entries inside its Rust
+#     execpolicy engine BEFORE launching direct commands — even when
+#     `approval_policy = "never"`.
+#   - Matching is EXACT and CASE-SENSITIVE on leading command tokens (argv[0],
+#     argv[1], ...). Because Windows binaries can be invoked with or without
+#     `.exe`/`.com` extensions and PowerShell cmdlets can be written in mixed
+#     or lowercase, explicit variants are listed below.
+#   - When multiple rules match the same command (for example `git push` vs
+#     `git push --force`), the most restrictive decision wins (`forbidden` >
+#     `prompt`).
+#   - TECHNICAL BOUNDARY: `prefix_rule` inspects direct command tokens; it does
+#     not deeply parse arbitrary strings nested inside `powershell -Command "..."`,
+#     `cmd /c "..."`, or `bash -c "..."`. Always keep this firewall paired with:
+#       * Layer 1: `sandbox_mode = "workspace-write"`, `network_access = false`,
+#                  and `approval_policy = "on-request"`
+#       * Layer 2: `[shell_environment_policy]` secret filtering & `env_key`
+#       * Layer 4: Global `AGENTS.md` (anti-prompt-injection & static-only rules)
+#
+# HOW END USERS CAN SAFELY CUSTOMIZE THIS FILE:
+#   1. NEVER remove Sections 1-4 (ransomware/system tampering, persistence,
+#      NTFS ACL/network tampering, or Git force-push blocks).
+#   2. If you actively develop trusted PHP, Ruby, or Perl projects AND do NOT
+#      analyze untrusted vulnerability samples in those languages, you may
+#      comment out ONLY the specific interpreter lines you need in Section 5A
+#      while keeping ALL Windows LOLBins / dynamic-execution rules (Section 5B)
+#      intact.
+#   3. After any edit, validate syntax and behavior with:
+#        codex execpolicy check --rules "<path-to-default.rules>" -- php -r "echo 1;"
+#        codex execpolicy check --rules "<path-to-default.rules>" -- vssadmin delete shadows
+#        codex execpolicy check --rules "<path-to-default.rules>" -- git push --force
+#   4. Keep the compact `pattern=["..."]` syntax for full compatibility across
+#      Codex CLI versions and `doctor.sh` / `doctor.ps1` health checks.
+# ==============================================================================
 
-# Hard-block Windows system tampering, persistence, and ransomware-like commands
+# ------------------------------------------------------------------------------
+# SECTION 1: Windows System Tampering & Ransomware-Style Destructive Commands
+# ------------------------------------------------------------------------------
+# WHY FORBIDDEN:
+#   Blocks utilities commonly abused to erase Volume Shadow Copies (vssadmin),
+#   corrupt boot configuration (bcdedit), delete system backups (wbadmin), or
+#   wipe partitions/volumes (diskpart, format). No normal coding workflow inside
+#   a repository sandbox requires invoking these tools.
 prefix_rule(pattern=["vssadmin"], decision="forbidden")
+prefix_rule(pattern=["vssadmin.exe"], decision="forbidden")
 prefix_rule(pattern=["bcdedit"], decision="forbidden")
+prefix_rule(pattern=["bcdedit.exe"], decision="forbidden")
 prefix_rule(pattern=["wbadmin"], decision="forbidden")
+prefix_rule(pattern=["wbadmin.exe"], decision="forbidden")
 prefix_rule(pattern=["diskpart"], decision="forbidden")
+prefix_rule(pattern=["diskpart.exe"], decision="forbidden")
 prefix_rule(pattern=["format"], decision="forbidden")
+prefix_rule(pattern=["format.com"], decision="forbidden")
+
+# ------------------------------------------------------------------------------
+# SECTION 2: OS Persistence, Service Control & Registry Mutation
+# ------------------------------------------------------------------------------
+# WHY FORBIDDEN:
+#   Prevents an agent (or prompt-injected payload) from installing surviving
+#   scheduled tasks (schtasks), creating/modifying Windows services (sc), or
+#   writing/deleting/importing Windows Registry keys (reg add/delete/import).
+#   Read-only `reg query` is intentionally left unblocked for benign inspection.
 prefix_rule(pattern=["schtasks"], decision="forbidden")
+prefix_rule(pattern=["schtasks.exe"], decision="forbidden")
 prefix_rule(pattern=["sc"], decision="forbidden")
 prefix_rule(pattern=["sc.exe"], decision="forbidden")
 prefix_rule(pattern=["reg", "add"], decision="forbidden")
 prefix_rule(pattern=["reg", "delete"], decision="forbidden")
 prefix_rule(pattern=["reg", "import"], decision="forbidden")
+prefix_rule(pattern=["reg.exe", "add"], decision="forbidden")
+prefix_rule(pattern=["reg.exe", "delete"], decision="forbidden")
+prefix_rule(pattern=["reg.exe", "import"], decision="forbidden")
+
+# ------------------------------------------------------------------------------
+# SECTION 3: Windows NTFS ACL, Ownership & Network/Firewall Tampering
+# ------------------------------------------------------------------------------
+# WHY FORBIDDEN:
+#   - `icacls` / `takeown`: Prevents weakening NTFS DACL locks placed on
+#     sensitive files (`auth.json`, `config.toml`, `.rollback/` snapshots) or
+#     taking ownership of protected files.
+#   - `net` / `net1` / `netsh`: Prevents creating/altering local user accounts,
+#     adding group memberships, exposing SMB shares, or tampering with Windows
+#     Firewall / proxy / network interface configuration.
 prefix_rule(pattern=["icacls"], decision="forbidden")
 prefix_rule(pattern=["icacls.exe"], decision="forbidden")
 prefix_rule(pattern=["takeown"], decision="forbidden")
@@ -28,17 +105,46 @@ prefix_rule(pattern=["net1.exe"], decision="forbidden")
 prefix_rule(pattern=["netsh"], decision="forbidden")
 prefix_rule(pattern=["netsh.exe"], decision="forbidden")
 
-# Hard-block force-pushing Git history
+# ------------------------------------------------------------------------------
+# SECTION 4: Irreversible Remote Git History Rewrites
+# ------------------------------------------------------------------------------
+# WHY FORBIDDEN:
+#   Hard-blocks force-pushing (`--force` / `-f`) so an autonomous session can
+#   never silently overwrite shared remote branch history. Regular `git push`
+#   still requires interactive human approval in Section 6 below.
 prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")
 prefix_rule(pattern=["git", "push", "-f"], decision="forbidden")
+prefix_rule(pattern=["git.exe", "push", "--force"], decision="forbidden")
+prefix_rule(pattern=["git.exe", "push", "-f"], decision="forbidden")
 
-# Static-analysis-only isolation: hard-block executing samples, DLLs, scripts, and Windows LOLBins
+# ------------------------------------------------------------------------------
+# SECTION 5: Static-Analysis-Only Isolation (Interpreters, LOLBins & Dynamic Exec)
+# ------------------------------------------------------------------------------
+# WHY FORBIDDEN:
+#   Security engineering, SAST, and binary-analysis repositories often contain
+#   intentionally vulnerable corpus files (PHP webshells, VBS/HTA payloads,
+#   malicious DLLs, script fixtures). All inspection MUST remain strictly static
+#   (read bytes/text through parsers and unit tests, never execute samples).
+
+# Section 5A — High-risk corpus script interpreters
+# Safe customization: comment out only a language you actively build/test on
+# trusted codebases; keep blocked whenever inspecting untrusted corpus samples.
 prefix_rule(pattern=["php"], decision="forbidden")
 prefix_rule(pattern=["php.exe"], decision="forbidden")
 prefix_rule(pattern=["ruby"], decision="forbidden")
 prefix_rule(pattern=["ruby.exe"], decision="forbidden")
 prefix_rule(pattern=["perl"], decision="forbidden")
 prefix_rule(pattern=["perl.exe"], decision="forbidden")
+
+# Section 5B — Windows Script Hosts, LOLBins & dynamic process/code execution
+# Keep ALL rules below enabled to block payload detonation, DLL sideloading,
+# download/decode cradles, and unreviewed PowerShell dynamic evaluation:
+#   - cscript/wscript/mshta : Windows Script Host & HTML Application execution
+#   - rundll32/regsvr32     : Direct DLL export execution & COM registration abuse
+#   - certutil/bitsadmin    : Classic download/base64-decode LOLBin cradles
+#   - msiexec/wmic          : Package execution & WMI process spawning
+#   - Start-Process / saps  : Spawning detached external binaries or payloads
+#   - Invoke-Expression/iex : Dynamic string evaluation (common obfuscation sink)
 prefix_rule(pattern=["cscript"], decision="forbidden")
 prefix_rule(pattern=["cscript.exe"], decision="forbidden")
 prefix_rule(pattern=["wscript"], decision="forbidden")
@@ -58,10 +164,26 @@ prefix_rule(pattern=["msiexec.exe"], decision="forbidden")
 prefix_rule(pattern=["wmic"], decision="forbidden")
 prefix_rule(pattern=["wmic.exe"], decision="forbidden")
 prefix_rule(pattern=["Start-Process"], decision="forbidden")
+prefix_rule(pattern=["start-process"], decision="forbidden")
+prefix_rule(pattern=["saps"], decision="forbidden")
 prefix_rule(pattern=["Invoke-Expression"], decision="forbidden")
+prefix_rule(pattern=["invoke-expression"], decision="forbidden")
 prefix_rule(pattern=["iex"], decision="forbidden")
+prefix_rule(pattern=["IEX"], decision="forbidden")
 
-# Require explicit human approval before pushing or discarding local changes
+# ------------------------------------------------------------------------------
+# SECTION 6: Human-in-the-Loop Approval Gates (decision="prompt")
+# ------------------------------------------------------------------------------
+# WHY PROMPTED:
+#   These commands are legitimate when initiated intentionally, but carry high
+#   blast radius if triggered autonomously:
+#     - `git push`          : publishes local commits to a remote repository
+#     - `git reset --hard`  : permanently discards uncommitted working-tree edits
+#     - `git clean`         : permanently deletes untracked local files
+#   Requiring explicit approval preserves the "Git Shield" checkpoint workflow.
 prefix_rule(pattern=["git", "push"], decision="prompt")
 prefix_rule(pattern=["git", "reset", "--hard"], decision="prompt")
 prefix_rule(pattern=["git", "clean"], decision="prompt")
+prefix_rule(pattern=["git.exe", "push"], decision="prompt")
+prefix_rule(pattern=["git.exe", "reset", "--hard"], decision="prompt")
+prefix_rule(pattern=["git.exe", "clean"], decision="prompt")

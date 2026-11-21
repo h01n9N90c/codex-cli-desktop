@@ -4,19 +4,33 @@
 
 **Codex Dual-Lane & Security Kit** (`codex-cli-desktop`) is a local configuration and guardrail toolkit licensed under **Apache License 2.0** (`Copyright 2026 Lê Hoàng Ngọc Tươi`).
 
-* **Zero telemetry / zero remote code execution:** All scripts run 100% locally and never download binaries or send data to external servers.
+* **Zero telemetry / zero remote code execution:** All scripts run 100% locally and never download binaries or transmit data to external servers.
 * **Zero secrets committed:** No API keys, OAuth tokens, or personal host configurations are stored in this repository.
 * **4-Layer Defense-in-Depth for Codex Agents:**
-  1. Workspace-scoped OS sandbox (`sandbox_mode = "workspace-write"`, `[windows] sandbox = "elevated"`) with outbound shell network disabled by default (`[sandbox_workspace_write] network_access = false`).
-  2. Sensitive environment-variable filtering (`exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]`).
-  3. Starlark execpolicy command firewall (`templates/default.rules`) hard-blocking destructive/persistence commands and Windows LOLBins/interpreters (`php`, `ruby`, `perl`, `cscript`, `wscript`, `mshta`, `rundll32`, `regsvr32`, `certutil`, `bitsadmin`, `msiexec`, `wmic`, `Start-Process`, `Invoke-Expression`, `iex`).
-  4. Global `AGENTS.md` anti-prompt-injection and **Static-Analysis-Only Isolation** rules.
+  1. **Layer 1 — Workspace-Scoped OS Sandbox & Network Isolation:** `sandbox_mode = "workspace-write"`, `[windows] sandbox = "elevated"`, outbound shell network disabled by default (`[sandbox_workspace_write] network_access = false`), safe default `approval_policy = "on-request"`, and optional `-UseGitWorktree` / `--use-git-worktree` for OS-enforced write separation between Lane 1 and Lane 2.
+  2. **Layer 2 — Secret Hygiene, Environment Filtering & File Permissions:**
+     * Uses `env_key` (never plaintext API keys or `experimental_bearer_token`) in `config.toml` and timestamped backups.
+     * Filters sensitive environment variables from sandboxed child shells (`[shell_environment_policy] exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]`).
+     * Applies POSIX `chmod 600` (with restrictive `umask 077` / `chmod 700` on sensitive directories) on macOS/Linux/WSL, and a **two-step Windows `icacls.exe` sequence** (`/inheritance:d` followed by `/remove:g "CodexSandboxUsers"`) on `auth.json`, `config.toml`, backups, and rollback manifests.
+     * **Strongest Secret Hygiene Recommendation:** Where supported by your installed Codex version, configure `cli_auth_credentials_store = "keyring"` so OAuth/login tokens are stored in the OS credential store rather than plaintext `auth.json`, and always supply third-party gateway credentials via `env_key`.
+  3. **Layer 3 — Starlark Execpolicy Command Firewall (`templates/default.rules`):** Hard-blocks (`decision="forbidden"`) ransomware/system tampering (`vssadmin`, `bcdedit`, `wbadmin`, `diskpart`, `format`), persistence (`schtasks`, `sc`, `reg add/delete/import`), Windows NTFS ACL/ownership/network tampering (`icacls`, `takeown`, `net`, `net1`, `netsh`), remote history force-push (`git push --force`, `git push -f`), and static-analysis-only corpus interpreters & Windows LOLBins (`php`, `ruby`, `perl`, `cscript`, `wscript`, `mshta`, `rundll32`, `regsvr32`, `certutil`, `bitsadmin`, `msiexec`, `wmic`, `Start-Process`/`saps`, `Invoke-Expression`/`iex`), including explicit `.exe`/`.com` and case variants. Prompts (`decision="prompt"`) before `git push`, `git reset --hard`, and `git clean`.
+  4. **Layer 4 — Global `AGENTS.md` Guardrails:** Anti-prompt-injection, **Static-Analysis-Only Isolation**, secret/config isolation, and dual-lane zero-collision discipline.
 
-See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for full details and honest technical boundaries.
+## Honest Security Boundaries (Kit Guarantees vs. OS & Codex Runtime Limits)
+
+This toolkit hardens local Codex deployments but cannot override OS kernel or Codex runtime behavior outside its control:
+
+* **Windows `CodexSandboxUsers:(OI)(CI)(RX)` directory inheritance:** Codex's Windows elevated sandbox may grant `CodexSandboxUsers:(OI)(CI)(RX)` (inherited read/execute) on `~/.codex*` directories. Newly created files inside those directories automatically inherit that ACE. The kit's two-step `icacls.exe` strip (`/inheritance:d` then `/remove:g "CodexSandboxUsers"`) removes the inherited read ACE from targeted files while degrading gracefully on fresh machines where the `CodexSandboxUsers` group does not yet exist.
+* **Atomic file replacement resets NTFS file DACLs:** When Codex CLI or Codex Desktop updates `config.toml` (for example after `codex features` commands or UI settings edits) or refreshes `auth.json` via atomic temp-file replacement, the newly replaced file inherits the parent directory's DACL again. File-level `icacls` locking is therefore **point-in-time defense-in-depth**, not a permanent kernel lock across subsequent Codex writes. Re-run `scripts/doctor.ps1` to audit ACL drift and re-run `scripts/setup-dual-lane.ps1` (or the two-step `icacls` commands) after Codex modifies those files; use `cli_auth_credentials_store = "keyring"` and `env_key` for durable secret hygiene.
+* **`execpolicy` prefix-matching scope:** Starlark `prefix_rule` evaluates exact, case-sensitive direct command tokens (`argv[0]`, ...). It does not deeply inspect arbitrary code strings nested inside `powershell -Command "..."`, `cmd /c "..."`, or `bash -c "..."`. Containment always depends on keeping all 4 layers active together.
+* **Soft vs. hard dual-lane write separation:** Sharing a single repository directory provides a **soft prompt boundary** (`AGENTS.md` + `DUAL_LANE_BRIDGE.md`). Use `-UseGitWorktree` / `--use-git-worktree` whenever you require a **hard OS sandbox write boundary** between Lane 1 and Lane 2.
+* **Shared brain trade-off:** Linking `sessions/`, `memories/`, `skills/`, and `plugins/` across both lanes means conversation logs are shared between Lane 1 and Lane 2. Never put real secrets into prompts or repositories, and keep confidential codebases on your official OpenAI lane rather than third-party API relays.
+
+See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for the full technical model, rollback procedures, and verification guidance.
 
 ## Reporting a Vulnerability
 
-If you discover a security bug or bypass in any script or template in this repository:
+If you discover a security bug, path-traversal flaw, ACL bypass, or secret-leakage issue in any script or template in this repository:
 
 1. **Do not** disclose exploit details or secrets in public issues.
 2. Report privately via GitHub **Security Advisories** (Report a vulnerability) on `https://github.com/h01n9N90c/codex-cli-desktop`.

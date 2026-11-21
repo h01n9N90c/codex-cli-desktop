@@ -1,15 +1,26 @@
-# Never commit real secrets, keys, or personal Codex configs
+# Never commit real secrets, keys, backups, or personal Codex configs
 .env
 .env.*
 config.toml
 config.backup.toml
+*.backup-*
 auth.json
 *.key
 *.pem
+
+# Never commit local Codex SQLite state or rollback snapshots
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+.rollback/
+
+# Python bytecode caches (keep repository clean across unittest / py_compile runs)
+scripts/__pycache__/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# OS metadata
 .DS_Store
 Thumbs.db

@@ -1,7 +1,7 @@
 # Danh sách Kiểm chứng Thực tế (Real Codex Verification Checklist)
 
 > **Tác giả:** Lê Hoàng Ngọc Tươi | **Dự án:** Codex Dual-Lane & Security Kit (Apache License 2.0)  
-> Danh sách này giúp bạn (hoặc đội kiểm duyệt an ninh) tự kiểm chứng bằng lệnh thực tế từng cơ chế của bộ kit trước và sau khi cài đặt — không tin mù quáng vào cấu hình tĩnh.
+> Danh sách này giúp bạn (hoặc đội kiểm duyệt an ninh) tự kiểm chứng bằng lệnh thực tế từng cơ chế bảo vệ, ACL, `execpolicy`, TOML merge, SQLite UPSERT và khôi phục SHA-256 trước và sau khi cài đặt — không tin mù quáng vào cấu hình tĩnh.
 
 ---
 
@@ -9,29 +9,49 @@
 
 Khi dùng `-ConfigureGateway`, bộ kit dùng thuộc tính `env_key = "CODEX_GATEWAY_API_KEY"` của Codex (đọc từ biến môi trường User) thay vì ghi trực tiếp key vào `config.toml`:
 
+**Windows (PowerShell):**
 ```powershell
-# Kiểm tra hoàn toàn không có chuỗi "sk-" hay "experimental_bearer_token" trong config.toml và các bản backup:
-Select-String -Path "$env:USERPROFILE\.codex\config*.toml","$env:USERPROFILE\.codex-official\config*.toml" `
+# Kiểm tra hoàn toàn không có chuỗi "sk-" hay "experimental_bearer_token" trong config.toml và các bản backup (.backup-*):
+Select-String -Path "$env:USERPROFILE\.codex\config*.toml*","$env:USERPROFILE\.codex-official\config*.toml*" `
     -Pattern "experimental_bearer_token|sk-[A-Za-z0-9]{10,}"
 ```
+**macOS / Linux / WSL (Bash):**
+```bash
+grep -En 'experimental_bearer_token|sk-[A-Za-z0-9]{10,}' \
+    ~/.codex/config*.toml* ~/.codex-official/config*.toml* 2>/dev/null || true
+```
 * **Kỳ vọng:** Không có kết quả nào (`0` dòng khớp).
+* **Khuyến nghị nâng cao:** Nếu phiên bản Codex của bạn hỗ trợ, cấu hình thêm `cli_auth_credentials_store = "keyring"` để chuyển token đăng nhập từ tệp `auth.json` vào OS Credential Store / Keyring.
 
 ---
 
 ## 2. Kiểm chứng Thực thi Engine `execpolicy` (Behavioral Check — Không chỉ đọc chuỗi)
 
-Thay vì chỉ kiểm tra file `default.rules` có tồn tại hay không, hãy gọi trực tiếp bộ máy **Starlark Execpolicy (Rust)** của Codex để xác nhận quyết định `"decision":"forbidden"`:
+Thay vì chỉ kiểm tra tệp `default.rules` có tồn tại hay không, hãy gọi trực tiếp bộ máy **Starlark Execpolicy (Rust)** của Codex để xác nhận quyết định thực tế cho các nhóm lệnh chặn cứng (`forbidden`), biến thể `.exe`/chữ thường và nhóm yêu cầu duyệt (`prompt`):
 
 ```powershell
-codex execpolicy check --rules "$env:USERPROFILE\.codex-official\rules\default.rules" -- php -r "echo 1;"
-codex execpolicy check --rules "$env:USERPROFILE\.codex-official\rules\default.rules" -- mshta http://example.invalid
-codex execpolicy check --rules "$env:USERPROFILE\.codex-official\rules\default.rules" -- vssadmin delete shadows /all
-codex execpolicy check --rules "$env:USERPROFILE\.codex-official\rules\default.rules" -- Start-Process calc.exe
-codex execpolicy check --rules "$env:USERPROFILE\.codex-official\rules\default.rules" -- iex "dir"
-codex execpolicy check --rules "$env:USERPROFILE\.codex-official\rules\default.rules" -- git push --force
+$rules = "$env:USERPROFILE\.codex-official\rules\default.rules"
+
+# Nhóm phải trả về "decision":"forbidden":
+codex execpolicy check --rules $rules -- php -r "echo 1;"
+codex execpolicy check --rules $rules -- mshta http://example.invalid
+codex execpolicy check --rules $rules -- vssadmin delete shadows /all
+codex execpolicy check --rules $rules -- vssadmin.exe delete shadows /all
+codex execpolicy check --rules $rules -- icacls.exe "$env:USERPROFILE\.codex\auth.json"
+codex execpolicy check --rules $rules -- Start-Process calc.exe
+codex execpolicy check --rules $rules -- start-process calc.exe
+codex execpolicy check --rules $rules -- iex "dir"
+codex execpolicy check --rules $rules -- git push --force
+
+# Nhóm phải trả về "decision":"prompt":
+codex execpolicy check --rules $rules -- git push
+codex execpolicy check --rules $rules -- git reset --hard
+
+# Lệnh vô hại phải trả về matchedRules rỗng ([]):
+codex execpolicy check --rules $rules -- git status
 ```
-* **Kỳ vọng:** Cả 6 lệnh đều trả về JSON có `"decision":"forbidden"`.
-* **Giới hạn kỹ thuật cần nhớ:** `prefix_rule` kiểm tra tiền tố lệnh trực tiếp (`argv[0]`). Các lệnh bị bọc gián tiếp qua `powershell -Command "..."` sẽ do lớp **OS Sandbox (`workspace-write` + `network_access = false`)** và **`approval_policy = "on-request"`** kiểm soát.
+* **Kỳ vọng:** 9 lệnh đầu trả về `"decision":"forbidden"`, 2 lệnh `git push` / `git reset --hard` trả về `"decision":"prompt"`, và `git status` trả về `{"matchedRules":[]}`.
+* **Giới hạn kỹ thuật cần nhớ:** `prefix_rule` kiểm khớp chính xác theo tiền tố lệnh trực tiếp (`argv[0]`), không phân tích hết chuỗi lồng trong `powershell -Command "..."` hay `bash -c "..."`. Các chuỗi lồng nhau được kiểm soát bởi **Lớp 1 OS Sandbox (`workspace-write` + `network_access = false`)**, **`approval_policy = "on-request"`** và **Lớp 4 `AGENTS.md`**.
 
 ---
 
@@ -46,30 +66,72 @@ codex debug prompt-input | Select-String -Pattern "Network access is restricted|
 
 ---
 
-## 4. Kiểm chứng Merge `config.toml` Không phá hủy (Non-Destructive TOML Merge)
+## 4. Kiểm chứng Quyền Tệp NTFS ACL (Windows) / POSIX `0600` (Unix)
 
-Khi chạy lại `setup-dual-lane.ps1`, các mục cấu hình riêng của bạn như `[mcp_servers.*]`, `[tui]`, `[plugins.*]` hoặc `notify` phải được giữ nguyên:
+**Windows (PowerShell):**
+```powershell
+# Kiểm tra toàn diện read-only (bao gồm live execpolicy probes & kernel_acl):
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\doctor.ps1
+
+# Hoặc kiểm tra trực tiếp Allow ACE của CodexSandboxUsers trên từng tệp nhạy cảm:
+foreach ($f in @("$env:USERPROFILE\.codex\auth.json","$env:USERPROFILE\.codex\config.toml","$env:USERPROFILE\.codex-official\auth.json","$env:USERPROFILE\.codex-official\config.toml")) {
+    if (Test-Path -LiteralPath $f) {
+        $leaks = @((Get-Acl -LiteralPath $f).Access | Where-Object {
+            $_.IdentityReference -like '*CodexSandboxUsers*' -and $_.AccessControlType -eq 'Allow'
+        })
+        Write-Host ("{0} => CodexSandboxUsers Allow ACEs: {1}" -f $f, $leaks.Count)
+    }
+}
+```
+* **Kỳ vọng:** `CodexSandboxUsers Allow ACEs: 0` (và `doctor.ps1` báo `kernel_acl=locked`, đồng thời không báo nhầm trên Deny ACE bảo vệ nếu có).
+* **Lưu ý thực tế:** Sau khi chạy `codex features ...` hoặc sửa Settings trên Codex Desktop (ghi đè atomic lên `config.toml`), Windows có thể áp lại quyền kế thừa `CodexSandboxUsers:(OI)(CI)(RX)` từ thư mục cha. Chạy lại `doctor.ps1` sau mỗi lần đổi cấu hình trong Codex để kiểm chứng kịp thời.
+
+**macOS / Linux / WSL (Bash):**
+```bash
+./scripts/doctor.sh
+ls -la ~/.codex/config.toml ~/.codex/auth.json ~/.codex-official/config.toml ~/.codex-official/auth.json 2>/dev/null || true
+```
+* **Kỳ vọng:** Các tệp cấu hình và xác thực có quyền chỉ chủ sở hữu đọc/ghi (`-rw-------` / `0600`).
+
+---
+
+## 5. Kiểm chứng Merge `config.toml` Không phá hủy & Khôi phục SHA-256
+
+Chạy bộ test tích hợp trên Windows (không đụng tới `~/.codex*` thật của bạn, dùng thư mục tạm cô lập):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1
 ```
+* **Kỳ vọng:** Tất cả kiểm tra cú pháp AST, `-DryRun`, TOML merge giữ nguyên `[mcp_servers.*]`/`[tui]`/`[projects.*]`, cô lập `env_key`, UTF-8 không BOM, chống path-traversal và khôi phục khớp mã băm SHA-256 đều báo `[PASS]`.
 
 ---
 
-## 5. Kiểm chứng Đồng bộ Phiên UPSERT (`INSERT` + `UPDATE`) khi DB đích trống
+## 6. Kiểm chứng Đồng bộ Phiên UPSERT (`INSERT` + `UPDATE`) & Bảo toàn Dữ liệu Nguồn
 
-Chạy bộ unit test tự động để xác nhận `sync-sessions.py` tạo mới (`INSERT`) thành công các phiên `Pinned` ngay cả khi bảng `threads` ở `~/.codex-official/state_*.sqlite` ban đầu hoàn toàn trống (`0` dòng):
+Chạy bộ unit test Python (không sửa bất kỳ DB Codex thật nào):
 
 ```powershell
 python -m unittest discover -s .\tests -v
 ```
-* **Kỳ vọng:** `Ran 3 tests ... OK`.
+* **Kỳ vọng:** Tất cả unit test đều trả về `OK` (`0` failures, `0` errors), xác nhận đọc nguồn chỉ-đọc (`?mode=ro`), UPSERT vào DB đích trống, `--pinned-only`, ghi nguyên tử JSONL và `--dry-run` không sửa đĩa.
 
 ---
 
-## 6. Chọn đúng Ranh giới Phân vùng: Mềm (`AGENTS.md`) vs Cứng (`-UseGitWorktree`)
+## 7. Kiểm chứng Xem trước Khôi phục An toàn (`DryRun`) & Chọn Ranh giới Mềm vs. Cứng
+
+### 7.1. Kiểm tra tính toàn vẹn Snapshot trước khi cần rollback
+```powershell
+# Windows (chỉ đọc, kiểm tra SHA-256 của toàn bộ bản sao lưu trong .rollback/latest.json):
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1 -DryRun
+```
+```bash
+# macOS / Linux / WSL (chỉ đọc):
+./scripts/restore-original.sh --dry-run
+```
+
+### 7.2. Chọn đúng Ranh giới Phân vùng: Mềm (`AGENTS.md`) vs. Cứng (`-UseGitWorktree`)
 
 | Chế độ | Cách kích hoạt | Bản chất kỹ thuật | Khi nào nên dùng |
 | :--- | :--- | :--- | :--- |
-| **Chế độ A: Chung 1 Worktree** *(Mặc định)* | Chạy `setup-dual-lane.ps1 -RepoPath "D:\my-app"` | **Ranh giới mềm (Prompt Boundary):** Hai luồng phân chia thư mục qua `AGENTS.md` và `DUAL_LANE_BRIDGE.md`, nhưng cùng chia sẻ quyền ghi OS trong thư mục `D:\my-app`. | Khi muốn 2 luồng thấy ngay file mới của nhau trên cùng 1 cây thư mục mà không cần merge nhánh. |
-| **Chế độ B: Tách Git Worktree riêng** *(Cưỡng chế cấp OS)* | Thêm cờ **`-UseGitWorktree`** (hoặc `--use-git-worktree` trên macOS/Linux) | **Ranh giới cứng (Hard OS Sandbox Boundary):** Tạo worktree riêng `<repo>-lane2` trên nhánh `dual-lane-2`. Vì `sandbox_mode = "workspace-write"` chỉ cho phép ghi trong `cwd` hiện tại, OS Sandbox của Luồng 2 **vật lý không thể ghi vào thư mục làm việc của Luồng 1**. | Khi cần cưỡng chế phân quyền ghi tuyệt đối ở cấp hệ điều hành giữa 2 agent. |
+| **Chế độ A: Chung 1 Worktree** *(Mặc định)* | Chạy `setup-dual-lane.ps1 -RepoPath "C:\Projects\my-app"` | **Ranh giới mềm (Soft Prompt Boundary):** Hai luồng phân chia thư mục qua `AGENTS.md` và `DUAL_LANE_BRIDGE.md`, nhưng cùng chia sẻ quyền ghi OS trong thư mục làm việc. | Khi muốn 2 luồng thấy ngay tệp mới của nhau trên cùng 1 cây thư mục mà không cần merge nhánh. |
+| **Chế độ B: Tách Git Worktree riêng** *(Cưỡng chế cấp OS)* | Thêm cờ **`-UseGitWorktree`** (Windows) hoặc **`--use-git-worktree`** (macOS/Linux/WSL) | **Ranh giới cứng (Hard OS Sandbox Boundary):** Tạo worktree riêng `<repo>-lane2` trên nhánh `dual-lane-2`. Vì `sandbox_mode = "workspace-write"` chỉ cho phép ghi trong `cwd` hiện tại, OS Sandbox của Luồng 2 **vật lý không thể ghi vào thư mục làm việc của Luồng 1**. | Khi cần cưỡng chế phân quyền ghi tuyệt đối ở cấp hệ điều hành giữa 2 agent. |

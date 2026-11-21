@@ -1,3 +1,32 @@
+# ==============================================================================
+# Continuous Integration & Cross-Platform Safety Verification
+# ==============================================================================
+# Author    : Lê Hoàng Ngọc Tươi
+# Copyright : Copyright 2026 Lê Hoàng Ngọc Tươi
+# License   : Apache-2.0 (https://www.apache.org/licenses/LICENSE-2.0)
+# Project   : Codex Dual-Lane & Security Kit
+#
+# Runs automated security, syntax, hygiene, and deterministic rollback checks
+# across Ubuntu, macOS, and Windows (both PowerShell 5.1 and PowerShell 7+):
+#   1. hygiene-and-policy (ubuntu-latest):
+#        - Line-ending & BOM enforcement per .gitattributes
+#        - Secret, API-key, and personal/private-path leak scanner
+#        - Forbidden tracked artifact guard (__pycache__, auth.json, config.toml)
+#        - Starlark AST & core policy check on templates/default.rules
+#        - Python syntax compilation (py_compile)
+#   2. test-windows (windows-latest):
+#        - Full tests/test-kit.ps1 under Windows PowerShell 5.1 AND PowerShell 7+
+#        - Covers AST parse, Python unittest, default.rules, -DryRun/-WhatIf,
+#          non-destructive TOML merge, env_key secret isolation, Protect-SensitiveFileAcl,
+#          doctor.ps1 zero-leakage/bypass checks, path-traversal rejection, and
+#          SHA-256 rollback inside paths containing spaces and '&'.
+#   3. test-unix (ubuntu-latest & macos-latest):
+#        - bash -n syntax validation on all scripts/*.sh
+#        - py_compile + python3 -B -m unittest discover -s ./tests -v
+#        - Portable end-to-end smoke test (paths with spaces, --dry-run zero-mutation,
+#          TOML merge preservation, 0600 permissions, doctor.sh zero-secret-leakage,
+#          tampered path-traversal manifest rejection, and SHA-256 rollback).
+# ==============================================================================
 name: CI
 
 on:
@@ -6,40 +35,246 @@ on:
   pull_request:
     branches: [ main ]
 
-jobs:
-  test-windows:
-    name: Windows PowerShell & Python Tests
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Run PowerShell & Python Test Suite
-        shell: powershell
-        run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1
+permissions:
+  contents: read
 
-  test-unix:
-    name: Linux Bash Syntax, Unit Tests & Smoke Check
+jobs:
+  hygiene-and-policy:
+    name: Repository Hygiene, Line Endings, Secret Scan & Rules AST
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Verify Bash syntax & LF line endings
+
+      # WHAT: Validates exact line endings (LF vs CRLF per .gitattributes), UTF-8
+      #       BOM hygiene, tracked-file allowlist (no __pycache__/secrets), and
+      #       LICENSE/NOTICE presence.
+      # PREVENTS: Broken Unix shebangs from CRLF, broken PS 5.1 CRLF contracts,
+      #           or accidentally committed credentials/bytecode caches.
+      - name: Verify .gitattributes line endings, BOM & repo hygiene
+        run: |
+          python3 -B - <<'PY'
+          import pathlib, subprocess, sys
+
+          tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode("utf-8").split("\x00")
+          tracked = [p for p in tracked if p]
+          assert tracked, "git ls-files returned empty repository"
+
+          # Verify legal attribution files remain intact.
+          for req in ("LICENSE", "NOTICE"):
+              p = pathlib.Path(req)
+              assert p.is_file() and p.stat().st_size > 0, f"Required file missing or empty: {req}"
+
+          # Reject forbidden tracked artifacts (bytecode caches, live configs, secrets, DBs).
+          forbidden_names = {"auth.json", "config.toml", "config.backup.toml", ".env"}
+          forbidden_suffixes = (".pyc", ".pyo", ".sqlite", ".sqlite-wal", ".sqlite-shm", ".key", ".pem")
+          errors = []
+          for rel in tracked:
+              parts = pathlib.PurePosixPath(rel).parts
+              name = parts[-1]
+              if "__pycache__" in parts or name in forbidden_names or name.startswith(".env.") or rel.endswith(forbidden_suffixes):
+                  errors.append(f"Forbidden tracked file: {rel}")
+                  continue
+
+              data = pathlib.Path(rel).read_bytes()
+              is_crlf_type = rel.endswith((".ps1", ".cmd"))
+              is_lf_type = (
+                  rel.endswith((".sh", ".py", ".md", ".rules", ".yml", ".yaml"))
+                  or name in {"LICENSE", "NOTICE", ".gitattributes", ".gitignore"}
+              )
+
+              if is_crlf_type:
+                  # Every LF in .ps1/.cmd must be preceded by CR (strict CRLF per .gitattributes).
+                  for i, b in enumerate(data):
+                      if b == 0x0A and (i == 0 or data[i - 1] != 0x0D):
+                          errors.append(f"Lone LF found in CRLF-enforced file: {rel}")
+                          break
+              elif is_lf_type:
+                  if data.startswith(b"\xef\xbb\xbf"):
+                      errors.append(f"UTF-8 BOM not permitted in LF-enforced file: {rel}")
+                  if b"\r" in data:
+                      errors.append(f"CR/CRLF byte found in LF-enforced file: {rel}")
+
+          if errors:
+              for err in errors:
+                  print(f"[FAIL] {err}", file=sys.stderr)
+              sys.exit(1)
+          print(f"[PASS] Line endings, BOM, and artifact hygiene verified across {len(tracked)} tracked files.")
+          PY
+
+      # WHAT: Scans all tracked files for accidentally committed API keys, private keys,
+      #       or non-placeholder local home paths (e.g., personal C:\Users\<name> paths).
+      # PREVENTS: Credential leaks or private workstation path disclosure in public PRs.
+      - name: Scan tracked files for leaked secrets & private paths
+        run: |
+          python3 -B - <<'PY'
+          import pathlib, re, subprocess, sys
+
+          tracked = [p for p in subprocess.check_output(["git", "ls-files", "-z"]).decode("utf-8").split("\x00") if p]
+
+          # Build patterns from pieces so this workflow step never self-matches its own regex text.
+          secret_patterns = [
+              ("OpenAI-style secret key", re.compile(r"\b" + r"sk-" + r"[A-Za-z0-9_-]{20,}\b")),
+              ("GitHub PAT", re.compile(r"\b" + r"gh[po]_" + r"[A-Za-z0-9]{20,}\b")),
+              ("AWS Access Key ID", re.compile(r"\b" + r"AKIA" + r"[0-9A-Z]{16}\b")),
+              ("Slack token", re.compile(r"\b" + r"xox[baprs]-" + r"[A-Za-z0-9-]{10,}\b")),
+              ("Private key header", re.compile(r"-----BEGIN " + r"[A-Z ]*PRIVATE KEY-----")),
+          ]
+          # Synthetic test/doc placeholders allowed in tests/ and docs/
+          placeholder_re = re.compile(r"(CANARY|LEGACY|EXAMPLE|PLACEHOLDER|YOUR|REDACTED|DUMMY|FAKE|TEST)", re.IGNORECASE)
+
+          # Detect personal Windows/macOS/Linux user-profile paths while permitting generic placeholders.
+          home_path_re = re.compile(r"(?:[A-Za-z]:\\+Users\\+|/Users/|/home/)([A-Za-z0-9._-]+)")
+          allowed_usernames = {
+              "user", "username", "yourname", "youruser", "your-user", "your_user",
+              "you", "alice", "bob", "example", "runner", "dev", "me",
+          }
+
+          findings = []
+          for rel in tracked:
+              text = pathlib.Path(rel).read_text(encoding="utf-8-sig", errors="replace")
+              for lineno, line in enumerate(text.splitlines(), 1):
+                  for label, pat in secret_patterns:
+                      for match in pat.finditer(line):
+                          if placeholder_re.search(match.group(0)):
+                              continue
+                          findings.append(f"{rel}:{lineno}: potential {label}")
+                  for match in home_path_re.finditer(line):
+                      uname = match.group(1)
+                      if uname.lower() in allowed_usernames:
+                          continue
+                      findings.append(f"{rel}:{lineno}: potential personal home path segment ({uname!r})")
+
+          if findings:
+              for f in findings:
+                  print(f"[FAIL] {f}", file=sys.stderr)
+              sys.exit(1)
+          print(f"[PASS] Secret & private-path leak scan clean across {len(tracked)} tracked files.")
+          PY
+
+      # WHAT: Parses templates/default.rules as Starlark/Python AST and compiles all
+      #       Python files to bytecode (without persisting __pycache__).
+      # PREVENTS: Malformed execpolicy rules or Python syntax regressions.
+      - name: Validate templates/default.rules AST & compile Python scripts
+        run: |
+          python3 -B - <<'PY'
+          import ast, pathlib, py_compile
+
+          py_compile.compile("scripts/sync-sessions.py", doraise=True)
+          py_compile.compile("tests/test_sync_sessions.py", doraise=True)
+
+          rules_path = pathlib.Path("templates/default.rules")
+          tree = ast.parse(rules_path.read_text(encoding="utf-8"), filename=str(rules_path))
+          assert len(tree.body) > 0, "templates/default.rules has zero rules"
+          rules = {}
+          for stmt in tree.body:
+              assert isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+              call = stmt.value
+              assert isinstance(call.func, ast.Name) and call.func.id == "prefix_rule"
+              assert not call.args
+              kw = {k.arg: ast.literal_eval(k.value) for k in call.keywords}
+              assert set(kw.keys()) == {"pattern", "decision"}
+              assert isinstance(kw["pattern"], list) and kw["pattern"] and all(isinstance(x, str) and x for x in kw["pattern"])
+              assert kw["decision"] in {"forbidden", "prompt", "allow"}
+              rules[tuple(kw["pattern"])] = kw["decision"]
+
+          for req_forbid in (("vssadmin",), ("icacls",), ("php",), ("mshta",), ("Start-Process",), ("iex",), ("git", "push", "--force")):
+              assert rules.get(req_forbid) == "forbidden", f"Missing forbidden rule: {req_forbid}"
+          for req_prompt in (("git", "push"), ("git", "reset", "--hard"), ("git", "clean")):
+              assert rules.get(req_prompt) == "prompt", f"Missing prompt rule: {req_prompt}"
+          print(f"[PASS] Python syntax & templates/default.rules AST validated ({len(rules)} rules).")
+          PY
+
+  test-windows:
+    name: Windows PowerShell (5.1 & 7+) & Python Safety Suite
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # WHAT: Syntax-checks Python sources prior to running the full Windows harness.
+      - name: Compile Python scripts (py_compile)
+        shell: powershell
+        run: |
+          python -B -m py_compile .\scripts\sync-sessions.py .\tests\test_sync_sessions.py
+
+      # WHAT: Runs full 8-stage test-kit.ps1 under Windows PowerShell 5.1 (default OS shell).
+      # PREVENTS: PS 5.1 strict-mode, BOM, encoding, ACL, TOML, or rollback regressions.
+      - name: Run Full Security & Rollback Test Suite (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1
+
+      # WHAT: Re-runs full 8-stage test-kit.ps1 under PowerShell 7+ (pwsh).
+      # PREVENTS: Cross-version PowerShell 7 incompatibilities.
+      - name: Run Full Security & Rollback Test Suite (PowerShell 7+)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1
+
+  test-unix:
+    name: Unix Safety Suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # WHAT: Validates Bash syntax on all .sh scripts, compiles Python, and executes
+      #       the full Python unit & adversarial safety suite (including real symlinks).
+      # PREVENTS: Bash 3.2 (macOS) / Bash 5 (Linux) syntax errors and sync-sessions regressions.
+      - name: Verify Bash syntax, py_compile & Python unit tests
         run: |
           bash -n ./scripts/setup-dual-lane.sh
           bash -n ./scripts/doctor.sh
           bash -n ./scripts/restore-original.sh
-          python3 -m unittest discover -s ./tests -v
-      - name: Run Unix installer, doctor & deterministic rollback smoke test
+          python3 -B -m py_compile ./scripts/sync-sessions.py ./tests/test_sync_sessions.py
+          python3 -B -m unittest discover -s ./tests -v
+
+      # WHAT: End-to-end safety smoke test on both Linux and macOS inside a path with spaces:
+      #       --dry-run zero-mutation, non-destructive TOML merge (top-level + sections),
+      #       0600 permissions, doctor.sh zero-secret-leakage, tampered traversal manifest
+      #       rejection, restore --dry-run, and SHA-256 verified rollback.
+      # PREVENTS: Linux/macOS portability bugs (GNU vs BSD stat/sed/shasum/mktemp),
+      #           symlink traversal escapes, permission regressions, and Lane 1 data loss.
+      - name: Run Unix installer, doctor, traversal defense & SHA-256 rollback smoke test
+        shell: bash
         run: |
-          TMP_ROOT="$(mktemp -d)"
-          FAKE_BIN="${TMP_ROOT}/fake-bin"
-          mkdir -p "${FAKE_BIN}" "${TMP_ROOT}/lane1/sessions" "${TMP_ROOT}/lane2"
-          echo '{"id":"s1"}' > "${TMP_ROOT}/lane1/sessions/keep.jsonl"
+          set -euo pipefail
+          sha256_of() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum < "$1" | awk '{print tolower($1)}'
+            else
+              shasum -a 256 < "$1" | awk '{print tolower($1)}'
+            fi
+          }
+
+          TMP_ROOT="$(mktemp -d 2>/dev/null || mktemp -d -t codex-kit-ci)"
+          trap 'rm -rf "${TMP_ROOT}"' EXIT
+
+          WORK_DIR="${TMP_ROOT}/my workspace"
+          REPO_DIR="${WORK_DIR}/my repo"
+          FAKE_BIN="${WORK_DIR}/fake bin"
+          LANE1="${WORK_DIR}/lane1"
+          LANE2="${WORK_DIR}/lane2"
+          LOCAL_BIN="${WORK_DIR}/local bin"
+          OUTSIDE_VICTIM="${TMP_ROOT}/outside_victim.txt"
+
+          mkdir -p "${REPO_DIR}" "${FAKE_BIN}" "${LANE1}/sessions" "${LANE2}"
+          echo '{"id":"s1"}' > "${LANE1}/sessions/keep.jsonl"
+          SESSION_HASH="$(sha256_of "${LANE1}/sessions/keep.jsonl")"
+          echo 'DO_NOT_DELETE' > "${OUTSIDE_VICTIM}"
+          VICTIM_HASH="$(sha256_of "${OUTSIDE_VICTIM}")"
+
           cat > "${FAKE_BIN}/codex" <<'EOF'
           #!/usr/bin/env bash
           if [ "${1:-}" = "--version" ]; then echo "codex-cli 0.171.0-ci"; exit 0; fi
@@ -48,29 +283,96 @@ jobs:
           exit 0
           EOF
           chmod +x "${FAKE_BIN}/codex"
-          cat > "${TMP_ROOT}/lane2/config.toml" <<'EOF'
+
+          cat > "${LANE2}/config.toml" <<'EOF'
+          model = "custom-ci-model"
+
           [mcp_servers.custom_ci]
           command = "node"
           EOF
-          ORIG_HASH="$(sha256sum "${TMP_ROOT}/lane2/config.toml" | awk '{print $1}')"
+          ORIG_HASH="$(sha256_of "${LANE2}/config.toml")"
+
+          SECRET_CANARY="sk-CANARY-UNIX-DOCTOR-NEVER-ECHO-991122"
+          printf '{"auth_mode":"chatgpt","token":"%s"}\n' "${SECRET_CANARY}" > "${LANE2}/auth.json"
+          chmod 600 "${LANE2}/auth.json"
+
+          # 1) --dry-run must perform zero disk mutations.
           PATH="${FAKE_BIN}:${PATH}" \
-          CODEX_LANE1_HOME="${TMP_ROOT}/lane1" \
-          CODEX_LANE2_HOME="${TMP_ROOT}/lane2" \
-          CODEX_LOCAL_BIN="${TMP_ROOT}/local-bin" \
-          ./scripts/setup-dual-lane.sh --repo "${TMP_ROOT}" --install-bridge
-          grep -q 'approval_policy = "on-request"' "${TMP_ROOT}/lane2/config.toml"
-          grep -q 'network_access = false' "${TMP_ROOT}/lane2/config.toml"
-          grep -q '\[mcp_servers\.custom_ci\]' "${TMP_ROOT}/lane2/config.toml"
-          PATH="${TMP_ROOT}/local-bin:${FAKE_BIN}:${PATH}" \
-          CODEX_LANE1_HOME="${TMP_ROOT}/lane1" \
-          CODEX_LANE2_HOME="${TMP_ROOT}/lane2" \
-          CODEX_LOCAL_BIN="${TMP_ROOT}/local-bin" \
-          ./scripts/doctor.sh
-          CODEX_LANE1_HOME="${TMP_ROOT}/lane1" \
-          CODEX_LANE2_HOME="${TMP_ROOT}/lane2" \
-          CODEX_LOCAL_BIN="${TMP_ROOT}/local-bin" \
+          CODEX_LANE1_HOME="${LANE1}" \
+          CODEX_LANE2_HOME="${LANE2}" \
+          CODEX_LOCAL_BIN="${LOCAL_BIN}" \
+          ./scripts/setup-dual-lane.sh --repo "${REPO_DIR}" --install-bridge --dry-run
+          [ "$(sha256_of "${LANE2}/config.toml")" = "${ORIG_HASH}" ]
+          [ ! -e "${LOCAL_BIN}/codex" ]
+          [ ! -L "${LANE2}/sessions" ]
+
+          # 2) Full install preserves top-level keys & custom sections, enforces 0600, creates manifest.
+          PATH="${FAKE_BIN}:${PATH}" \
+          CODEX_LANE1_HOME="${LANE1}" \
+          CODEX_LANE2_HOME="${LANE2}" \
+          CODEX_LOCAL_BIN="${LOCAL_BIN}" \
+          ./scripts/setup-dual-lane.sh --repo "${REPO_DIR}" --install-bridge
+
+          grep -q 'approval_policy = "on-request"' "${LANE2}/config.toml"
+          grep -q 'network_access = false' "${LANE2}/config.toml"
+          grep -q 'model = "custom-ci-model"' "${LANE2}/config.toml"
+          grep -q '\[mcp_servers\.custom_ci\]' "${LANE2}/config.toml"
+          [ -f "${LANE2}/.rollback/latest.tsv" ]
+          python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600' "${LANE2}/config.toml"
+
+          # 3) doctor.sh passes and never echoes auth secret canary.
+          DOC_OUT="$(
+            PATH="${LOCAL_BIN}:${FAKE_BIN}:${PATH}" \
+            CODEX_LANE1_HOME="${LANE1}" \
+            CODEX_LANE2_HOME="${LANE2}" \
+            CODEX_LOCAL_BIN="${LOCAL_BIN}" \
+            ./scripts/doctor.sh
+          )"
+          printf '%s\n' "${DOC_OUT}"
+          if printf '%s' "${DOC_OUT}" | grep -Fq "${SECRET_CANARY}"; then
+            echo "[FAIL] doctor.sh leaked auth.json secret canary!" >&2
+            exit 1
+          fi
+
+          # 4) Adversarial path-traversal manifest must fail closed with zero side effects.
+          BAD_SNAP="${TMP_ROOT}/bad-traversal.tsv"
+          printf '# schema=1\n0\t-\t%s/../outside_victim.txt\t-\n' "${LANE2}" > "${BAD_SNAP}"
+          set +e
+          TRAV_ERR="$(
+            CODEX_LANE1_HOME="${LANE1}" \
+            CODEX_LANE2_HOME="${LANE2}" \
+            CODEX_LOCAL_BIN="${LOCAL_BIN}" \
+            ./scripts/restore-original.sh --snapshot "${BAD_SNAP}" 2>&1
+          )"
+          TRAV_RC=$?
+          set -e
+          if [ "${TRAV_RC}" -eq 0 ]; then
+            echo "[FAIL] restore-original.sh accepted path-traversal manifest!" >&2
+            exit 1
+          fi
+          printf '%s\n' "${TRAV_ERR}" | grep -Eq 'Security violation|traversal'
+          [ -f "${OUTSIDE_VICTIM}" ]
+          [ "$(sha256_of "${OUTSIDE_VICTIM}")" = "${VICTIM_HASH}" ]
+          [ -L "${LANE2}/sessions" ]
+
+          # 5) restore-original.sh --dry-run must perform zero mutations.
+          PRE_RESTORE_HASH="$(sha256_of "${LANE2}/config.toml")"
+          CODEX_LANE1_HOME="${LANE1}" \
+          CODEX_LANE2_HOME="${LANE2}" \
+          CODEX_LOCAL_BIN="${LOCAL_BIN}" \
+          ./scripts/restore-original.sh --dry-run
+          [ "$(sha256_of "${LANE2}/config.toml")" = "${PRE_RESTORE_HASH}" ]
+          [ -L "${LANE2}/sessions" ]
+
+          # 6) Real deterministic SHA-256 rollback restores exact original config & keeps Lane 1 intact.
+          CODEX_LANE1_HOME="${LANE1}" \
+          CODEX_LANE2_HOME="${LANE2}" \
+          CODEX_LOCAL_BIN="${LOCAL_BIN}" \
           ./scripts/restore-original.sh
-          RESTORED_HASH="$(sha256sum "${TMP_ROOT}/lane2/config.toml" | awk '{print $1}')"
+          RESTORED_HASH="$(sha256_of "${LANE2}/config.toml")"
           [ "${ORIG_HASH}" = "${RESTORED_HASH}" ]
-          [ -f "${TMP_ROOT}/lane1/sessions/keep.jsonl" ]
-          rm -rf "${TMP_ROOT}"
+          [ ! -L "${LANE2}/sessions" ]
+          [ ! -e "${LOCAL_BIN}/codex" ]
+          [ -f "${LANE1}/sessions/keep.jsonl" ]
+          [ "$(sha256_of "${LANE1}/sessions/keep.jsonl")" = "${SESSION_HASH}" ]
+          echo "[PASS] Unix smoke, traversal defense, and deterministic SHA-256 rollback passed!"

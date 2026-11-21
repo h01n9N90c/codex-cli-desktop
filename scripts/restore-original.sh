@@ -1,89 +1,678 @@
 #!/usr/bin/env bash
-# Deterministic rollback & recovery tool for Codex Dual-Lane & Security Kit on macOS / Linux / WSL.
+# ==============================================================================
+# Deterministic SHA-256 verified rollback & recovery tool (macOS / Linux / WSL)
+# ==============================================================================
 # Author    : Lê Hoàng Ngọc Tươi
 # Copyright : Copyright 2026 Lê Hoàng Ngọc Tươi
 # License   : Apache-2.0 (https://www.apache.org/licenses/LICENSE-2.0)
+# Project   : Codex Dual-Lane & Security Kit
+#
+# Security & End-User Safety Guarantees:
+#   - Strict Bash error handling (`set -euo pipefail`) and owner-only file
+#     creation mask (`umask 077`).
+#   - Strictly validates every target and backup path from rollback manifests
+#     against trusted roots (LANE1_HOME, LANE2_HOME, LOCAL_BIN):
+#       * Rejects any `..` path-traversal segments or relative paths.
+#       * Rejects symlinks at the target, backup, or any intermediate directory
+#         below the trusted roots.
+#       * Never allows a tampered manifest to widen ALLOWED_ROOTS.
+#   - Portable SHA-256 verification (`sha256sum`, `shasum -a 256`, or `openssl`)
+#     BOTH before staging a backup AND after atomically moving it into place.
+#   - Atomic file restoration (`mktemp` in target dir + `chmod 600` + `mv -f`)
+#     with `trap` cleanup on EXIT/INT/TERM.
+#   - Safely unlinks Lane 2 symlinks first (never `rm -rf` across a symlink) and
+#     proves zero symlinks remain anywhere inside LANE2_HOME before permitting
+#     `--remove-lane2-home`.
+#   - Full `--dry-run` verification mode that validates paths and SHA-256 hashes
+#     without modifying any files on disk.
+# ==============================================================================
 set -euo pipefail
 
+# Enforce owner-only permissions on any temporary staging files created during recovery.
+umask 077
+
+# ------------------------------------------------------------------------------
+# Temporary Artifact Tracking & Signal-Safe Cleanup
+# ------------------------------------------------------------------------------
+TEMP_ARTIFACTS=()
+cleanup_temp_artifacts() {
+  # Guard array length for Bash 3.2 (macOS) compatibility under `set -u`.
+  if [ "${#TEMP_ARTIFACTS[@]}" -gt 0 ]; then
+    rm -rf -- "${TEMP_ARTIFACTS[@]}" 2>/dev/null || true
+  fi
+}
+trap cleanup_temp_artifacts EXIT INT TERM
+
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+
+# Print CLI usage, options, and environment overrides.
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/restore-original.sh [OPTIONS]
+
+Options:
+  --snapshot PATH        Explicit rollback manifest path (default: <LANE2_HOME>/.rollback/latest.tsv)
+  --remove-lane2-home    Remove <LANE2_HOME> after proving zero symlinks remain inside it
+  --dry-run              Verify paths, symlinks, and SHA-256 hashes without modifying disk
+  -h, --help             Show this help message
+
+Environment overrides:
+  CODEX_LANE1_HOME       Primary CODEX_HOME (default: ~/.codex)
+  CODEX_LANE2_HOME       Secondary CODEX_HOME (default: ~/.codex-official)
+  CODEX_LOCAL_BIN        CLI wrapper directory (default: ~/.local/bin)
+EOF
+}
+
+# Validate that an option requiring a value received one before reading $2.
+require_arg() {
+  local opt_name="$1"
+  local arg_count="$2"
+  if [ "${arg_count}" -lt 2 ]; then
+    echo "[FAIL] Option '${opt_name}' requires a value." >&2
+    usage >&2
+    exit 1
+  fi
+}
+
+# Reject empty paths, filesystem root '/', or control characters; strip trailing slashes.
+validate_path_value() {
+  local label="$1"
+  local raw="$2"
+  if [ -z "${raw}" ]; then
+    echo "[FAIL] ${label} must not be empty." >&2
+    exit 1
+  fi
+  if printf '%s' "${raw}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    echo "[FAIL] ${label} contains unsupported control characters." >&2
+    exit 1
+  fi
+  local trimmed="${raw}"
+  while [ "${#trimmed}" -gt 1 ] && [ "${trimmed%/}" != "${trimmed}" ]; do
+    trimmed="${trimmed%/}"
+  done
+  if [ "${trimmed}" = "/" ]; then
+    echo "[FAIL] Refusing filesystem root '/' for ${label}." >&2
+    exit 1
+  fi
+  printf '%s' "${trimmed}"
+}
+
+# Portable physical path canonicalizer (macOS BSD / Linux GNU / WSL / Git Bash).
+# Resolves existing ancestor via `cd -P && pwd -P` so OS symlinks above the
+# user's home/temp dirs (e.g. macOS `/var -> /private/var`) normalize consistently.
+canonicalize_dir() {
+  local p="$1"
+  local suffix=""
+  local cur="${p}"
+  while [ ! -d "${cur}" ]; do
+    local parent base
+    parent="$(dirname -- "${cur}")"
+    base="$(basename -- "${cur}")"
+    if [ "${parent}" = "${cur}" ]; then
+      break
+    fi
+    if [ -n "${suffix}" ]; then
+      suffix="${base}/${suffix}"
+    else
+      suffix="${base}"
+    fi
+    cur="${parent}"
+  done
+  local resolved=""
+  if [ -d "${cur}" ]; then
+    resolved="$(cd -P -- "${cur}" && pwd -P)"
+  else
+    resolved="${cur}"
+  fi
+  if [ -n "${suffix}" ]; then
+    if [ "${resolved}" = "/" ]; then
+      printf '/%s' "${suffix}"
+    else
+      printf '%s/%s' "${resolved}" "${suffix}"
+    fi
+  else
+    printf '%s' "${resolved}"
+  fi
+}
+
+# Portable lowercase 64-hex SHA-256 helper using stdin redirection to prevent
+# leading-dash option injection and GNU backslash-escaped filename prefixes.
+sha256_file() {
+  local file="$1"
+  local digest=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum < "${file}" | awk '{print tolower($1)}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$(shasum -a 256 < "${file}" | awk '{print tolower($1)}')"
+  elif command -v openssl >/dev/null 2>&1; then
+    digest="$(openssl dgst -sha256 < "${file}" | awk '{print tolower($NF)}')"
+  else
+    echo "[FAIL] No SHA-256 utility found (need sha256sum, shasum, or openssl)." >&2
+    exit 1
+  fi
+  if ! printf '%s' "${digest}" | grep -Eq '^[0-9a-f]{64}$'; then
+    echo "[FAIL] Unexpected SHA-256 output while hashing ${file}." >&2
+    exit 1
+  fi
+  printf '%s' "${digest}"
+}
+
+# Multi-layer containment & anti-symlink validator for rollback paths.
+# Enforces all five invariants before any file read, overwrite, or deletion:
+#   1. Non-empty, absolute path (`/*`), free of control characters.
+#   2. Zero `..` or `.` path traversal segments anywhere in the path.
+#   3. Strict descendant (depth >= 1) of a trusted root in ALLOWED_ROOTS
+#      (prevents both sibling-prefix confusion and root-directory deletion).
+#   4. Zero symlinks on the target itself OR any intermediate directory below
+#      the matched trusted root (while permitting OS symlinks strictly above
+#      the root, such as macOS `/var -> /private/var`).
+#   5. Final canonical path starts strictly with `<matched_root>/`.
+assert_safe_contained_path() {
+  local label="$1"
+  local candidate="$2"
+
+  if [ -z "${candidate}" ]; then
+    echo "[FAIL] Security violation: empty path for ${label}." >&2
+    exit 1
+  fi
+  if printf '%s' "${candidate}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    echo "[FAIL] Security violation: control characters in ${label}." >&2
+    exit 1
+  fi
+  case "${candidate}" in
+    /*) ;;
+    *)
+      echo "[FAIL] Security violation: relative path rejected for ${label}: '${candidate}'" >&2
+      exit 1
+      ;;
+  esac
+  # Reject any `..` or `.` path traversal segment lexically.
+  case "/${candidate}/" in
+    */../*|*/./*)
+      echo "[FAIL] Security violation: path traversal segment rejected for ${label}: '${candidate}'" >&2
+      exit 1
+      ;;
+  esac
+
+  # Strip trailing slashes before component walk.
+  local trimmed="${candidate}"
+  while [ "${#trimmed}" -gt 1 ] && [ "${trimmed%/}" != "${trimmed}" ]; do
+    trimmed="${trimmed%/}"
+  done
+
+  local depth=0
+  local cur="${trimmed}"
+  local matched_root=""
+  while true; do
+    # Reject any symlink BEFORE matching ALLOWED_ROOTS so a cross-root symlink
+    # such as `LANE2_HOME/evil -> LANE1_HOME` (or `LANE2_HOME/loop -> LANE2_HOME`)
+    # can NEVER masquerade as a trusted root. OS symlinks strictly above the
+    # root (e.g. macOS `/var -> /private/var`) remain unaffected because `-L`
+    # tests only the leaf component at each step and the loop breaks once the
+    # non-symlink root directory itself matches ALLOWED_ROOTS.
+    if [ -L "${cur}" ]; then
+      echo "[FAIL] Security violation: symlink rejected for ${label}: '${cur}'" >&2
+      exit 1
+    fi
+
+    if [ "${depth}" -ge 1 ]; then
+      local cur_canon root
+      cur_canon="$(canonicalize_dir "${cur}")"
+      for root in "${ALLOWED_ROOTS[@]}"; do
+        if [ "${cur_canon}" = "${root}" ]; then
+          matched_root="${root}"
+          break
+        fi
+      done
+      if [ -n "${matched_root}" ]; then
+        break
+      fi
+    fi
+
+    local parent
+    parent="$(dirname -- "${cur}")"
+    if [ "${parent}" = "${cur}" ]; then
+      break
+    fi
+    cur="${parent}"
+    depth=$((depth + 1))
+  done
+
+  if [ -z "${matched_root}" ]; then
+    echo "[FAIL] Security violation: ${label} '${candidate}' is outside allowed Codex directories!" >&2
+    exit 1
+  fi
+
+  # Defense-in-depth: confirm canonicalized full path stays strictly beneath matched_root.
+  local canon_parent canon_full
+  canon_parent="$(canonicalize_dir "$(dirname -- "${trimmed}")")"
+  canon_full="${canon_parent}/$(basename -- "${trimmed}")"
+  case "${canon_full}" in
+    "${matched_root}/"*) ;;
+    *)
+      echo "[FAIL] Security violation: canonical path '${canon_full}' escaped '${matched_root}'!" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# Atomically restore a verified backup file to its target path.
+# Checks SHA-256 on the backup BEFORE writing, on the staged temp file BEFORE
+# moving, and on the restored target AFTER moving, then removes the backup.
+atomic_restore_verified_file() {
+  local bkp="$1"
+  local target="$2"
+  local expected_sha="$3"
+
+  assert_safe_contained_path "backup file" "${bkp}"
+  assert_safe_contained_path "restore target" "${target}"
+
+  if [ ! -f "${bkp}" ] || [ -L "${bkp}" ]; then
+    echo "[WARN] Backup file missing or not a regular file: ${bkp} (cannot restore ${target})" >&2
+    return 0
+  fi
+
+  local bkp_sha
+  bkp_sha="$(sha256_file "${bkp}")"
+  if [ -n "${expected_sha}" ] && [ "${bkp_sha}" != "${expected_sha}" ]; then
+    echo "[FAIL] SHA-256 mismatch on backup ${bkp}! Expected ${expected_sha}, got ${bkp_sha}." >&2
+    exit 1
+  fi
+
+  if [ -d "${target}" ]; then
+    echo "[FAIL] Refusing to restore regular file over directory: ${target}" >&2
+    exit 1
+  fi
+
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    local target_dir tmp staged_sha restored_sha
+    target_dir="$(dirname -- "${target}")"
+    mkdir -p -- "${target_dir}"
+    tmp="$(mktemp "${target_dir}/.codex-restore.XXXXXX")"
+    TEMP_ARTIFACTS+=("${tmp}")
+    cp -- "${bkp}" "${tmp}"
+    chmod 600 -- "${tmp}"
+
+    staged_sha="$(sha256_file "${tmp}")"
+    if [ "${staged_sha}" != "${bkp_sha}" ]; then
+      echo "[FAIL] Staged SHA-256 verification failed before replacing ${target}!" >&2
+      exit 1
+    fi
+
+    mv -f -- "${tmp}" "${target}"
+
+    restored_sha="$(sha256_file "${target}")"
+    if [ "${restored_sha}" != "${bkp_sha}" ]; then
+      echo "[FAIL] Post-restore SHA-256 verification failed for ${target}!" >&2
+      exit 1
+    fi
+
+    # Remove the consumed backup only after post-restore checksum passes.
+    rm -f -- "${bkp}"
+    echo "    Restored & SHA-256 verified: ${target} (SHA256=${bkp_sha:0:12}...)"
+  else
+    echo "    [DRY-RUN] Verified backup & would restore: ${bkp} -> ${target} (SHA256=${bkp_sha:0:12}...)"
+  fi
+}
+
+# Read-only preflight validator for rollback manifests.
+# Runs BEFORE Step 1 touches any symlink, file, or wrapper so a tampered
+# manifest (path traversal, symlink escape, malformed row, or SHA-256 mismatch)
+# fails closed with ZERO disk side effects.
+preflight_validate_manifest() {
+  local manifest_path="$1"
+  local line_num=0
+  local line existed orig_sha target bkp extra bkp_sha
+  while IFS= read -r line || [ -n "${line}" ]; do
+    line_num=$((line_num + 1))
+    line="${line%$'\r'}"
+    [ -z "${line}" ] && continue
+    case "${line}" in
+      \#*) continue ;;
+    esac
+
+    existed=""
+    orig_sha=""
+    target=""
+    bkp=""
+    extra=""
+    IFS=$'\t' read -r existed orig_sha target bkp extra <<< "${line}"
+
+    if [ -n "${extra}" ] || [ -z "${existed}" ] || [ -z "${target}" ]; then
+      echo "[FAIL] Malformed manifest entry at ${manifest_path}:${line_num}." >&2
+      exit 1
+    fi
+
+    assert_safe_contained_path "manifest target" "${target}"
+
+    case "${existed}" in
+      1)
+        orig_sha="$(printf '%s' "${orig_sha}" | awk '{print tolower($0)}')"
+        if ! printf '%s' "${orig_sha}" | grep -Eq '^[0-9a-f]{64}$'; then
+          echo "[FAIL] Invalid SHA-256 hash in manifest at ${manifest_path}:${line_num}." >&2
+          exit 1
+        fi
+        assert_safe_contained_path "manifest backup" "${bkp}"
+        if [ -f "${bkp}" ] && [ ! -L "${bkp}" ]; then
+          bkp_sha="$(sha256_file "${bkp}")"
+          if [ "${bkp_sha}" != "${orig_sha}" ]; then
+            echo "[FAIL] SHA-256 mismatch on backup ${bkp}! Expected ${orig_sha}, got ${bkp_sha}." >&2
+            exit 1
+          fi
+        fi
+        ;;
+      0)
+        if [ -d "${target}" ]; then
+          echo "[FAIL] Refusing to remove directory listed as newly created file: ${target}" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        echo "[FAIL] Invalid existed_prior flag '${existed}' at ${manifest_path}:${line_num}." >&2
+        exit 1
+        ;;
+    esac
+  done < "${manifest_path}"
+}
+
+# Find the newest timestamped backup matching `<prefix>.backup-*` safely via
+# Bash `nullglob` (never parsing `ls`, immune to spaces/weird filenames).
+# Filters strictly to regular files (`file`) or real directories (`dir`),
+# rejecting symlinks at discovery time.
+find_latest_backup() {
+  local kind="$1"
+  local prefix="$2"
+  local latest=""
+  local cand
+
+  shopt -s nullglob
+  for cand in "${prefix}.backup-"*; do
+    # Skip symlinks unconditionally so attacker-planted backup links are ignored.
+    [ -L "${cand}" ] && continue
+    if [ "${kind}" = "dir" ] && [ ! -d "${cand}" ]; then
+      continue
+    fi
+    if [ "${kind}" = "file" ] && [ ! -f "${cand}" ]; then
+      continue
+    fi
+    # Timestamps are YYYYMMDD-HHMMSS, so lexicographic order is chronological.
+    if [ -z "${latest}" ] || [[ "${cand}" > "${latest}" ]]; then
+      latest="${cand}"
+    fi
+  done
+  shopt -u nullglob
+
+  printf '%s' "${latest}"
+}
+
+# ------------------------------------------------------------------------------
+# CLI Argument Parsing & Trusted Root Initialization
+# ------------------------------------------------------------------------------
 LANE1_HOME="${CODEX_LANE1_HOME:-${HOME}/.codex}"
 LANE2_HOME="${CODEX_LANE2_HOME:-${HOME}/.codex-official}"
 LOCAL_BIN="${CODEX_LOCAL_BIN:-${HOME}/.local/bin}"
+SNAPSHOT_PATH=""
 REMOVE_LANE2=0
 DRY_RUN=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --remove-lane2-home) REMOVE_LANE2=1; shift ;;
-    --dry-run) DRY_RUN=1; shift ;;
+    --snapshot)
+      require_arg "$1" "$#"
+      SNAPSHOT_PATH="$2"
+      shift 2
+      ;;
+    --remove-lane2-home)
+      REMOVE_LANE2=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
     -h|--help)
-      echo "Usage: ./scripts/restore-original.sh [--remove-lane2-home] [--dry-run]"
+      usage
       exit 0
       ;;
-    *) echo "[FAIL] Unknown argument: $1" >&2; exit 1 ;;
+    *)
+      echo "[FAIL] Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
   esac
 done
 
-echo "=== Codex Dual-Lane Deterministic Rollback & Recovery (Unix / macOS / WSL) ==="
-[ "${DRY_RUN}" -eq 1 ] && echo "[DRY-RUN MODE] No files will be modified."
+LANE1_HOME="$(validate_path_value "LANE1_HOME" "${LANE1_HOME}")"
+LANE2_HOME="$(validate_path_value "LANE2_HOME" "${LANE2_HOME}")"
+LOCAL_BIN="$(validate_path_value "LOCAL_BIN" "${LOCAL_BIN}")"
 
-# 1. Safely unlink symlinks in Lane 2 first (never rm -rf through a symlink target)
+# Reject symlinked CODEX_HOME roots BEFORE canonicalize_dir resolves symlinks
+# (applies in both normal and --dry-run modes so `--remove-lane2-home` can
+# never resolve a symlinked LANE2_HOME and delete its target directory).
+for home_root in "${LANE1_HOME}" "${LANE2_HOME}"; do
+  if [ -L "${home_root}" ]; then
+    echo "[FAIL] Security refusal: CODEX_HOME '${home_root}' must not be a symlink." >&2
+    exit 1
+  fi
+done
+
+# Canonicalize trusted roots once from user/env values ONLY; a rollback manifest
+# is NEVER permitted to redefine or widen ALLOWED_ROOTS.
+LANE1_HOME="$(canonicalize_dir "${LANE1_HOME}")"
+LANE2_HOME="$(canonicalize_dir "${LANE2_HOME}")"
+LOCAL_BIN="$(canonicalize_dir "${LOCAL_BIN}")"
+
+if [ "${LANE1_HOME}" = "${LANE2_HOME}" ]; then
+  echo "[FAIL] LANE1_HOME and LANE2_HOME resolve to the same directory ('${LANE1_HOME}'); aborting." >&2
+  exit 1
+fi
+
+ALLOWED_ROOTS=("${LANE1_HOME}" "${LANE2_HOME}" "${LOCAL_BIN}")
+
+echo "=== Codex Dual-Lane Deterministic Rollback & Recovery (Unix / macOS / WSL) ==="
+[ "${DRY_RUN}" -eq 1 ] && echo "[DRY-RUN MODE] Verifying paths & SHA-256 hashes without modifying disk."
+
+# Resolve rollback manifest path (explicit --snapshot must exist and not be a symlink).
+MANIFEST_FILE=""
+if [ -n "${SNAPSHOT_PATH}" ]; then
+  SNAPSHOT_PATH="$(validate_path_value "--snapshot" "${SNAPSHOT_PATH}")"
+  case "/${SNAPSHOT_PATH}/" in
+    */../*)
+      echo "[FAIL] Security violation: path traversal rejected in --snapshot: '${SNAPSHOT_PATH}'" >&2
+      exit 1
+      ;;
+  esac
+  if [ -L "${SNAPSHOT_PATH}" ]; then
+    echo "[FAIL] Security violation: --snapshot path must not be a symlink: '${SNAPSHOT_PATH}'" >&2
+    exit 1
+  fi
+  if [ ! -f "${SNAPSHOT_PATH}" ]; then
+    echo "[FAIL] Specified --snapshot manifest does not exist: '${SNAPSHOT_PATH}'" >&2
+    exit 1
+  fi
+  MANIFEST_FILE="${SNAPSHOT_PATH}"
+else
+  DEFAULT_MANIFEST="${LANE2_HOME}/.rollback/latest.tsv"
+  if [ -e "${DEFAULT_MANIFEST}" ] || [ -L "${DEFAULT_MANIFEST}" ]; then
+    assert_safe_contained_path "default rollback manifest" "${DEFAULT_MANIFEST}"
+    if [ -f "${DEFAULT_MANIFEST}" ]; then
+      MANIFEST_FILE="${DEFAULT_MANIFEST}"
+    fi
+  fi
+fi
+
+# Run full read-only manifest preflight BEFORE Step 1 mutates any symlink or file.
+if [ -n "${MANIFEST_FILE}" ]; then
+  preflight_validate_manifest "${MANIFEST_FILE}"
+fi
+
+# ------------------------------------------------------------------------------
+# Step 1: Safely Unlink Shared Symlinks in Lane 2 First
+# ------------------------------------------------------------------------------
+# Critical safety invariant: ALWAYS unlink symlinks with `rm` (never `rm -rf`)
+# before any other operation so Lane 1's real sessions/memories/skills are safe.
 echo "[+] Step 1: Unlinking shared symlinks in ${LANE2_HOME}..."
-for d in memories memories_v2 sessions archived_sessions skills plugins; do
+SHARED_DIRS=(memories memories_v2 sessions archived_sessions skills plugins)
+for d in "${SHARED_DIRS[@]}"; do
   target="${LANE2_HOME}/${d}"
   if [ -L "${target}" ]; then
-    [ "${DRY_RUN}" -eq 0 ] && rm "${target}"
-    echo "    Unlinked symlink: ${target} (Lane 1 data untouched)"
-  fi
-  latest_dir_bkp="$(ls -1dt "${LANE2_HOME}/${d}.backup-"* 2>/dev/null | head -n 1 || true)"
-  if [ -n "${latest_dir_bkp}" ] && [ ! -e "${target}" ]; then
-    [ "${DRY_RUN}" -eq 0 ] && mv "${latest_dir_bkp}" "${target}"
-    echo "    Restored pre-existing directory: ${latest_dir_bkp} -> ${target}"
-  fi
-done
-
-# 2. Restore latest timestamped backups for config.toml, AGENTS.md, rules/default.rules
-echo "[+] Step 2: Restoring backed-up configuration and rule files..."
-restore_latest() {
-  local file="$1"
-  local bkp
-  bkp="$(ls -1t "${file}.backup-"* 2>/dev/null | head -n 1 || true)"
-  if [ -n "${bkp}" ]; then
     if [ "${DRY_RUN}" -eq 0 ]; then
-      cp "${bkp}" "${file}"
-      rm -f "${bkp}"
-    fi
-    echo "    Restored: ${bkp} -> ${file}"
-  fi
-}
-
-for home_dir in "${LANE1_HOME}" "${LANE2_HOME}"; do
-  restore_latest "${home_dir}/config.toml"
-  restore_latest "${home_dir}/AGENTS.md"
-  restore_latest "${home_dir}/rules/default.rules"
-done
-
-# 3. Remove CLI wrappers
-echo "[+] Step 3: Removing CLI wrappers from ${LOCAL_BIN}..."
-for w in codex codex-official codex-t3; do
-  if [ -f "${LOCAL_BIN}/${w}" ]; then
-    [ "${DRY_RUN}" -eq 0 ] && rm -f "${LOCAL_BIN}/${w}"
-    echo "    Removed wrapper: ${LOCAL_BIN}/${w}"
-  fi
-done
-
-# 4. Optional: remove Lane 2 home directory after confirming zero symlinks remain
-if [ "${REMOVE_LANE2}" -eq 1 ] && [ -d "${LANE2_HOME}" ]; then
-  echo "[+] Step 4: Removing ${LANE2_HOME} (--remove-lane2-home)..."
-  if [ "${DRY_RUN}" -eq 0 ]; then
-    for d in memories memories_v2 sessions archived_sessions skills plugins; do
-      if [ -L "${LANE2_HOME}/${d}" ]; then
-        echo "[FAIL] Symlink still present at ${LANE2_HOME}/${d}; aborting removal." >&2
+      rm -- "${target}"
+      if [ -L "${target}" ] || [ -e "${target}" ]; then
+        echo "[FAIL] Failed to unlink symlink ${target}; aborting to protect Lane 1 data." >&2
         exit 1
       fi
-    done
-    rm -rf "${LANE2_HOME}"
+      echo "    Unlinked symlink: ${target} (Lane 1 data untouched)"
+    else
+      echo "    [DRY-RUN] Would unlink symlink: ${target} (Lane 1 data untouched)"
+    fi
   fi
-  echo "    Removed directory: ${LANE2_HOME}"
+
+  latest_dir_bkp="$(find_latest_backup "dir" "${target}")"
+  if [ -n "${latest_dir_bkp}" ] && [ ! -e "${target}" ] && [ ! -L "${target}" ]; then
+    assert_safe_contained_path "directory backup" "${latest_dir_bkp}"
+    if [ "${DRY_RUN}" -eq 0 ]; then
+      mv -- "${latest_dir_bkp}" "${target}"
+      echo "    Restored pre-existing directory: ${latest_dir_bkp} -> ${target}"
+    else
+      echo "    [DRY-RUN] Would restore pre-existing directory: ${latest_dir_bkp} -> ${target}"
+    fi
+  fi
+done
+
+# Confirm primary Lane 1 directories remain intact after unlinking Lane 2.
+for d in sessions memories; do
+  if [ -d "${LANE1_HOME}/${d}" ]; then
+    echo "    Verified Lane 1 data intact: ${LANE1_HOME}/${d}"
+  fi
+done
+
+# ------------------------------------------------------------------------------
+# Step 2: Restore Backed-Up Files with SHA-256 Integrity Verification
+# ------------------------------------------------------------------------------
+echo "[+] Step 2: Restoring configuration & rule files with SHA-256 verification..."
+if [ -n "${MANIFEST_FILE}" ]; then
+  echo "    Loaded rollback manifest: ${MANIFEST_FILE}"
+  line_num=0
+  while IFS= read -r line || [ -n "${line}" ]; do
+    line_num=$((line_num + 1))
+    # Tolerate CRLF if manifest was edited or inspected across WSL/Windows.
+    line="${line%$'\r'}"
+    [ -z "${line}" ] && continue
+    case "${line}" in
+      \#*) continue ;;
+    esac
+
+    # Strict 4-column TSV parsing: existed_prior, original_sha256, target_path, backup_path.
+    existed=""
+    orig_sha=""
+    target=""
+    bkp=""
+    extra=""
+    IFS=$'\t' read -r existed orig_sha target bkp extra <<< "${line}"
+
+    if [ -n "${extra}" ] || [ -z "${existed}" ] || [ -z "${target}" ]; then
+      echo "[FAIL] Malformed manifest entry at ${MANIFEST_FILE}:${line_num}." >&2
+      exit 1
+    fi
+
+    # Validate target containment & anti-symlink BEFORE inspecting anything else.
+    assert_safe_contained_path "manifest target" "${target}"
+
+    case "${existed}" in
+      1)
+        orig_sha="$(printf '%s' "${orig_sha}" | awk '{print tolower($0)}')"
+        if ! printf '%s' "${orig_sha}" | grep -Eq '^[0-9a-f]{64}$'; then
+          echo "[FAIL] Invalid SHA-256 hash in manifest at ${MANIFEST_FILE}:${line_num}." >&2
+          exit 1
+        fi
+        atomic_restore_verified_file "${bkp}" "${target}" "${orig_sha}"
+        ;;
+      0)
+        if [ -e "${target}" ] || [ -L "${target}" ]; then
+          if [ -d "${target}" ]; then
+            echo "[FAIL] Refusing to remove directory listed as newly created file: ${target}" >&2
+            exit 1
+          fi
+          if [ "${DRY_RUN}" -eq 0 ]; then
+            rm -f -- "${target}"
+            echo "    Removed newly created file: ${target}"
+          else
+            echo "    [DRY-RUN] Would remove newly created file: ${target}"
+          fi
+        fi
+        ;;
+      *)
+        echo "[FAIL] Invalid existed_prior flag '${existed}' at ${MANIFEST_FILE}:${line_num}." >&2
+        exit 1
+        ;;
+    esac
+  done < "${MANIFEST_FILE}"
+else
+  echo "    No rollback manifest found; falling back to latest timestamped .backup-* files."
+  for home_dir in "${LANE1_HOME}" "${LANE2_HOME}"; do
+    for rel in "config.toml" "AGENTS.md" "rules/default.rules"; do
+      target_file="${home_dir}/${rel}"
+      bkp_file="$(find_latest_backup "file" "${target_file}")"
+      if [ -n "${bkp_file}" ]; then
+        atomic_restore_verified_file "${bkp_file}" "${target_file}" ""
+      fi
+    done
+  done
+fi
+
+# ------------------------------------------------------------------------------
+# Step 3: Remove Dual-Lane CLI Wrappers from LOCAL_BIN
+# ------------------------------------------------------------------------------
+echo "[+] Step 3: Removing CLI wrappers from ${LOCAL_BIN}..."
+for w in codex codex-official codex-t3; do
+  wp="${LOCAL_BIN}/${w}"
+  if [ -L "${wp}" ]; then
+    echo "[WARN] Leaving unexpected symlink untouched in ${LOCAL_BIN}: ${wp}" >&2
+  elif [ -f "${wp}" ]; then
+    if [ "${DRY_RUN}" -eq 0 ]; then
+      rm -f -- "${wp}"
+      echo "    Removed wrapper: ${wp}"
+    else
+      echo "    [DRY-RUN] Would remove wrapper: ${wp}"
+    fi
+  fi
+done
+
+# ------------------------------------------------------------------------------
+# Step 4: Optional Complete Removal of LANE2_HOME (After Proving Zero Symlinks)
+# ------------------------------------------------------------------------------
+if [ "${REMOVE_LANE2}" -eq 1 ]; then
+  if [ -L "${LANE2_HOME}" ]; then
+    echo "[FAIL] Security refusal: LANE2_HOME '${LANE2_HOME}' is itself a symlink; aborting removal." >&2
+    exit 1
+  fi
+  HOME_CANON="$(canonicalize_dir "${HOME}")"
+  if [ "${LANE2_HOME}" = "${HOME_CANON}" ] || [ "${LANE2_HOME}" = "${LANE1_HOME}" ]; then
+    echo "[FAIL] Security refusal: refusing to remove '${LANE2_HOME}'." >&2
+    exit 1
+  fi
+  if [ -d "${LANE2_HOME}" ]; then
+    echo "[+] Step 4: Removing ${LANE2_HOME} (--remove-lane2-home)..."
+    # Scan the entire Lane 2 tree for ANY remaining symlink before permitting rm -rf.
+    remaining_links="$(find "${LANE2_HOME}" -type l 2>/dev/null || true)"
+    if [ -n "${remaining_links}" ]; then
+      if [ "${DRY_RUN}" -eq 1 ]; then
+        echo "    [DRY-RUN] Note: symlinks still present only because --dry-run skipped unlinking in Step 1."
+      else
+        echo "[FAIL] Refusing to remove ${LANE2_HOME}: symlink(s) still present!" >&2
+        exit 1
+      fi
+    fi
+    if [ "${DRY_RUN}" -eq 0 ]; then
+      rm -rf -- "${LANE2_HOME}"
+      echo "    Removed directory: ${LANE2_HOME} (Lane 1 data verified safe)"
+    else
+      echo "    [DRY-RUN] Would remove directory: ${LANE2_HOME} (after unlinking symlinks)"
+    fi
+  fi
 fi
 
 echo "[OK] Deterministic rollback completed!"
