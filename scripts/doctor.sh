@@ -83,7 +83,7 @@ first_line_or_default() {
 get_octal_mode() {
   local path="$1"
   local mode=""
-  if mode="$(stat -c '%a' -- "${path}" 2>/dev/null)"; then
+  if mode="$(stat -c '%a' "${path}" 2>/dev/null)"; then
     printf '%s' "${mode}"
   elif mode="$(stat -f '%Lp' "${path}" 2>/dev/null)"; then
     printf '%s' "${mode}"

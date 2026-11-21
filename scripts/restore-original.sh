@@ -287,13 +287,19 @@ atomic_restore_verified_file() {
   fi
 
   if [ "${DRY_RUN}" -eq 0 ]; then
-    local target_dir tmp staged_sha restored_sha
-    target_dir="$(dirname -- "${target}")"
+    local target_dir tmp staged_sha restored_sha restore_mode
+    target_dir="$(dirname "${target}")"
     mkdir -p -- "${target_dir}"
     tmp="$(mktemp "${target_dir}/.codex-restore.XXXXXX")"
     TEMP_ARTIFACTS+=("${tmp}")
     cp -- "${bkp}" "${tmp}"
-    chmod 600 -- "${tmp}"
+    # Preserve executable bit for CLI launchers in LOCAL_BIN (or executable backups);
+    # omit `--` on chmod for BSD/macOS compatibility.
+    restore_mode="600"
+    if [ -x "${bkp}" ] || [ "${target_dir}" = "${LOCAL_BIN}" ]; then
+      restore_mode="700"
+    fi
+    chmod "${restore_mode}" "${tmp}"
 
     staged_sha="$(sha256_file "${tmp}")"
     if [ "${staged_sha}" != "${bkp_sha}" ]; then
@@ -553,6 +559,20 @@ done
 # Step 2: Restore Backed-Up Files with SHA-256 Integrity Verification
 # ------------------------------------------------------------------------------
 echo "[+] Step 2: Restoring configuration & rule files with SHA-256 verification..."
+HANDLED_TARGETS=()
+is_handled_target() {
+  local needle="$1"
+  local item
+  if [ "${#HANDLED_TARGETS[@]}" -gt 0 ]; then
+    for item in "${HANDLED_TARGETS[@]}"; do
+      if [ "${item}" = "${needle}" ]; then
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
 if [ -n "${MANIFEST_FILE}" ]; then
   echo "    Loaded rollback manifest: ${MANIFEST_FILE}"
   line_num=0
@@ -580,6 +600,7 @@ if [ -n "${MANIFEST_FILE}" ]; then
 
     # Validate target containment & anti-symlink BEFORE inspecting anything else.
     assert_safe_contained_path "manifest target" "${target}"
+    HANDLED_TARGETS+=("${target}")
 
     case "${existed}" in
       1)
@@ -624,12 +645,18 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Step 3: Remove Dual-Lane CLI Wrappers from LOCAL_BIN
+# Step 3: Restore Pre-Existing Launchers or Remove Newly Created Wrappers
 # ------------------------------------------------------------------------------
-echo "[+] Step 3: Removing CLI wrappers from ${LOCAL_BIN}..."
+echo "[+] Step 3: Reconciling CLI wrappers in ${LOCAL_BIN}..."
 for w in codex codex-official codex-t3; do
   wp="${LOCAL_BIN}/${w}"
-  if [ -L "${wp}" ]; then
+  if is_handled_target "${wp}"; then
+    continue
+  fi
+  bkp_wrapper="$(find_latest_backup "file" "${wp}")"
+  if [ -n "${bkp_wrapper}" ]; then
+    atomic_restore_verified_file "${bkp_wrapper}" "${wp}" ""
+  elif [ -L "${wp}" ]; then
     echo "[WARN] Leaving unexpected symlink untouched in ${LOCAL_BIN}: ${wp}" >&2
   elif [ -f "${wp}" ]; then
     if [ "${DRY_RUN}" -eq 0 ]; then

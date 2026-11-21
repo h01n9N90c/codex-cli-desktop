@@ -220,12 +220,47 @@ atomic_write_from_stdin() {
     exit 1
   fi
   local parent tmp
-  parent="$(dirname -- "${dst}")"
+  parent="$(dirname "${dst}")"
   tmp="$(mktemp "${parent}/.codex-tmp.XXXXXX")"
   TEMP_ARTIFACTS+=("${tmp}")
   cat > "${tmp}"
-  chmod "${mode}" -- "${tmp}"
+  chmod "${mode}" "${tmp}"
   mv -f -- "${tmp}" "${dst}"
+}
+
+# Back up a pre-existing target file (such as a CLI launcher in LOCAL_BIN)
+# before overwriting it, recording its SHA-256 and backup path in MANIFEST_ROWS
+# so restore-original.sh restores pre-existing files instead of deleting them.
+record_target_for_rollback() {
+  local dst="$1"
+  local bkp_mode="${2:-600}"
+  if [ -L "${dst}" ]; then
+    echo "[FAIL] Security refusal: destination '${dst}' is a symlink; refusing to overwrite." >&2
+    exit 1
+  fi
+  if [ -d "${dst}" ]; then
+    echo "[FAIL] Refusing to overwrite directory '${dst}' with a regular file." >&2
+    exit 1
+  fi
+  if [ -f "${dst}" ]; then
+    local orig_hash bkp bkp_hash
+    orig_hash="$(sha256_file "${dst}")"
+    bkp="${dst}.backup-${stamp}"
+    if [ "${DRY_RUN}" -eq 0 ]; then
+      atomic_write_from_stdin "${bkp}" "${bkp_mode}" < "${dst}"
+      bkp_hash="$(sha256_file "${bkp}")"
+      if [ "${bkp_hash}" != "${orig_hash}" ]; then
+        echo "[FAIL] Backup integrity verification failed for ${bkp}." >&2
+        exit 1
+      fi
+      echo "    Backup saved: ${bkp} (SHA256=${orig_hash:0:12}...)"
+    else
+      echo "    [DRY-RUN] Would save backup: ${bkp} (SHA256=${orig_hash:0:12}...)"
+    fi
+    MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s' "${orig_hash}" "${dst}" "${bkp}")")
+  else
+    MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-' "${dst}")")
+  fi
 }
 
 # Back up an existing file with SHA-256 verification and atomically install a
@@ -520,7 +555,8 @@ if [ "${DRY_RUN}" -eq 0 ]; then
   done
   mkdir -p -- "${LANE1_HOME}/rules" "${LANE2_HOME}/rules" "${LOCAL_BIN}"
   # Enforce 0700 on both CODEX_HOME roots and rules dirs even if pre-existing.
-  chmod 700 -- "${LANE1_HOME}" "${LANE1_HOME}/rules" "${LANE2_HOME}" "${LANE2_HOME}/rules" 2>/dev/null || true
+  # Note: omit `--` on chmod for BSD/macOS compatibility (paths are validated absolute).
+  chmod 700 "${LANE1_HOME}" "${LANE1_HOME}/rules" "${LANE2_HOME}" "${LANE2_HOME}/rules" 2>/dev/null || true
 fi
 
 # ------------------------------------------------------------------------------
@@ -533,7 +569,7 @@ for d in "${SHARED_DIRS[@]}"; do
   dst_link="${LANE2_HOME}/${d}"
   if [ "${DRY_RUN}" -eq 0 ]; then
     mkdir -p -- "${src_dir}"
-    chmod 700 -- "${src_dir}" 2>/dev/null || true
+    chmod 700 "${src_dir}" 2>/dev/null || true
   fi
   if [ -L "${dst_link}" ]; then
     existing_target="$(readlink "${dst_link}" 2>/dev/null || true)"
@@ -740,14 +776,14 @@ if [ "${DRY_RUN}" -eq 0 ]; then
   } | atomic_write_from_stdin "${CFG2}" 600
 
   # Tighten permissions on sensitive auth/config files in both lanes (regular
-  # files only; never traverse symlinks with chmod).
+  # files only; never traverse symlinks with chmod; omit `--` for BSD/macOS chmod).
   for sec_f in \
     "${LANE1_HOME}/auth.json" \
     "${LANE1_HOME}/config.toml" \
     "${LANE2_HOME}/auth.json" \
     "${LANE2_HOME}/config.toml"; do
     if [ -f "${sec_f}" ] && [ ! -L "${sec_f}" ]; then
-      chmod 600 -- "${sec_f}" 2>/dev/null || true
+      chmod 600 "${sec_f}" 2>/dev/null || true
     fi
   done
   echo "    Wrote: ${CFG2} (approval_policy=${APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK})"
@@ -760,10 +796,18 @@ fi
 # ------------------------------------------------------------------------------
 # Single-quote every embedded path so spaces, `$`, backticks, quotes, or `&` in
 # directory names can NEVER be evaluated as shell code when users run `codex`.
+# Pre-existing launchers in LOCAL_BIN are backed up with SHA-256 verification
+# and recorded in MANIFEST_ROWS so rollback restores them instead of deleting.
 Q_LANE1_HOME="$(shell_quote "${LANE1_HOME}")"
 Q_LANE2_HOME="$(shell_quote "${LANE2_HOME}")"
 Q_CARGO_TARGET="$(shell_quote "${CARGO_TARGET_LANE2}")"
 Q_CODEX_BIN="$(shell_quote "${CODEX_BIN}")"
+Q_PRIMARY_REPO="$(shell_quote "${REPO_PATH}")"
+Q_LANE2_REPO="$(shell_quote "${EFFECTIVE_LANE2_REPO}")"
+
+for name in codex codex-official codex-t3; do
+  record_target_for_rollback "${LOCAL_BIN}/${name}" 700
+done
 
 if [ "${DRY_RUN}" -eq 0 ]; then
   for name in codex codex-official; do
@@ -773,6 +817,16 @@ if [ "${DRY_RUN}" -eq 0 ]; then
       printf 'export CODEX_HOME=%s\n' "${Q_LANE2_HOME}"
       printf 'export CODEX_ACTIVE_LANE=%s\n' "'LANE_2'"
       printf 'export CARGO_TARGET_DIR=%s\n' "${Q_CARGO_TARGET}"
+      if [ "${USE_GIT_WORKTREE}" -eq 1 ] && [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ]; then
+        printf 'export CODEX_PRIMARY_REPO=%s\n' "${Q_PRIMARY_REPO}"
+        printf 'export CODEX_LANE2_WORKTREE=%s\n' "${Q_LANE2_REPO}"
+        printf '# Enforce OS workspace-write boundary: switch cwd from primary repo to Lane 2 worktree.\n'
+        printf 'if [ -z "${CODEX_NO_AUTO_WORKTREE_CD:-}" ] && [ -d "${CODEX_LANE2_WORKTREE}" ]; then\n'
+        printf '  case "$(pwd -P 2>/dev/null || pwd)/" in\n'
+        printf '    "${CODEX_PRIMARY_REPO}/"*) cd "${CODEX_LANE2_WORKTREE}" || exit 1 ;;\n'
+        printf '  esac\n'
+        printf 'fi\n'
+      fi
       printf 'exec %s "$@"\n' "${Q_CODEX_BIN}"
     } | atomic_write_from_stdin "${LOCAL_BIN}/${name}" 700
   done
@@ -805,7 +859,7 @@ if [ "${INSTALL_BRIDGE}" -eq 1 ]; then
     fi
     if [ ! -f "${BRIDGE_DST}" ]; then
       if [ "${DRY_RUN}" -eq 0 ]; then
-        mkdir -p -- "$(dirname -- "${BRIDGE_DST}")"
+        mkdir -p -- "$(dirname "${BRIDGE_DST}")"
         # Repo documentation file contains zero secrets; 0644 matches normal repo permissions.
         atomic_write_from_stdin "${BRIDGE_DST}" 644 < "${KIT_ROOT}/templates/DUAL_LANE_BRIDGE.md"
         echo "    Created: ${BRIDGE_DST}"
@@ -852,7 +906,7 @@ if [ "${DRY_RUN}" -eq 0 ]; then
     exit 1
   fi
   mkdir -p -- "${ROLLBACK_DIR}"
-  chmod 700 -- "${ROLLBACK_DIR}" 2>/dev/null || true
+  chmod 700 "${ROLLBACK_DIR}" 2>/dev/null || true
 
   UTC_NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%dT%H:%M:%S)"
   SNAP_FILE="${ROLLBACK_DIR}/snapshot-${stamp}.tsv"

@@ -240,40 +240,70 @@ function Find-PlaintextSecretsInToml([string]$ConfigText) {
 function Test-SandboxDenyAclState([string]$LaneHomePath) {
     <#
     .SYNOPSIS
-        Strictly read-only advisory inspection of <CODEX_HOME>\.sandbox\deny_read_acl_state.json.
-        WHY: Codex's Windows elevated sandbox tracks paths protected by Deny-Read ACLs in this
-        JSON file. Inspecting only presence, JSON parseability, and entry count verifies the file
-        is healthy without ever modifying it or printing any internal paths/contents.
+        Strictly read-only host-side inspection of <CODEX_HOME>\.sandbox\deny_read_acl_state.json.
+        WHY:
+          Codex's Windows elevated sandbox tracks paths protected by Deny-Read ACLs in this JSON file
+          (under `{ "principals": { "<SID>": [ "<path>", ... ] } }`).
+          This function inspects:
+            1. Presence & JSON parseability (detecting 22-byte NUL torn-write corruption that breaks
+               Codex sandbox initialization).
+            2. Count of tracked principal SIDs and deny-read path entries (without printing any paths).
+            3. Host-side NTFS DACL on `deny_read_acl_state.json` (whether `CodexSandboxUsers` holds
+               inherited/explicit Write or Modify access).
+           BOUNDARY NOTE: `doctor.ps1` runs under the current Windows user context and performs static
+          host-side DACL & structural inspection only; it does NOT spawn a child token under
+          `CodexSandboxOffline`. For live sandbox-identity execution probes, see `docs/REAL_CODEX_CHECKLIST.md`.
     #>
     $statePath = Join-Path $LaneHomePath '.sandbox\deny_read_acl_state.json'
     if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
-        return [PSCustomObject]@{ Present = $false; ValidJson = $false; EntryCount = 0 }
+        return [PSCustomObject]@{ Present = $false; ValidJson = $false; EntryCount = 0; PrincipalCount = 0; SandboxWritable = $false }
     }
+    $sandboxWritable = $false
+    try {
+        $stateAcl = Get-Acl -LiteralPath $statePath -ErrorAction Stop
+        $writeRules = @($stateAcl.Access | Where-Object {
+            ($_.IdentityReference.Value -like '*CodexSandboxUsers*') -and
+            ($_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) -and
+            (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) -or
+             ($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify))
+        })
+        if ($writeRules.Count -gt 0) { $sandboxWritable = $true }
+    } catch {}
     try {
         # Explicit UTF-8 read handles non-ASCII paths cleanly on PowerShell 5.1 without modifying the file.
         $raw = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 -ErrorAction Stop
         if ([string]::IsNullOrWhiteSpace($raw)) {
-            return [PSCustomObject]@{ Present = $true; ValidJson = $false; EntryCount = 0 }
+            return [PSCustomObject]@{ Present = $true; ValidJson = $false; EntryCount = 0; PrincipalCount = 0; SandboxWritable = $sandboxWritable }
         }
         $obj = $raw | ConvertFrom-Json -ErrorAction Stop
         $count = 0
+        $principalCount = 0
         if ($obj -is [System.Array]) {
             $count = $obj.Count
         } elseif ($null -ne $obj) {
-            # Count tracked list items if a known collection property exists, otherwise top-level keys.
-            $props = @($obj.PSObject.Properties)
-            $count = $props.Count
-            foreach ($listPropName in @('entries', 'paths', 'rules', 'deny_paths', 'protected_paths')) {
-                $lp = $obj.PSObject.Properties[$listPropName]
-                if ($null -ne $lp -and $null -ne $lp.Value) {
-                    $count = @($lp.Value).Count
-                    break
+            # Codex's PersistentDenyReadAclState schema maps `principals: { "<SID>": [ "<path>", ... ] }`.
+            $principalsProp = $obj.PSObject.Properties['principals']
+            if ($null -ne $principalsProp -and $null -ne $principalsProp.Value) {
+                $pProps = @($principalsProp.Value.PSObject.Properties)
+                $principalCount = $pProps.Count
+                foreach ($pp in $pProps) {
+                    if ($null -ne $pp.Value) { $count += @($pp.Value).Count }
+                }
+            } else {
+                $props = @($obj.PSObject.Properties)
+                $count = $props.Count
+                foreach ($listPropName in @('entries', 'paths', 'rules', 'deny_paths', 'protected_paths')) {
+                    $lp = $obj.PSObject.Properties[$listPropName]
+                    if ($null -ne $lp -and $null -ne $lp.Value) {
+                        $count = @($lp.Value).Count
+                        break
+                    }
                 }
             }
         }
-        return [PSCustomObject]@{ Present = $true; ValidJson = $true; EntryCount = $count }
+        return [PSCustomObject]@{ Present = $true; ValidJson = $true; EntryCount = $count; PrincipalCount = $principalCount; SandboxWritable = $sandboxWritable }
     } catch {
-        return [PSCustomObject]@{ Present = $true; ValidJson = $false; EntryCount = 0 }
+        return [PSCustomObject]@{ Present = $true; ValidJson = $false; EntryCount = 0; PrincipalCount = 0; SandboxWritable = $sandboxWritable }
     }
 }
 
@@ -559,20 +589,22 @@ if ($m2 -ne 'not-logged-in' -and $m2 -ne 'unreadable' -and $sandboxAllowCount -e
     Report 'WARN' 'Auth & ACL Isolation' "Lane 1=$m1 | Lane 2=$m2 | $aclLabel"
 }
 
-# Read-only advisory check on .sandbox\deny_read_acl_state.json (never modifies anything, never prints contents).
+# Read-only advisory check on .sandbox\deny_read_acl_state.json (host-side structural + DACL inspection;
+# never modifies anything, never prints internal paths, and does not spawn a live sandbox token).
 $denyStateL1 = Test-SandboxDenyAclState -LaneHomePath $Lane1Home
 $denyStateL2 = Test-SandboxDenyAclState -LaneHomePath $Lane2Home
 if (-not $denyStateL1.Present -and -not $denyStateL2.Present) {
-    Report 'PASS' 'Sandbox Deny-ACL State' 'Not present yet (read-only advisory; created by Codex Windows elevated sandbox on first run)'
+    Report 'PASS' 'Sandbox Deny-ACL State' 'Not present yet (host-side read-only advisory; created by Codex Windows elevated sandbox on first run)'
 } else {
     foreach ($pair in @(@('Lane 1', $denyStateL1), @('Lane 2', $denyStateL2))) {
         $laneLbl = $pair[0]
         $st      = $pair[1]
         if (-not $st.Present) { continue }
+        $daclNote = if ($st.SandboxWritable) { 'state_dacl=sandbox_writable(host_dacl)' } else { 'state_dacl=locked(host_dacl)' }
         if ($st.ValidJson) {
-            Report 'PASS' "$laneLbl Sandbox Deny-ACL" "Present & valid JSON ($($st.EntryCount) tracked item(s); read-only advisory, untouched)"
+            Report 'PASS' "$laneLbl Sandbox Deny-ACL" "Present & valid JSON ($($st.EntryCount) tracked item(s), $($st.PrincipalCount) principal(s); $daclNote; read-only advisory, untouched; see docs/REAL_CODEX_CHECKLIST.md for live sandbox-token probe)"
         } else {
-            Report 'WARN' "$laneLbl Sandbox Deny-ACL" 'Present at .sandbox\deny_read_acl_state.json but unreadable/malformed JSON (read-only advisory, untouched)'
+            Report 'WARN' "$laneLbl Sandbox Deny-ACL" "Present at .sandbox\deny_read_acl_state.json but unreadable/malformed JSON ($daclNote; read-only advisory, untouched)"
         }
     }
 }

@@ -269,11 +269,14 @@ jobs:
           LOCAL_BIN="${WORK_DIR}/local bin"
           OUTSIDE_VICTIM="${TMP_ROOT}/outside_victim.txt"
 
-          mkdir -p "${REPO_DIR}" "${FAKE_BIN}" "${LANE1}/sessions" "${LANE2}"
+          mkdir -p "${REPO_DIR}" "${FAKE_BIN}" "${LANE1}/sessions" "${LANE2}" "${LOCAL_BIN}"
           echo '{"id":"s1"}' > "${LANE1}/sessions/keep.jsonl"
           SESSION_HASH="$(sha256_of "${LANE1}/sessions/keep.jsonl")"
           echo 'DO_NOT_DELETE' > "${OUTSIDE_VICTIM}"
           VICTIM_HASH="$(sha256_of "${OUTSIDE_VICTIM}")"
+          printf '#!/usr/bin/env bash\necho PRE_EXISTING_UNIX_LAUNCHER\n' > "${LOCAL_BIN}/codex-t3"
+          chmod 700 "${LOCAL_BIN}/codex-t3"
+          ORIG_LAUNCHER_HASH="$(sha256_of "${LOCAL_BIN}/codex-t3")"
 
           cat > "${FAKE_BIN}/codex" <<'EOF'
           #!/usr/bin/env bash
@@ -373,6 +376,9 @@ jobs:
           [ "${ORIG_HASH}" = "${RESTORED_HASH}" ]
           [ ! -L "${LANE2}/sessions" ]
           [ ! -e "${LOCAL_BIN}/codex" ]
+          [ ! -e "${LOCAL_BIN}/codex-official" ]
+          [ -x "${LOCAL_BIN}/codex-t3" ]
+          [ "$(sha256_of "${LOCAL_BIN}/codex-t3")" = "${ORIG_LAUNCHER_HASH}" ]
           [ -f "${LANE1}/sessions/keep.jsonl" ]
           [ "$(sha256_of "${LANE1}/sessions/keep.jsonl")" = "${SESSION_HASH}" ]
           echo "[PASS] Unix smoke, traversal defense, and deterministic SHA-256 rollback passed!"

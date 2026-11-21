@@ -363,6 +363,14 @@ theme = "light"
     [System.IO.File]::WriteAllText((Join-Path $l1 'auth.json'), $authLane1Json, (New-Object System.Text.UTF8Encoding($false)))
     [System.IO.File]::WriteAllText((Join-Path $l2 'auth.json'), $authLane2Json, (New-Object System.Text.UTF8Encoding($false)))
 
+    # Seed a pre-existing user launcher (codex-t3.cmd) in LocalBin (while leaving codex.cmd and
+    # codex-official.cmd absent) to verify rollback restores pre-existing launchers byte-for-byte
+    # instead of deleting them.
+    New-Item -ItemType Directory -Path $bin -Force | Out-Null
+    $preExistingLauncher = Join-Path $bin 'codex-t3.cmd'
+    [System.IO.File]::WriteAllText($preExistingLauncher, "@echo off`r`necho PRE_EXISTING_USER_LAUNCHER`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    $origLauncherHash = (Get-FileHash -LiteralPath $preExistingLauncher -Algorithm SHA256).Hash
+
     # ========================================================================
     # TEST 4: Dry-Run & -WhatIf Zero-Mutation Verification
     # WHAT: Runs setup-dual-lane.ps1 with -DryRun and -WhatIf (also testing
@@ -673,9 +681,11 @@ theme = "light"
     Assert-True ($restoredLane1Hash -eq $origLane1Hash) "Rollback SHA-256 mismatch on Lane 1 config.toml! Expected $origLane1Hash, got $restoredLane1Hash"
 
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $l2 'AGENTS.md'))) 'Newly created Lane 2 AGENTS.md should have been removed by rollback'
-    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex.cmd'))) 'Wrapper codex.cmd should have been removed by rollback'
-    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-official.cmd'))) 'Wrapper codex-official.cmd should have been removed by rollback'
-    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-t3.cmd'))) 'Wrapper codex-t3.cmd should have been removed by rollback'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex.cmd'))) 'Newly created wrapper codex.cmd should have been removed by rollback'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-official.cmd'))) 'Newly created wrapper codex-official.cmd should have been removed by rollback'
+    Assert-True (Test-Path -LiteralPath $preExistingLauncher -PathType Leaf) 'Pre-existing user launcher codex-t3.cmd MUST be restored by rollback (not deleted!)'
+    $restoredLauncherHash = (Get-FileHash -LiteralPath $preExistingLauncher -Algorithm SHA256).Hash
+    Assert-True ($restoredLauncherHash -eq $origLauncherHash) "Rollback SHA-256 mismatch on pre-existing codex-t3.cmd! Expected $origLauncherHash, got $restoredLauncherHash"
     foreach ($d in @('memories', 'memories_v2', 'sessions', 'archived_sessions', 'skills', 'plugins')) {
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $l2 $d))) "NTFS Junction Lane2\$d was not detached by rollback"
     }

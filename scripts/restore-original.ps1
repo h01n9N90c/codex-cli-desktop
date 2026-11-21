@@ -593,6 +593,7 @@ Write-Step 'Step 2: Restoring files & verifying SHA-256 integrity...'
 $manifestFiles = if ($manifest) { @(Get-JsonProp -Obj $manifest -Name 'Files') } else { @() }
 # Filter out null elements in case Files was absent or empty
 $manifestFiles = @($manifestFiles | Where-Object { $null -ne $_ })
+$handledManifestTargets = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
 if ($manifest -and $manifestFiles.Count -gt 0) {
     foreach ($entry in $manifestFiles) {
@@ -601,6 +602,7 @@ if ($manifest -and $manifestFiles.Count -gt 0) {
             throw "Security violation: Snapshot target path '$target' is outside allowed Codex directories!"
         }
         Assert-NoReparsePointInPath -CandidatePath $target -AllowedRoots $allowedRestoreRoots
+        [void]$handledManifestTargets.Add([System.IO.Path]::GetFullPath($target))
 
         $existedPrior = [bool](Get-JsonProp -Obj $entry -Name 'ExistedPrior')
         if ($existedPrior) {
@@ -695,13 +697,41 @@ if ($manifest -and $manifestFiles.Count -gt 0) {
 }
 
 # ============================================================================
-# Step 3: Remove CLI Wrappers & Clean User PATH
+# Step 3: Reconcile CLI Wrappers (Restore Pre-Existing or Remove Newly Created) & Clean User PATH
 # ============================================================================
-Write-Step "Step 3: Removing CLI wrappers from $LocalBin..."
+Write-Step "Step 3: Reconciling CLI wrappers in $LocalBin..."
 foreach ($w in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd')) {
-    $wp = Join-Path $LocalBin $w
-    if (Test-Path -LiteralPath $wp -PathType Leaf) {
-        Assert-NoReparsePointInPath -CandidatePath $wp -AllowedRoots $allowedRestoreRoots
+    $wp = [System.IO.Path]::GetFullPath((Join-Path $LocalBin $w))
+    # If Step 2 already restored (ExistedPrior=$true) or removed (ExistedPrior=$false) this wrapper
+    # from the rollback manifest, do not touch it again in Step 3.
+    if ($handledManifestTargets.Contains($wp)) {
+        continue
+    }
+    Assert-NoReparsePointInPath -CandidatePath $wp -AllowedRoots $allowedRestoreRoots
+
+    # Fallback mode (or legacy manifest without wrapper entries in Files): check for a timestamped
+    # backup of a pre-existing launcher before deleting.
+    $wrapperBkps = @()
+    if (Test-Path -LiteralPath $LocalBin -PathType Container) {
+        $wrapperBkps = @(Get-ChildItem -LiteralPath $LocalBin -Filter "$w.backup-*" -File -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+    }
+    if ($wrapperBkps.Count -gt 0) {
+        $latestWrapperBkp = $wrapperBkps[0].FullName
+        Assert-NoReparsePointInPath -CandidatePath $latestWrapperBkp -AllowedRoots $allowedRestoreRoots
+        $bkpHash = Get-FileSha256 $latestWrapperBkp
+        if (-not $script:IsDryRun) {
+            $res = Restore-FileAtomicallyWithRetry -BackupPath $latestWrapperBkp -TargetPath $wp -ExpectedSha256 $bkpHash
+            if (-not $res.Success) {
+                $script:ErrorCount++
+                Write-Warning "Could not restore pre-existing wrapper '$wp' from '$latestWrapperBkp' ($($res.Reason))."
+                continue
+            }
+            Remove-Item -LiteralPath $latestWrapperBkp -Force -ErrorAction SilentlyContinue
+            Write-Host "    Restored pre-existing wrapper: $latestWrapperBkp -> $wp (SHA256=$($bkpHash.Substring(0, 12))...)" -ForegroundColor Green
+        } else {
+            Write-Host "    [DRY-RUN] Would restore pre-existing wrapper: $latestWrapperBkp -> $wp (SHA256=$($bkpHash.Substring(0, 12))...)" -ForegroundColor Green
+        }
+    } elseif (Test-Path -LiteralPath $wp -PathType Leaf) {
         if (-not $script:IsDryRun) {
             $rmRes = Remove-FileGracefully -TargetPath $wp
             if (-not $rmRes.Success) {

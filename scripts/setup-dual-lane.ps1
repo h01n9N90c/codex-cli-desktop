@@ -445,8 +445,8 @@ function Write-Utf8NoBom {
         [System.IO.File]::WriteAllText($tmpPath, $Text, $utf8NoBom)
         if (Test-Path -LiteralPath $fullPath) {
             try {
-                # Same-volume atomic replacement (supported on both .NET Framework 4.x / PS 5.1 and .NET 6+ / PS 7+)
-                [System.IO.File]::Replace($tmpPath, $fullPath, $null)
+                # Same-volume atomic replacement ([NullString]::Value avoids PS 5.1 $null->"" conversion quirk)
+                [System.IO.File]::Replace($tmpPath, $fullPath, [NullString]::Value)
             } catch {
                 # Graceful fallback for virtualized/filter-driver filesystems that reject ReplaceFileW
                 Copy-Item -LiteralPath $tmpPath -Destination $fullPath -Force
@@ -465,14 +465,14 @@ function Write-Utf8NoBom {
 function Protect-SensitiveFileAcl([string]$FilePath) {
     <#
     .SYNOPSIS
-        Locks down a sensitive file's Windows NTFS DACL using a safe two-step icacls.exe sequence.
+        Fail-closed two-step Windows NTFS DACL lockdown for sensitive credential, config, and manifest files.
         WHY:
           On Windows, Codex's elevated sandbox creates a local group named `CodexSandboxUsers` and
           can grant `CodexSandboxUsers:(OI)(CI)(RX)` on parent directories such as `%USERPROFILE%\.codex`.
-          A single `icacls /remove:g` cannot strip INHERITED ACEs, and combining flags can fail cleanly
-          on fresh machines where `CodexSandboxUsers` does not exist yet (ERROR_NONE_MAPPED = 1332).
+          A single `icacls /remove:g` cannot strip INHERITED ACEs, and combining flags can fail on fresh
+          machines where `CodexSandboxUsers` does not exist yet (ERROR_NONE_MAPPED = 1332).
 
-          Two-step mitigation:
+          Two-step fail-closed mitigation:
             Step 1: `icacls.exe <file> /inheritance:d`
                     Converts inherited ACEs into explicit ACEs while disabling future inheritance.
                     Current user, SYSTEM, and Administrators retain full access (never locking you out),
@@ -481,14 +481,17 @@ function Protect-SensitiveFileAcl([string]$FilePath) {
                     Runs whenever `CodexSandboxUsers` exists locally (or appears in the file's DACL),
                     stripping ONLY Grant ACEs while leaving any protective Deny ACEs untouched.
                     On fresh machines without `CodexSandboxUsers`, Step 2 is gracefully skipped.
+            Step 3: Post-condition verification via `Get-Acl` asserts `AreAccessRulesProtected == $true`
+                    and zero remaining `CodexSandboxUsers` Allow ACEs. Any failure throws a terminating
+                    security error rather than silently continuing with an exposed credential/config file.
     #>
     if ($script:IsDryRun -or -not (Test-Path -LiteralPath $FilePath -PathType Leaf)) { return }
 
     $fullPath = [System.IO.Path]::GetFullPath($FilePath)
-    # Refuse to alter ACLs through a symlink or reparse point.
-    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction SilentlyContinue
-    if (-not $item -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return }
-    if (-not (Get-Command 'icacls.exe' -ErrorAction SilentlyContinue)) { return }
+    Assert-NotReparsePoint -PathValue $fullPath -Label 'Protect-SensitiveFileAcl target file'
+    if (-not (Get-Command 'icacls.exe' -ErrorAction SilentlyContinue)) {
+        throw "Security error: 'icacls.exe' was not found in PATH; cannot lock NTFS DACL on '$fullPath'."
+    }
 
     $prevPref = $ErrorActionPreference
     try {
@@ -497,10 +500,10 @@ function Protect-SensitiveFileAcl([string]$FilePath) {
         $ErrorActionPreference = 'Continue'
 
         # Step 1: Disable inheritance while copying existing ACEs as explicit ACEs.
-        $null = & icacls.exe $fullPath /inheritance:d 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Verbose ("Protect-SensitiveFileAcl: /inheritance:d returned exit {0} for '{1}'." -f $LASTEXITCODE, $fullPath)
-            return
+        $icaclsOut1 = (& icacls.exe $fullPath /inheritance:d 2>&1) -join ' '
+        $exit1 = $LASTEXITCODE
+        if ($exit1 -ne 0) {
+            throw "Security error: icacls.exe /inheritance:d failed (exit code $exit1) for '$fullPath': $icaclsOut1"
         }
 
         # Step 2: Check whether CodexSandboxUsers exists on this machine (or is referenced in the file ACL).
@@ -513,25 +516,35 @@ function Protect-SensitiveFileAcl([string]$FilePath) {
             $sandboxGroupExists = $false
         }
         if (-not $sandboxGroupExists) {
-            try {
-                $acl = Get-Acl -LiteralPath $fullPath -ErrorAction Stop
-                $matchingAces = @($acl.Access | Where-Object { $_.IdentityReference.Value -like '*CodexSandboxUsers*' })
-                if ($matchingAces.Count -gt 0) { $sandboxGroupExists = $true }
-            } catch {}
+            $preAcl = Get-Acl -LiteralPath $fullPath -ErrorAction Stop
+            $matchingAces = @($preAcl.Access | Where-Object { $_.IdentityReference.Value -like '*CodexSandboxUsers*' })
+            if ($matchingAces.Count -gt 0) { $sandboxGroupExists = $true }
         }
 
         if ($sandboxGroupExists) {
             # Remove Grant ACEs only (/remove:g) so protective Deny ACEs remain intact.
-            $null = & icacls.exe $fullPath /remove:g "CodexSandboxUsers" 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-Verbose ("Protect-SensitiveFileAcl: /remove:g CodexSandboxUsers returned exit {0} for '{1}'." -f $LASTEXITCODE, $fullPath)
+            $icaclsOut2 = (& icacls.exe $fullPath /remove:g "CodexSandboxUsers" 2>&1) -join ' '
+            $exit2 = $LASTEXITCODE
+            if ($exit2 -ne 0) {
+                throw "Security error: icacls.exe /remove:g CodexSandboxUsers failed (exit code $exit2) for '$fullPath': $icaclsOut2"
             }
         }
-    } catch {
-        Write-Verbose ("Protect-SensitiveFileAcl skipped for '{0}': {1}" -f $fullPath, $_.Exception.Message)
+
+        # Step 3: Fail-closed post-condition verification on the resulting NTFS DACL.
+        $postAcl = Get-Acl -LiteralPath $fullPath -ErrorAction Stop
+        if (-not $postAcl.AreAccessRulesProtected) {
+            throw "Security error: NTFS DACL inheritance remained active on '$fullPath' after icacls /inheritance:d."
+        }
+        $remainingAllow = @($postAcl.Access | Where-Object {
+            ($_.IdentityReference.Value -like '*CodexSandboxUsers*') -and
+            ($_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow)
+        })
+        if ($remainingAllow.Count -gt 0) {
+            throw "Security error: '$fullPath' still grants $($remainingAllow.Count) Allow ACE(s) to CodexSandboxUsers after icacls lockdown."
+        }
     } finally {
         $ErrorActionPreference = $prevPref
-        # Never leak an optional icacls non-zero exit code into subsequent steps.
+        # Never leak an icacls exit code into subsequent script checks.
         $global:LASTEXITCODE = 0
     }
 }
@@ -1560,14 +1573,30 @@ if not exist "%CODEX_EXE%" (
 } else { '' }
 
 # Switch cmd.exe to UTF-8 codepage (65001) whenever any embedded path contains non-ASCII/Unicode characters.
-$needsUtf8Codepage = ($Lane1Home -match '[^\x00-\x7F]') -or ($Lane2Home -match '[^\x00-\x7F]') -or ($CargoTargetDir -match '[^\x00-\x7F]') -or ($CodexExe -match '[^\x00-\x7F]')
+$needsUtf8Codepage = ($Lane1Home -match '[^\x00-\x7F]') -or ($Lane2Home -match '[^\x00-\x7F]') -or ($CargoTargetDir -match '[^\x00-\x7F]') -or ($CodexExe -match '[^\x00-\x7F]') -or ($RepoPath -match '[^\x00-\x7F]') -or ($effectiveLane2Repo -match '[^\x00-\x7F]')
 $utf8Header = if ($needsUtf8Codepage) { "chcp 65001 >nul`r`n" } else { '' }
 
 # Escape '%' -> '%%' and reject quotes/newlines before embedding paths into .cmd files.
-$cmdLane1Home = Escape-CmdSetValue -Value $Lane1Home      -Label 'Lane1Home'
-$cmdLane2Home = Escape-CmdSetValue -Value $Lane2Home      -Label 'Lane2Home'
-$cmdCargoDir  = Escape-CmdSetValue -Value $CargoTargetDir -Label 'CargoTargetDir'
-$cmdCodexExe  = Escape-CmdSetValue -Value $CodexExe       -Label 'CodexExe'
+$cmdLane1Home = Escape-CmdSetValue -Value $Lane1Home          -Label 'Lane1Home'
+$cmdLane2Home = Escape-CmdSetValue -Value $Lane2Home          -Label 'Lane2Home'
+$cmdCargoDir  = Escape-CmdSetValue -Value $CargoTargetDir     -Label 'CargoTargetDir'
+$cmdCodexExe  = Escape-CmdSetValue -Value $CodexExe           -Label 'CodexExe'
+$cmdRepoPath  = Escape-CmdSetValue -Value $RepoPath           -Label 'RepoPath'
+$cmdLane2Repo = Escape-CmdSetValue -Value $effectiveLane2Repo -Label 'Lane2WorktreePath'
+
+# When -UseGitWorktree is enabled, enforce OS workspace-write isolation by automatically switching
+# the Lane 2 process working directory from the primary repo root into the dedicated Lane 2 worktree.
+$worktreeCdBlock = if ($UseGitWorktree -and ($effectiveLane2Repo -ne $RepoPath)) {
+@"
+set "CODEX_PRIMARY_REPO=$cmdRepoPath"
+set "CODEX_LANE2_WORKTREE=$cmdLane2Repo"
+if not defined CODEX_NO_AUTO_WORKTREE_CD (
+    if /I "%CD%"=="%CODEX_PRIMARY_REPO%" (
+        if exist "%CODEX_LANE2_WORKTREE%\" cd /d "%CODEX_LANE2_WORKTREE%"
+    )
+)
+"@
+} else { '' }
 
 # WHY direct `"%CODEX_EXE%" %*` (without `call`) is used for both .exe and .cmd/.bat targets:
 # `call` triggers a second cmd.exe `%` expansion pass, which corrupts target paths containing
@@ -1580,7 +1609,7 @@ ${utf8Header}set "CODEX_HOME=$cmdLane2Home"
 set "CODEX_ACTIVE_LANE=LANE_2"
 set "CARGO_TARGET_DIR=$cmdCargoDir"
 set "CODEX_EXE=$cmdCodexExe"
-$windowsAppsRefresh
+$worktreeCdBlock$windowsAppsRefresh
 if not exist "%CODEX_EXE%" (
     echo [ERROR] Codex binary not found at "%CODEX_EXE%". Re-run setup-dual-lane.ps1. >&2
     exit /b 1
@@ -1603,6 +1632,14 @@ if not exist "%CODEX_EXE%" (
 "%CODEX_EXE%" %*
 exit /b %ERRORLEVEL%
 "@
+
+# Back up any pre-existing launcher in LocalBin BEFORE writing so restore-original.ps1
+# restores pre-existing user launchers with SHA-256 verification instead of deleting them.
+foreach ($wrapperName in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd')) {
+    $wrapperFullPath = Join-Path $LocalBin $wrapperName
+    Assert-NotReparsePoint -PathValue $wrapperFullPath -Label "Launcher $wrapperName"
+    Backup-IfExists $wrapperFullPath
+}
 
 if (-not $script:IsDryRun) {
     Write-Utf8NoBom -FilePath (Join-Path $LocalBin 'codex.cmd')          -Text $officialWrapper
