@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-windows:
+    name: Windows PowerShell & Python Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run PowerShell & Python Test Suite
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1
+
+  test-unix:
+    name: Linux Bash Syntax, Unit Tests & Smoke Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify Bash syntax & LF line endings
+        run: |
+          bash -n ./scripts/setup-dual-lane.sh
+          bash -n ./scripts/doctor.sh
+          python3 -m unittest discover -s ./tests -v
+      - name: Run Unix installer & doctor smoke test with mock codex binary
+        run: |
+          TMP_ROOT="$(mktemp -d)"
+          FAKE_BIN="${TMP_ROOT}/fake-bin"
+          mkdir -p "${FAKE_BIN}" "${TMP_ROOT}/lane2"
+          cat > "${FAKE_BIN}/codex" <<'EOF'
+          #!/usr/bin/env bash
+          if [ "${1:-}" = "--version" ]; then echo "codex-cli 0.171.0-ci"; exit 0; fi
+          if [ "${1:-}" = "features" ]; then echo "memories stable true"; exit 0; fi
+          if [ "${1:-}" = "execpolicy" ]; then echo '{"decision":"forbidden"}'; exit 0; fi
+          exit 0
+          EOF
+          chmod +x "${FAKE_BIN}/codex"
+          cat > "${TMP_ROOT}/lane2/config.toml" <<'EOF'
+          [mcp_servers.custom_ci]
+          command = "node"
+          EOF
+          PATH="${FAKE_BIN}:${PATH}" \
+          CODEX_LANE1_HOME="${TMP_ROOT}/lane1" \
+          CODEX_LANE2_HOME="${TMP_ROOT}/lane2" \
+          CODEX_LOCAL_BIN="${TMP_ROOT}/local-bin" \
+          ./scripts/setup-dual-lane.sh --repo "${TMP_ROOT}" --install-bridge
+          grep -q 'approval_policy = "on-request"' "${TMP_ROOT}/lane2/config.toml"
+          grep -q 'network_access = false' "${TMP_ROOT}/lane2/config.toml"
+          grep -q '\[mcp_servers\.custom_ci\]' "${TMP_ROOT}/lane2/config.toml"
+          PATH="${TMP_ROOT}/local-bin:${FAKE_BIN}:${PATH}" \
+          CODEX_LANE1_HOME="${TMP_ROOT}/lane1" \
+          CODEX_LANE2_HOME="${TMP_ROOT}/lane2" \
+          CODEX_LOCAL_BIN="${TMP_ROOT}/local-bin" \
+          ./scripts/doctor.sh
+          rm -rf "${TMP_ROOT}"

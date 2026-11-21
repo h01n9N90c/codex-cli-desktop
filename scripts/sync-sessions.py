@@ -8,9 +8,15 @@ Copyright : Copyright 2026 Lê Hoàng Ngọc Tươi
 License   : Apache-2.0 (https://www.apache.org/licenses/LICENSE-2.0)
 Project   : Codex Dual-Lane & Security Kit
 
-Automatically discovers the newest state_*.sqlite and goals_*.sqlite files and
-inspects real table columns via PRAGMA table_info so it remains compatible across
-different Codex CLI/Desktop versions without hardcoded schema assumptions.
+Key guarantees:
+  - Opens source SQLite databases in read-only URI mode (?mode=ro) so active Lane 1
+    processes are never blocked by write locks.
+  - Dynamically inspects table schemas via PRAGMA table_info(...) across state_*.sqlite
+    and goals_*.sqlite.
+  - Performs full UPSERT (INSERT missing threads + UPDATE existing threads) inside an
+    atomic transaction on the target database, so pinned threads appear even when the
+    target database is freshly initialized and has zero existing thread rows.
+  - Supports --pinned-only to avoid syncing unpinned session metadata when desired.
 
 Usage:
     python scripts/sync-sessions.py --repo "C:\\Projects\\my-app"
@@ -64,13 +70,49 @@ def get_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
 
 
-def sync_session_index(lane1: str, lane2: str, dry_run: bool) -> int:
+def get_column_info(conn: sqlite3.Connection, table: str) -> dict[str, dict[str, object]]:
+    info: dict[str, dict[str, object]] = {}
+    for row in conn.execute(f"PRAGMA table_info({table})").fetchall():
+        # cid, name, type, notnull, dflt_value, pk
+        info[str(row[1])] = {
+            "type": str(row[2] or "").upper(),
+            "notnull": bool(row[3]),
+            "dflt_value": row[4],
+            "pk": bool(row[5]),
+        }
+    return info
+
+
+def fallback_default_for_type(col_type: str) -> object:
+    if "INT" in col_type or "BOOL" in col_type:
+        return 0
+    if "REAL" in col_type or "FLOA" in col_type or "DOUB" in col_type:
+        return 0.0
+    if "BLOB" in col_type:
+        return b""
+    return ""
+
+
+def normalize_repo_cwd(repo_path: str) -> str:
+    norm_cwd = os.path.abspath(repo_path)
+    if os.name == "nt" and not norm_cwd.startswith("\\\\?\\"):
+        norm_cwd = "\\\\?\\" + norm_cwd
+    return norm_cwd
+
+
+def sync_session_index(
+    lane1: str,
+    lane2: str,
+    dry_run: bool,
+    allowed_ids: set[str] | None = None,
+) -> int:
     idx1 = os.path.join(lane1, "session_index.jsonl")
     idx2 = os.path.join(lane2, "session_index.jsonl")
     if not os.path.exists(idx1):
         return 0
     by_id: dict[str, str] = {}
-    for p in (idx1, idx2):
+    # Preserve existing destination entries first, then merge source entries
+    for p in (idx2, idx1):
         if os.path.exists(p):
             with open(p, "r", encoding="utf-8") as f:
                 for line in f:
@@ -79,8 +121,12 @@ def sync_session_index(lane1: str, lane2: str, dry_run: bool) -> int:
                         continue
                     try:
                         obj = json.loads(line)
-                        if "id" in obj:
-                            by_id[str(obj["id"])] = line
+                        tid = str(obj.get("id", ""))
+                        if not tid:
+                            continue
+                        if p == idx1 and allowed_ids is not None and tid not in allowed_ids:
+                            continue
+                        by_id[tid] = line
                     except json.JSONDecodeError:
                         continue
     if not dry_run:
@@ -119,86 +165,147 @@ def sync_state_db(
     lane2: str,
     repo_path: str | None,
     approval_mode: str | None,
+    pinned_only: bool,
     dry_run: bool,
-) -> tuple[str | None, int]:
+) -> tuple[str | None, int, int, int, set[str]]:
+    """
+    Returns (db_basename, inserted_count, updated_count, pinned_count, synced_thread_ids).
+    """
     st1 = find_latest_versioned_db(lane1, "state")
     st2 = find_latest_versioned_db(lane2, "state")
     if not st1 or not st2:
         print(
             "[!] state_*.sqlite not found in both homes. Launch 'codex' once to initialize the secondary DB first."
         )
-        return (None, 0)
+        return (None, 0, 0, 0, set())
 
     c1 = connect_readonly(st1)
     c2 = sqlite3.connect(st2, timeout=15.0)
     try:
+        c2.execute("PRAGMA busy_timeout = 15000")
+        if "threads" not in get_tables(c1) or "threads" not in get_tables(c2):
+            return (os.path.basename(st2), 0, 0, 0, set())
+
+        cols1 = get_columns(c1, "threads")
+        cols2_info = get_column_info(c2, "threads")
+        cols2 = set(cols2_info.keys())
+        common_cols = [c for c in cols1 if c in cols2]
+        if "id" not in common_cols:
+            return (os.path.basename(st2), 0, 0, 0, set())
+
+        # Any target-only NOT NULL columns without a default need a safe fallback on INSERT
+        extra_notnull_cols: list[str] = [
+            col
+            for col, meta in cols2_info.items()
+            if col not in common_cols and meta["notnull"] and meta["dflt_value"] is None and not meta["pk"]
+        ]
+
+        existing_dst_ids = {
+            str(r[0]) for r in c2.execute("SELECT id FROM threads").fetchall()
+        }
+
+        select_sql = ", ".join(common_cols)
+        src_rows = c1.execute(f"SELECT {select_sql} FROM threads").fetchall()
+
+        norm_cwd = normalize_repo_cwd(repo_path) if repo_path else None
+        inserted_count = 0
+        updated_count = 0
+        pinned_count = 0
+        synced_ids: set[str] = set()
+
+        if not dry_run:
+            c2.execute("BEGIN IMMEDIATE")
+
         for tbl in ("thread_sections", "projects", "project_roots"):
             copy_shared_table(c1, c2, tbl, dry_run)
 
-        if "threads" not in get_tables(c1) or "threads" not in get_tables(c2):
-            return (os.path.basename(st2), 0)
-
-        cols1 = set(get_columns(c1, "threads"))
-        cols2 = set(get_columns(c2, "threads"))
-        desired_copy = [
-            "name",
-            "is_pinned",
-            "thread_section_id",
-            "section_position",
-            "section_entered_at_ms",
-            "project_id",
-        ]
-        copy_cols = [c for c in desired_copy if c in cols1 and c in cols2]
-        if "id" not in cols1 or "id" not in cols2:
-            return (os.path.basename(st2), 0)
-
-        select_sql = ", ".join(["id"] + copy_cols)
-        src_rows = c1.execute(f"SELECT {select_sql} FROM threads").fetchall()
-        pinned_count = 0
-
         for row in src_rows:
-            tid = row[0]
-            values = dict(zip(copy_cols, row[1:]))
-            is_pinned_val = bool(values.get("is_pinned")) or (
-                values.get("thread_section_id") is not None
+            row_dict = dict(zip(common_cols, row))
+            tid = str(row_dict["id"])
+            is_pinned_val = bool(row_dict.get("is_pinned")) or (
+                row_dict.get("thread_section_id") is not None
             )
+            if pinned_only and not is_pinned_val:
+                continue
+
+            synced_ids.add(tid)
             if is_pinned_val:
                 pinned_count += 1
-            if "is_pinned" in values:
-                values["is_pinned"] = 1 if is_pinned_val else 0
-
-            set_clauses: list[str] = []
-            params: list[object] = []
-            for col, val in values.items():
-                if col == "name":
-                    set_clauses.append("name = COALESCE(?, name)")
-                else:
-                    set_clauses.append(f"{col} = ?")
-                params.append(val)
-
+            if "is_pinned" in row_dict:
+                row_dict["is_pinned"] = 1 if is_pinned_val else 0
             if "model_provider" in cols2:
-                set_clauses.append("model_provider = 'openai'")
+                row_dict["model_provider"] = "openai"
             if approval_mode and "approval_mode" in cols2:
-                set_clauses.append("approval_mode = ?")
-                params.append(approval_mode)
+                row_dict["approval_mode"] = approval_mode
+            if norm_cwd and is_pinned_val and "cwd" in cols2:
+                row_dict["cwd"] = norm_cwd
 
-            if set_clauses and not dry_run:
-                params.append(tid)
-                c2.execute(
-                    f"UPDATE threads SET {', '.join(set_clauses)} WHERE id = ?",
-                    params,
-                )
+            if tid not in existing_dst_ids:
+                inserted_count += 1
+                if not dry_run:
+                    insert_cols = list(row_dict.keys())
+                    insert_vals = [row_dict[c] for c in insert_cols]
+                    for extra_col in extra_notnull_cols:
+                        insert_cols.append(extra_col)
+                        insert_vals.append(
+                            fallback_default_for_type(str(cols2_info[extra_col]["type"]))
+                        )
+                    col_list_sql = ", ".join(insert_cols)
+                    placeholders = ", ".join(["?"] * len(insert_cols))
+                    c2.execute(
+                        f"INSERT INTO threads ({col_list_sql}) VALUES ({placeholders})",
+                        insert_vals,
+                    )
+                    existing_dst_ids.add(tid)
+            else:
+                updated_count += 1
+                if not dry_run:
+                    update_candidates = [
+                        "name",
+                        "is_pinned",
+                        "thread_section_id",
+                        "section_position",
+                        "section_entered_at_ms",
+                        "project_id",
+                        "model_provider",
+                    ]
+                    if approval_mode and "approval_mode" in cols2:
+                        update_candidates.append("approval_mode")
+                    if norm_cwd and is_pinned_val and "cwd" in cols2:
+                        update_candidates.append("cwd")
 
-        if repo_path and "cwd" in cols2 and "is_pinned" in cols2 and not dry_run:
-            norm_cwd = os.path.abspath(repo_path)
-            if os.name == "nt" and not norm_cwd.startswith("\\\\?\\"):
-                norm_cwd = "\\\\?\\" + norm_cwd
-            c2.execute("UPDATE threads SET cwd = ? WHERE is_pinned = 1", (norm_cwd,))
+                    set_clauses: list[str] = []
+                    params: list[object] = []
+                    for col in update_candidates:
+                        if col not in row_dict:
+                            continue
+                        if col == "name":
+                            set_clauses.append("name = COALESCE(?, name)")
+                        else:
+                            set_clauses.append(f"{col} = ?")
+                        params.append(row_dict[col])
+
+                    if set_clauses:
+                        params.append(tid)
+                        c2.execute(
+                            f"UPDATE threads SET {', '.join(set_clauses)} WHERE id = ?",
+                            params,
+                        )
 
         if not dry_run:
             c2.commit()
             c2.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        return (os.path.basename(st2), pinned_count)
+        return (
+            os.path.basename(st2),
+            inserted_count,
+            updated_count,
+            pinned_count,
+            synced_ids,
+        )
+    except Exception:
+        if not dry_run and c2.in_transaction:
+            c2.rollback()
+        raise
     finally:
         c1.close()
         c2.close()
@@ -213,12 +320,19 @@ def sync_goals_db(lane1: str, lane2: str, dry_run: bool) -> int:
     c1 = connect_readonly(g1)
     c2 = sqlite3.connect(g2, timeout=15.0)
     try:
+        c2.execute("PRAGMA busy_timeout = 15000")
+        if not dry_run:
+            c2.execute("BEGIN IMMEDIATE")
         goals_count = copy_shared_table(c1, c2, "thread_goals", dry_run)
         copy_shared_table(c1, c2, "thread_goal_continuation_deferrals", dry_run)
         if not dry_run:
             c2.commit()
             c2.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return goals_count
+    except Exception:
+        if not dry_run and c2.in_transaction:
+            c2.rollback()
+        raise
     finally:
         c1.close()
         c2.close()
@@ -226,7 +340,7 @@ def sync_goals_db(lane1: str, lane2: str, dry_run: bool) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Schema-adaptive sync of Codex sessions, pinned tasks, and goals between two CODEX_HOMEs."
+        description="Schema-adaptive UPSERT sync of Codex sessions, pinned tasks, and goals between two CODEX_HOMEs."
     )
     user_home = os.path.expanduser("~")
     parser.add_argument(
@@ -251,21 +365,33 @@ def main() -> int:
         help="Optional approval_mode to apply on synced threads (omit to preserve existing values)",
     )
     parser.add_argument(
+        "--pinned-only",
+        action="store_true",
+        help="Only sync pinned threads (avoids sharing unpinned thread records across environments)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Inspect schemas and report what would be synced without writing any file",
     )
     args = parser.parse_args()
 
-    idx_count = sync_session_index(args.lane1, args.lane2, args.dry_run)
-    db_name, pinned_count = sync_state_db(
-        args.lane1, args.lane2, args.repo, args.approval_mode, args.dry_run
+    db_name, inserted_count, updated_count, pinned_count, synced_ids = sync_state_db(
+        args.lane1,
+        args.lane2,
+        args.repo,
+        args.approval_mode,
+        args.pinned_only,
+        args.dry_run,
     )
+    allowed_ids = synced_ids if args.pinned_only else None
+    idx_count = sync_session_index(args.lane1, args.lane2, args.dry_run, allowed_ids)
     goals_count = sync_goals_db(args.lane1, args.lane2, args.dry_run)
 
     mode = "DRY-RUN" if args.dry_run else "OK"
     print(
-        f"[{mode}] session_index={idx_count} | state_db={db_name or 'N/A'} (pinned={pinned_count}) | goals={goals_count}"
+        f"[{mode}] session_index={idx_count} | state_db={db_name or 'N/A'} "
+        f"(inserted={inserted_count}, updated={updated_count}, pinned={pinned_count}) | goals={goals_count}"
     )
     return 0
 

@@ -8,16 +8,19 @@
     Zero hardcoded mock data, zero hardcoded model tiers, zero hardcoded secrets:
       - Auto-detects real Codex executable (WindowsApps MSIX, PATH, npm global, or explicit -CodexPath)
       - Dynamically probes real supported feature flags via `codex features list`
-      - Checks NTFS filesystem support before creating Directory Junctions
-      - Checks real free disk space on the Cargo target drive and warns if low (< 10 GB)
-      - Preserves existing trusted [projects.'...'] entries and creates timestamped backups before editing
+      - Non-destructively merges existing config.toml (preserving custom [mcp_servers], [tui], [plugins],
+        top-level settings, and trusted [projects] entries) and creates timestamped backups
+      - Secure-by-default: uses approval_policy = "on-request", network_access = false in sandbox,
+        and env_key (never writing plaintext API keys into config.toml or backups)
+      - Optional -UseGitWorktree creates an isolated Git worktree for Lane 2 so OS-level workspace-write
+        sandboxing physically separates Lane 1 and Lane 2 file writes
       - Supports -DryRun to preview every action without modifying disk
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -RepoPath "C:\Projects\my-app" -DryRun
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -RepoPath "C:\Projects\my-app" -InstallBridgeTemplate
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -RepoPath "C:\Projects\my-app" -OfficialModel "gpt-6.2-sol" -SyncSessions
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -RepoPath "C:\Projects\my-app" -UseGitWorktree -SyncSessions
 .NOTES
     Author    : Lê Hoàng Ngọc Tươi
     Copyright : Copyright 2026 Lê Hoàng Ngọc Tươi
@@ -35,15 +38,21 @@ param(
     [string]$OfficialModel = '',
     [string]$OfficialReasoning = '',
     [string]$OfficialServiceTier = '',
-    [ValidateSet('never', 'on-request')]
-    [string]$ApprovalPolicy = 'never',
+    [ValidateSet('on-request', 'never')]
+    [string]$ApprovalPolicy = 'on-request',
     [switch]$AllowSandboxNetwork,
+    [switch]$UseGitWorktree,
+    [string]$Lane2WorktreePath = '',
+    [string]$Lane2Branch = 'dual-lane-2',
     [switch]$ConfigureGateway,
     [string]$GatewayProviderName = 'OpenAI',
     [string]$GatewayBaseUrl = '',
     [string]$GatewayModel = '',
+    [string]$GatewayApiKeyEnv = 'CODEX_GATEWAY_API_KEY',
     [string]$GatewayApiKey = '',
+    [switch]$PromptGatewayApiKey,
     [switch]$SyncSessions,
+    [switch]$PinnedOnlySync,
     [switch]$InstallBridgeTemplate,
     [switch]$SkipPathUpdate,
     [switch]$DryRun
@@ -109,7 +118,6 @@ function Resolve-CodexExecutable([string]$ExplicitPath, [string]$ExcludedDir) {
         $parent = (Split-Path -Parent $src).TrimEnd('\').ToLowerInvariant()
         if ($parent -eq $excludedNorm) { continue }
         $ext = [System.IO.Path]::GetExtension($src).ToLowerInvariant()
-        # On Windows, npm creates codex.ps1 alongside codex.cmd; cmd.exe wrappers cannot execute .ps1 directly
         if ($ext -eq '.ps1' -or $ext -eq '') {
             $siblingExe = Join-Path (Split-Path -Parent $src) 'codex.exe'
             $siblingCmd = Join-Path (Split-Path -Parent $src) 'codex.cmd'
@@ -187,6 +195,80 @@ function Get-ExistingTrustedProjects([string[]]$ConfigPaths) {
     return , $list
 }
 
+function Merge-CodexConfigToml {
+    param(
+        [string]$ExistingPath,
+        [string]$ManagedTopBlock,
+        [string]$ManagedSectionsBlock,
+        [string[]]$ManagedTopKeys,
+        [string[]]$ManagedSectionNames
+    )
+    if (-not (Test-Path -LiteralPath $ExistingPath)) {
+        return ($ManagedTopBlock.TrimEnd() + "`r`n`r`n" + $ManagedSectionsBlock.TrimEnd() + "`r`n")
+    }
+    $raw = Get-Content -LiteralPath $ExistingPath -Raw -ErrorAction SilentlyContinue
+    if (-not $raw) {
+        return ($ManagedTopBlock.TrimEnd() + "`r`n`r`n" + $ManagedSectionsBlock.TrimEnd() + "`r`n")
+    }
+
+    $topKeySet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in $ManagedTopKeys) { [void]$topKeySet.Add($k) }
+
+    $secSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($s in $ManagedSectionNames) { [void]$secSet.Add($s) }
+
+    $preservedTop = New-Object 'System.Collections.Generic.List[string]'
+    $preservedSections = New-Object 'System.Collections.Generic.List[string]'
+
+    $lines = $raw -split "\r?\n"
+    $inSection = $false
+    $keepCurrentSection = $false
+    $currentSectionLines = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\[([^\]]+)\]\s*$') {
+            if ($inSection -and $keepCurrentSection -and $currentSectionLines.Count -gt 0) {
+                $preservedSections.Add(($currentSectionLines -join "`r`n").TrimEnd())
+            }
+            $currentSectionLines.Clear()
+            $inSection = $true
+            $secName = $Matches[1].Trim()
+            if ($secSet.Contains($secName) -or ($secName -match '^projects\.')) {
+                $keepCurrentSection = $false
+            } else {
+                $keepCurrentSection = $true
+                $currentSectionLines.Add($line)
+            }
+            continue
+        }
+
+        if (-not $inSection) {
+            if ($line -match '^\s*#' -or $line -match '^\s*$') { continue }
+            if ($line -match '^\s*([A-Za-z0-9_-]+)\s*=') {
+                $keyName = $Matches[1]
+                if (-not $topKeySet.Contains($keyName)) {
+                    $preservedTop.Add($line)
+                }
+            }
+        } elseif ($keepCurrentSection) {
+            $currentSectionLines.Add($line)
+        }
+    }
+    if ($inSection -and $keepCurrentSection -and $currentSectionLines.Count -gt 0) {
+        $preservedSections.Add(($currentSectionLines -join "`r`n").TrimEnd())
+    }
+
+    $combinedTop = $ManagedTopBlock.TrimEnd()
+    if ($preservedTop.Count -gt 0) {
+        $combinedTop += "`r`n" + ($preservedTop -join "`r`n")
+    }
+    $result = $combinedTop + "`r`n`r`n" + $ManagedSectionsBlock.TrimEnd()
+    if ($preservedSections.Count -gt 0) {
+        $result += "`r`n`r`n# Preserved custom user sections`r`n" + ($preservedSections -join "`r`n`r`n")
+    }
+    return ($result.TrimEnd() + "`r`n")
+}
+
 $KitRoot  = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $RepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
 
@@ -247,7 +329,29 @@ Write-Host ("    Detected {0} feature flags (daemon_auto_start={1}, goals={2}, m
     $supportedFeatures.ContainsKey('goals'), `
     $supportedFeatures.ContainsKey('memories'))
 
-# 4. Prepare directories
+# 4. Optional: Prepare isolated Git worktree for Lane 2 (OS-enforced workspace-write isolation)
+$effectiveLane2Repo = $RepoPath
+if ($UseGitWorktree) {
+    Write-Step 'Configuring isolated Git worktree for Lane 2 (OS-level workspace-write boundary)...'
+    $wtTarget = if ($Lane2WorktreePath) { $Lane2WorktreePath } else { "${RepoPath}-lane2" }
+    if (Test-Path -LiteralPath $wtTarget) {
+        $effectiveLane2Repo = (Resolve-Path -LiteralPath $wtTarget).Path
+        Write-Host "    Existing Lane 2 worktree: $effectiveLane2Repo"
+    } else {
+        if (-not $DryRun) {
+            & git -C $RepoPath worktree add -B $Lane2Branch $wtTarget HEAD
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to create git worktree at $wtTarget"
+            }
+            $effectiveLane2Repo = (Resolve-Path -LiteralPath $wtTarget).Path
+        } else {
+            $effectiveLane2Repo = $wtTarget
+        }
+        Write-Host "    Created Lane 2 Git worktree: $effectiveLane2Repo (branch: $Lane2Branch)"
+    }
+}
+
+# 5. Prepare directories
 Write-Step "Preparing directories: $Lane1Home, $Lane2Home, $LocalBin..."
 foreach ($dir in @($Lane1Home, (Join-Path $Lane1Home 'rules'), $Lane2Home, (Join-Path $Lane2Home 'rules'), $LocalBin)) {
     if (-not (Test-Path -LiteralPath $dir)) {
@@ -256,7 +360,7 @@ foreach ($dir in @($Lane1Home, (Join-Path $Lane1Home 'rules'), $Lane2Home, (Join
     }
 }
 
-# 5. Create NTFS Directory Junctions for shared memories, sessions, skills, plugins
+# 6. Create NTFS Directory Junctions for shared memories, sessions, skills, plugins
 Write-Step 'Linking shared memories, sessions, skills, and plugins via NTFS Junctions...'
 $sharedDirs = @('memories', 'memories_v2', 'sessions', 'archived_sessions', 'skills', 'plugins')
 foreach ($name in $sharedDirs) {
@@ -279,7 +383,7 @@ foreach ($name in $sharedDirs) {
     Write-Host "    Linked: $dst -> $src"
 }
 
-# 6. Install Starlark command firewall (rules/default.rules) into both lanes
+# 7. Install Starlark command firewall (rules/default.rules) into both lanes
 Write-Step 'Installing Starlark command firewall (rules/default.rules) into both lanes...'
 $rulesTemplate = Join-Path $KitRoot 'templates\default.rules'
 foreach ($homeDir in @($Lane1Home, $Lane2Home)) {
@@ -289,7 +393,7 @@ foreach ($homeDir in @($Lane1Home, $Lane2Home)) {
     Write-Host "    Installed: $targetRule"
 }
 
-# 7. Install lane-specific global AGENTS.md guardrails
+# 8. Install lane-specific global AGENTS.md guardrails
 Write-Step 'Installing anti-prompt-injection & dual-lane AGENTS.md guardrails...'
 $lane1AgentsDst = Join-Path $Lane1Home 'AGENTS.md'
 $lane2AgentsDst = Join-Path $Lane2Home 'AGENTS.md'
@@ -302,19 +406,33 @@ if (-not $DryRun) {
 Write-Host "    Installed: $lane1AgentsDst"
 Write-Host "    Installed: $lane2AgentsDst"
 
-# 8. Build & write Lane 2 Official OpenAI config.toml (preserving existing trusted projects!)
-Write-Step 'Writing Lane 2 Official OpenAI config.toml...'
+# 9. Non-destructively merge & write Lane 2 Official OpenAI config.toml
+Write-Step 'Merging & writing Lane 2 Official OpenAI config.toml (non-destructive TOML merge)...'
 $lane2ConfigPath = Join-Path $Lane2Home 'config.toml'
 $trustedProjects = Get-ExistingTrustedProjects -ConfigPaths @((Join-Path $Lane1Home 'config.toml'), $lane2ConfigPath)
-$normRepo = $RepoPath.ToLowerInvariant()
-if (-not ($trustedProjects | Where-Object { $_.ToLowerInvariant() -eq $normRepo })) {
-    $trustedProjects.Add($normRepo)
+foreach ($rp in @($RepoPath, $effectiveLane2Repo)) {
+    $normRp = $rp.ToLowerInvariant()
+    if (-not ($trustedProjects | Where-Object { $_.ToLowerInvariant() -eq $normRp })) {
+        $trustedProjects.Add($normRp)
+    }
 }
 
+$managedTopKeys = New-Object 'System.Collections.Generic.List[string]'
+$managedTopKeys.AddRange([string[]]@('sandbox_mode', 'approval_policy', 'windows_wsl_setup_acknowledged'))
+
 $optionalModelLines = New-Object 'System.Collections.Generic.List[string]'
-if ($OfficialModel)       { $optionalModelLines.Add("model = `"$(Escape-TomlBasicString $OfficialModel)`"") }
-if ($OfficialReasoning)   { $optionalModelLines.Add("model_reasoning_effort = `"$(Escape-TomlBasicString $OfficialReasoning)`"") }
-if ($OfficialServiceTier) { $optionalModelLines.Add("service_tier = `"$(Escape-TomlBasicString $OfficialServiceTier)`"") }
+if ($OfficialModel) {
+    $optionalModelLines.Add("model = `"$(Escape-TomlBasicString $OfficialModel)`"")
+    $managedTopKeys.Add('model')
+}
+if ($OfficialReasoning) {
+    $optionalModelLines.Add("model_reasoning_effort = `"$(Escape-TomlBasicString $OfficialReasoning)`"")
+    $managedTopKeys.Add('model_reasoning_effort')
+}
+if ($OfficialServiceTier) {
+    $optionalModelLines.Add("service_tier = `"$(Escape-TomlBasicString $OfficialServiceTier)`"")
+    $managedTopKeys.Add('service_tier')
+}
 
 $featureLines = New-Object 'System.Collections.Generic.List[string]'
 if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('daemon_auto_start')) {
@@ -331,26 +449,28 @@ if ($supportedFeatures.ContainsKey('goals')) {
 }
 
 $projectsBlock = ($trustedProjects | ForEach-Object {
-    "[projects.`"$(Escape-TomlBasicString $_)`"]`ntrust_level = `"trusted`""
-}) -join "`n`n"
+    "[projects.`"$(Escape-TomlBasicString $_)`"]`r`ntrust_level = `"trusted`""
+}) -join "`r`n`r`n"
 
 $sandboxNetworkValue = if ($AllowSandboxNetwork) { 'true' } else { 'false' }
 
-$lane2Config = @"
+$lane2TopBlock = @"
 # Official OpenAI / ChatGPT Codex CLI configuration (LANE 2)
 # Leave model/service_tier unset unless overridden so Codex uses your account's real defaults.
 sandbox_mode = "workspace-write"
 approval_policy = "$ApprovalPolicy"
 windows_wsl_setup_acknowledged = true
-$($optionalModelLines -join "`n")
+$($optionalModelLines -join "`r`n")
+"@
 
+$lane2SectionsBlock = @"
 [windows]
 sandbox = "elevated"
 
 $projectsBlock
 
 [features]
-$($featureLines -join "`n")
+$($featureLines -join "`r`n")
 
 [memories]
 generate_memories = true
@@ -367,16 +487,58 @@ CODEX_ACTIVE_LANE = "LANE_2"
 CARGO_TARGET_DIR = "$(Escape-TomlBasicString $CargoTargetDir)"
 "@
 
-Backup-IfExists $lane2ConfigPath
-if (-not $DryRun) { Write-Utf8NoBom -FilePath $lane2ConfigPath -Text $lane2Config }
-Write-Host "    Wrote: $lane2ConfigPath (preserved $($trustedProjects.Count) trusted project(s))"
+$managedSectionNames = @(
+    'windows',
+    'features',
+    'memories',
+    'sandbox_workspace_write',
+    'shell_environment_policy',
+    'shell_environment_policy.set'
+)
 
-# 9. Optional: configure Lane 1 third-party gateway ONLY if explicitly requested
+$mergedLane2Config = Merge-CodexConfigToml `
+    -ExistingPath $lane2ConfigPath `
+    -ManagedTopBlock $lane2TopBlock `
+    -ManagedSectionsBlock $lane2SectionsBlock `
+    -ManagedTopKeys ($managedTopKeys.ToArray()) `
+    -ManagedSectionNames $managedSectionNames
+
+Backup-IfExists $lane2ConfigPath
+if (-not $DryRun) { Write-Utf8NoBom -FilePath $lane2ConfigPath -Text $mergedLane2Config }
+Write-Host "    Wrote: $lane2ConfigPath (preserved custom sections & $($trustedProjects.Count) trusted project(s))"
+
+# 10. Optional: configure Lane 1 third-party gateway using env_key (NEVER writing plaintext API key to config.toml)
 if ($ConfigureGateway) {
-    if (-not $GatewayBaseUrl -or -not $GatewayApiKey) {
-        throw '-ConfigureGateway requires both -GatewayBaseUrl and -GatewayApiKey.'
+    if (-not $GatewayBaseUrl) {
+        throw '-ConfigureGateway requires -GatewayBaseUrl.'
     }
-    Write-Step 'Configuring Lane 1 third-party gateway in ~/.codex/config.toml...'
+    if (-not ($GatewayApiKeyEnv -match '^[A-Za-z_][A-Za-z0-9_]*$')) {
+        throw "Invalid environment variable name for -GatewayApiKeyEnv: $GatewayApiKeyEnv"
+    }
+    Write-Step "Configuring Lane 1 gateway in ~/.codex/config.toml (using env_key = `"$GatewayApiKeyEnv`", zero plaintext secrets in file)..."
+
+    if ($GatewayApiKey) {
+        Write-Warning "Passing -GatewayApiKey on the command line may leave the key in PowerShell history. Prefer -PromptGatewayApiKey or setting `$env:$GatewayApiKeyEnv before running."
+        if (-not $DryRun) {
+            [System.Environment]::SetEnvironmentVariable($GatewayApiKeyEnv, $GatewayApiKey, 'User')
+            Set-Item -Path "Env:\$GatewayApiKeyEnv" -Value $GatewayApiKey
+        }
+        Write-Host "    Stored API key in User environment variable: $GatewayApiKeyEnv (not written to config.toml)"
+    } elseif ($PromptGatewayApiKey) {
+        $sec = Read-Host -Prompt "Enter API key for $GatewayProviderName (stored in User env $GatewayApiKeyEnv, never in config.toml)" -AsSecureString
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+        try {
+            $plainKey = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+            if ($plainKey -and -not $DryRun) {
+                [System.Environment]::SetEnvironmentVariable($GatewayApiKeyEnv, $plainKey, 'User')
+                Set-Item -Path "Env:\$GatewayApiKeyEnv" -Value $plainKey
+            }
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+        Write-Host "    Stored API key securely in User environment variable: $GatewayApiKeyEnv"
+    }
+
     $lane1ConfigPath = Join-Path $Lane1Home 'config.toml'
     $lane1CleanBackup = Join-Path $Lane1Home 'config.backup.toml'
     if ((Test-Path -LiteralPath $lane1ConfigPath) -and -not (Test-Path -LiteralPath $lane1CleanBackup)) {
@@ -386,8 +548,10 @@ if ($ConfigureGateway) {
     Backup-IfExists $lane1ConfigPath
 
     $modelsUrl = $GatewayBaseUrl.TrimEnd('/') + '/models'
+    $gwTopKeys = @('model_provider', 'web_search', 'disable_response_storage', 'sandbox_mode', 'approval_policy', 'windows_wsl_setup_acknowledged')
     $gwModelLines = if ($GatewayModel) {
-        "model = `"$(Escape-TomlBasicString $GatewayModel)`"`nreview_model = `"$(Escape-TomlBasicString $GatewayModel)`""
+        $gwTopKeys += @('model', 'review_model')
+        "model = `"$(Escape-TomlBasicString $GatewayModel)`"`r`nreview_model = `"$(Escape-TomlBasicString $GatewayModel)`""
     } else { '' }
 
     $gwFeatureLines = New-Object 'System.Collections.Generic.List[string]'
@@ -397,24 +561,25 @@ if ($ConfigureGateway) {
     if ($supportedFeatures.ContainsKey('image_generation')) { $gwFeatureLines.Add('image_generation = true') }
     if ($supportedFeatures.ContainsKey('goals')) { $gwFeatureLines.Add('goals = true') }
 
-    $lane1Config = @"
-# Lane 1 Codex configuration (Third-Party Gateway + Security Guardrails)
+    $provHeader = "model_providers.`"$(Escape-TomlBasicString $GatewayProviderName)`""
+    $lane1TopBlock = @"
+# Lane 1 Codex configuration (Gateway via env_key + Security Guardrails)
 model_provider = "$(Escape-TomlBasicString $GatewayProviderName)"
 $gwModelLines
 web_search = "live"
 disable_response_storage = true
-network_access = "enabled"
 sandbox_mode = "workspace-write"
 approval_policy = "$ApprovalPolicy"
 windows_wsl_setup_acknowledged = true
+"@
 
-[model_providers."$(Escape-TomlBasicString $GatewayProviderName)"]
+    $lane1SectionsBlock = @"
+[$provHeader]
 name = "$(Escape-TomlBasicString $GatewayProviderName)"
 base_url = "$(Escape-TomlBasicString $GatewayBaseUrl)"
 model_catalog_url = "$(Escape-TomlBasicString $modelsUrl)"
 wire_api = "responses"
-requires_openai_auth = false
-experimental_bearer_token = "$(Escape-TomlBasicString $GatewayApiKey)"
+env_key = "$(Escape-TomlBasicString $GatewayApiKeyEnv)"
 
 [windows]
 sandbox = "elevated"
@@ -422,7 +587,7 @@ sandbox = "elevated"
 $projectsBlock
 
 [features]
-$($gwFeatureLines -join "`n")
+$($gwFeatureLines -join "`r`n")
 
 [sandbox_workspace_write]
 network_access = $sandboxNetworkValue
@@ -433,11 +598,19 @@ exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]
 [shell_environment_policy.set]
 CODEX_ACTIVE_LANE = "LANE_1"
 "@
-    if (-not $DryRun) { Write-Utf8NoBom -FilePath $lane1ConfigPath -Text $lane1Config }
-    Write-Host "    Wrote: $lane1ConfigPath"
+
+    $mergedLane1Config = Merge-CodexConfigToml `
+        -ExistingPath $lane1ConfigPath `
+        -ManagedTopBlock $lane1TopBlock `
+        -ManagedSectionsBlock $lane1SectionsBlock `
+        -ManagedTopKeys $gwTopKeys `
+        -ManagedSectionNames ($managedSectionNames + @($provHeader, "model_providers.$GatewayProviderName"))
+
+    if (-not $DryRun) { Write-Utf8NoBom -FilePath $lane1ConfigPath -Text $mergedLane1Config }
+    Write-Host "    Wrote: $lane1ConfigPath (zero plaintext keys; reads from env $GatewayApiKeyEnv)"
 }
 
-# 10. Install self-healing CLI wrappers into ~/.local/bin
+# 11. Install self-healing CLI wrappers into ~/.local/bin
 Write-Step 'Installing codex.cmd, codex-official.cmd, and codex-t3.cmd into ~/.local/bin...'
 $isBatchTarget = $CodexExe.ToLowerInvariant().EndsWith('.cmd') -or $CodexExe.ToLowerInvariant().EndsWith('.bat')
 $invokePrefix  = if ($isBatchTarget) { 'call ' } else { '' }
@@ -505,23 +678,25 @@ if (-not $SkipPathUpdate) {
     Write-Host "    Skipped User PATH modification (-SkipPathUpdate)." -ForegroundColor DarkGray
 }
 
-# 11. Optional: copy DUAL_LANE_BRIDGE.md into target repository
+# 12. Optional: copy DUAL_LANE_BRIDGE.md into target repository
 if ($InstallBridgeTemplate) {
-    $bridgeDir = Join-Path $RepoPath 'artifacts\dual-lane'
-    $bridgeDst = Join-Path $bridgeDir 'DUAL_LANE_BRIDGE.md'
-    Write-Step "Ensuring bridge template at $bridgeDst..."
-    if (-not (Test-Path -LiteralPath $bridgeDst)) {
-        if (-not $DryRun) {
-            if (-not (Test-Path -LiteralPath $bridgeDir)) { New-Item -ItemType Directory -Path $bridgeDir -Force | Out-Null }
-            Copy-Item -LiteralPath (Join-Path $KitRoot 'templates\DUAL_LANE_BRIDGE.md') -Destination $bridgeDst
+    foreach ($targetRepo in (@($RepoPath, $effectiveLane2Repo) | Select-Object -Unique)) {
+        $bridgeDir = Join-Path $targetRepo 'artifacts\dual-lane'
+        $bridgeDst = Join-Path $bridgeDir 'DUAL_LANE_BRIDGE.md'
+        Write-Step "Ensuring bridge template at $bridgeDst..."
+        if (-not (Test-Path -LiteralPath $bridgeDst)) {
+            if (-not $DryRun) {
+                if (-not (Test-Path -LiteralPath $bridgeDir)) { New-Item -ItemType Directory -Path $bridgeDir -Force | Out-Null }
+                Copy-Item -LiteralPath (Join-Path $KitRoot 'templates\DUAL_LANE_BRIDGE.md') -Destination $bridgeDst
+            }
+            Write-Host "    Created: $bridgeDst"
+        } else {
+            Write-Host "    Kept existing: $bridgeDst"
         }
-        Write-Host "    Created: $bridgeDst"
-    } else {
-        Write-Host "    Kept existing: $bridgeDst"
     }
 }
 
-# 12. Optional: sync session metadata & pinned threads
+# 13. Optional: sync session metadata & pinned threads
 if ($SyncSessions) {
     Write-Step 'Syncing session index, pinned threads, and goals via sync-sessions.py...'
     $pythonExe = $null
@@ -542,7 +717,8 @@ if ($SyncSessions) {
     if (-not $pythonExe) {
         Write-Warning 'Real Python 3 was not found in PATH (ignoring Microsoft Store stub); skipping SQLite session sync.'
     } else {
-        $pyArgs = @((Join-Path $KitRoot 'scripts\sync-sessions.py'), '--lane1', $Lane1Home, '--lane2', $Lane2Home, '--repo', $RepoPath, '--approval-mode', $ApprovalPolicy)
+        $pyArgs = @((Join-Path $KitRoot 'scripts\sync-sessions.py'), '--lane1', $Lane1Home, '--lane2', $Lane2Home, '--repo', $effectiveLane2Repo, '--approval-mode', $ApprovalPolicy)
+        if ($PinnedOnlySync) { $pyArgs += '--pinned-only' }
         if ($DryRun) { $pyArgs += '--dry-run' }
         & $pythonExe @pyArgs
     }

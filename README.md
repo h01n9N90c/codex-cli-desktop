@@ -10,10 +10,10 @@
 | Trường hợp của bạn | Vấn đề bạn đang gặp | Bộ kit này giải quyết thế nào? |
 | :--- | :--- | :--- |
 | **1. Có cả tài khoản OpenAI chính chủ lẫn key/gateway bên thứ 3** | Muốn vừa dùng Desktop App (chạy key/gateway riêng) vừa dùng CLI (tài khoản ChatGPT/OpenAI chính chủ), nhưng đăng nhập bên này lại đè mất `auth.json` và `config.toml` của bên kia. | Tách 2 `CODEX_HOME` độc lập (`~/.codex` và `~/.codex-official`), sinh sẵn 2 lệnh riêng trên Terminal: **`codex`** *(chính chủ)* và **`codex-t3`** *(cổng phụ)*. |
-| **2. Muốn chạy 2 agent song song trên cùng 1 dự án mà vẫn hiểu nhau** | Ví dụ: Luồng 1 làm Backend/Binary, Luồng 2 làm SAST/Frontend/CLI. Chạy chung thì đè file nhau; tách riêng thì không hiểu bên kia đang làm gì. | Nối **NTFS Directory Junction** (Windows) / **symlink** (macOS/Linux) cho `memories`, `sessions`, `skills`, `plugins` để dùng chung bộ não + cơ chế **Ghi riêng – Đọc chung** qua `DUAL_LANE_BRIDGE.md`. |
-| **3. Máy chỉ có 1 ổ `C:\`, cấu hình khác nhau hoặc dùng Codex bản `npm`/standalone** | Các script cứng đường dẫn `D:\`, `E:\` hay khóa cứng tên model gói Pro (`gpt-6-astra` / `priority`) sẽ lỗi trên máy khác hoặc tài khoản Plus/API khác. | Tự dò thực tế mọi nguồn cài đặt (`WindowsApps`, `PATH`, `npm`, `-CodexPath`), tự dò feature flags bằng `codex features list`, để trống model mặc định (dùng đúng model thật của tài khoản bạn), tự kiểm tra ổ đĩa NTFS & dung lượng trống. |
+| **2. Muốn chạy 2 agent song song trên cùng 1 dự án mà vẫn hiểu nhau** | Ví dụ: Luồng 1 làm Backend/Binary, Luồng 2 làm SAST/Frontend/CLI. Chạy chung thì đè file nhau; tách riêng thì không hiểu bên kia đang làm gì. | Nối **NTFS Directory Junction** (Windows) / **symlink** (macOS/Linux) cho `memories`, `sessions`, `skills`, `plugins` + cơ chế **Ghi riêng – Đọc chung** qua `DUAL_LANE_BRIDGE.md` *(ranh giới mềm qua prompt)* hoặc thêm cờ **`-UseGitWorktree`** *(ranh giới cứng cưỡng chế ở cấp OS sandbox qua worktree riêng)*. |
+| **3. Máy chỉ có 1 ổ `C:\`, cấu hình khác nhau hoặc dùng Codex bản `npm`/standalone** | Các script cứng đường dẫn `D:\`, `E:\` hay ghi đè mất cấu hình cũ trong `config.toml` sẽ lỗi trên máy khác. | Tự dò thực tế mọi nguồn cài đặt (`WindowsApps`, `PATH`, `npm`, `-CodexPath`), tự dò feature flags bằng `codex features list`, **merge `config.toml` không phá hủy** (giữ nguyên `[mcp_servers]`, `[tui]`, `[plugins]` cũ), tự kiểm tra ổ đĩa NTFS & dung lượng trống. |
 | **4. Dự án Rust bị kẹt `Blocking waiting for file lock` khi 2 agent cùng test** | Hai agent cùng chạy `cargo test` tranh nhau khóa `target/.cargo-lock`. | Tự tách `CARGO_TARGET_DIR` riêng cho Luồng 2 (mặc định `%TEMP%\codex-lane2-target`, tùy chỉnh được qua `-CargoTargetDir` nếu ổ `C:` ít dung lượng) $\rightarrow$ biên dịch song song không bao giờ khóa nhau. |
-| **5. Dùng CLI từ Windows Desktop gặp lỗi `--no-daemon`, mất task ghim (`Pinned`), hoặc lo mã độc / Prompt Injection** | Báo lỗi `this CLI has no complete local package`, mất danh sách `Pinned`, hỏi duyệt từng lệnh, hoặc lo lộ secret/chạy lệnh phá máy. | Tự động tắt `daemon_auto_start = false` khi có hỗ trợ, kèm `sync-sessions.py` tự đọc schema SQLite thật (`PRAGMA table_info`) để đồng bộ `Pinned` & `Goals`, và cài sẵn **4 lớp bảo vệ** (`workspace-write`, lọc `*KEY*/*TOKEN*`, tường lửa `default.rules`, `AGENTS.md` chống Prompt Injection). |
+| **5. Dùng CLI từ Windows Desktop gặp lỗi `--no-daemon`, mất task ghim (`Pinned`), hoặc lo rủi ro thực thi lệnh / lộ API key** | Báo lỗi `this CLI has no complete local package`, mất danh sách `Pinned` khi DB mới chưa có dòng `threads`, hoặc lộ API key trong `config.toml`. | Tự động tắt `daemon_auto_start = false` khi có hỗ trợ, kèm `sync-sessions.py` thực hiện **UPSERT (`INSERT` + `UPDATE`)** theo schema động, dùng `env_key` để **không bao giờ lưu plaintext API key vào `config.toml`**, mặc định `approval_policy = "on-request"`, và phòng thủ 4 lớp (`workspace-write` + `network_access = false`, lọc `*KEY*/*TOKEN*`, `default.rules`, `AGENTS.md`). |
 
 ---
 
@@ -59,26 +59,32 @@ flowchart LR
 ## Cấu trúc thư mục
 
 ```text
-codex-cli-desktop-/
+codex-dual-lane-kit/
 ├── README.md                     # Hướng dẫn tổng hợp (file bạn đang đọc)
 ├── LICENSE                       # Giấy phép Apache License 2.0
 ├── NOTICE                        # Khai báo bản quyền tác giả (Apache-2.0)
 ├── SECURITY.md                   # Chính sách bảo mật & báo cáo lỗ hổng (tab Security trên GitHub)
-├── .gitignore                    # Chặn tuyệt đối không commit key / auth.json / config.toml
+├── .gitattributes                # Khóa chuẩn LF cho .sh/.py và CRLF cho .ps1/.cmd
+├── .gitignore                    # Chặn không commit key / auth.json / config.toml
+├── .github/workflows/ci.yml      # GitHub Actions CI tự động chạy test trên Windows & Linux
 ├── scripts/
-│   ├── setup-dual-lane.ps1       # Bộ cài đặt tự thích nghi cho Windows 10/11 (hỗ trợ -DryRun)
+│   ├── setup-dual-lane.ps1       # Bộ cài đặt tự thích nghi cho Windows 10/11 (TOML merge, -DryRun)
 │   ├── setup-dual-lane.sh        # Bộ cài đặt tương đương cho macOS / Linux / WSL (hỗ trợ --dry-run)
-│   ├── doctor.ps1                # Chẩn đoán hệ thống thực tế cho Windows (read-only, zero mock data)
-│   ├── doctor.sh                 # Chẩn đoán hệ thống thực tế cho macOS / Linux / WSL (read-only)
-│   └── sync-sessions.py          # Đồng bộ phiên, mục đã ghim (Pinned) & Goals (SQLite read-only nguồn)
+│   ├── doctor.ps1                # Chẩn đoán hệ thống & test thực thi execpolicy cho Windows (read-only)
+│   ├── doctor.sh                 # Chẩn đoán hệ thống & test thực thi execpolicy cho macOS / Linux / WSL
+│   └── sync-sessions.py          # Đồng bộ UPSERT (INSERT + UPDATE) phiên, Pinned & Goals
 ├── templates/
-│   ├── default.rules             # Tường lửa chặn lệnh nguy hiểm & LOLBins (Starlark execpolicy)
+│   ├── default.rules             # Bộ quy tắc tiền tố lệnh (Starlark execpolicy)
 │   ├── AGENTS.lane1.md           # Chỉ thị bảo vệ, phân tích tĩnh & phân luồng cho Luồng 1
 │   ├── AGENTS.lane2.md           # Chỉ thị bảo vệ, phân tích tĩnh & phân luồng cho Luồng 2
 │   └── DUAL_LANE_BRIDGE.md       # Mẫu cầu nối giao tiếp 2 luồng cho bất kỳ dự án nào
+├── tests/
+│   ├── test_sync_sessions.py     # Unit test kiểm chứng UPSERT khi DB đích trống, --pinned-only & --dry-run
+│   └── test-kit.ps1              # Smoke test kiểm chứng TOML merge, env_key, UTF-8 no-BOM
 └── docs/
     ├── GUIDE_AND_MANIFEST.md     # Hướng dẫn chi tiết, khai báo từng tệp/hàm/tham số & cách gỡ an toàn
-    ├── SECURITY_MODEL.md         # Chi tiết 4 lớp bảo vệ, cách ly phân tích tĩnh & Khiên Git
+    ├── REAL_CODEX_CHECKLIST.md   # Danh sách lệnh kiểm chứng thực tế trước và sau khi cài đặt
+    ├── SECURITY_MODEL.md         # Mô hình phòng thủ 4 lớp, ranh giới Mềm vs Cứng (-UseGitWorktree)
     └── TROUBLESHOOTING.md        # Sổ tay xử lý 7 lỗi thực chiến hay gặp nhất
 ```
 
@@ -89,8 +95,8 @@ codex-cli-desktop-/
 ### Bước 0 *(Khuyên làm trước)* — Tải kho & chạy thử `-DryRun` để kiểm tra máy của bạn
 Mở PowerShell và chạy (chế độ `-DryRun` không sửa bất kỳ file nào):
 ```powershell
-git clone https://github.com/h01n9N90c/codex-cli-desktop-.git
-cd codex-cli-desktop-
+git clone https://github.com/h01n9N90c/codex-cli-desktop-.git codex-dual-lane-kit
+cd codex-dual-lane-kit
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 `
     -RepoPath "C:\Projects\my-app" `
     -DryRun
@@ -98,14 +104,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps
 
 ### Bước 1 — Chạy cài đặt chính thức (chọn đúng kịch bản của bạn)
 
-#### Kịch bản A: Cài chuẩn cho máy 1 ổ `C:\` hoặc nhiều ổ (dùng model mặc định của tài khoản)
+#### Kịch bản A: Cài chuẩn Secure-by-Default (`approval_policy = "on-request"`, dùng model mặc định của tài khoản)
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 `
     -RepoPath "C:\Projects\my-app" `
     -InstallBridgeTemplate
 ```
+*(Nếu muốn tách thêm Git worktree riêng cho Luồng 2 để cưỡng chế phân vùng ghi ở cấp OS Sandbox, thêm cờ `-UseGitWorktree`; nếu muốn chạy tự động qua đêm không hỏi duyệt, thêm `-ApprovalPolicy never`.)*
 
-#### Kịch bản B: Cài kèm chọn model cụ thể + kéo sẵn các phiên đã ghim (`Pinned`) từ Desktop sang CLI
+#### Kịch bản B: Cài kèm chọn model cụ thể + đồng bộ UPSERT các phiên đã ghim (`Pinned`) từ Desktop sang CLI
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 `
     -RepoPath "C:\Projects\my-app" `
@@ -114,15 +121,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps
     -InstallBridgeTemplate
 ```
 
-#### Kịch bản C: Có thêm cổng API trung gian (bên thứ 3) cho Luồng 1
-> **Bảo mật:** Không bao giờ lưu API key trực tiếp vào file trong repo; chỉ truyền qua tham số lúc chạy.
+#### Kịch bản C: Có thêm cổng API trung gian (bên thứ 3) cho Luồng 1 *(Không lưu key vào `config.toml` hay lịch sử lệnh)*
+> **Bảo mật:** Dùng `-PromptGatewayApiKey` để nhập ẩn key vào biến môi trường User (`env_key = "CODEX_GATEWAY_API_KEY"`), tuyệt đối không ghi plaintext API key vào `config.toml` hay các file `.backup-*`:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 `
     -RepoPath "C:\Projects\my-app" `
     -ConfigureGateway `
     -GatewayBaseUrl "https://<cong-api-cua-ban>/v1" `
     -GatewayModel "<ten-model>" `
-    -GatewayApiKey "<API_KEY_CUA_BAN>" `
+    -GatewayApiKeyEnv "CODEX_GATEWAY_API_KEY" `
+    -PromptGatewayApiKey `
     -InstallBridgeTemplate
 ```
 
@@ -146,8 +154,8 @@ Sau khi toàn bộ mục báo `[PASS]`:
 
 ## Người dùng macOS / Linux / WSL
 ```bash
-git clone https://github.com/h01n9N90c/codex-cli-desktop-.git
-cd codex-cli-desktop-
+git clone https://github.com/h01n9N90c/codex-cli-desktop-.git codex-dual-lane-kit
+cd codex-dual-lane-kit
 chmod +x ./scripts/setup-dual-lane.sh ./scripts/doctor.sh
 ./scripts/setup-dual-lane.sh --repo /path/to/your-project --dry-run
 ./scripts/setup-dual-lane.sh --repo /path/to/your-project --install-bridge
@@ -162,21 +170,23 @@ codex
 
 | Mục đích | Lệnh |
 | :--- | :--- |
-| Chẩn đoán thực tế cấu hình máy & trạng thái 2 luồng | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\doctor.ps1` |
+| Chẩn đoán cấu hình máy & chạy probe thực thi `execpolicy` | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\doctor.ps1` |
+| Chạy toàn bộ Unit Test & Smoke Test của bộ kit | `powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1` |
 | Chạy Codex CLI bằng **tài khoản OpenAI chính chủ (Luồng 2)** | `codex` *(hoặc `codex-official`)* |
 | Chạy Codex CLI bằng **cấu hình Desktop / Gateway (Luồng 1)** | `codex-t3` |
 | Đổi model ngay trong khung chat TUI | Gõ `/model` |
 | Mở CLI với một model cụ thể | `codex -m <model-slug>` |
 | Mở lại phiên cũ / phiên đã ghim | `codex resume` *(hoặc `codex resume --all`)* |
-| Đồng bộ lại phiên mới ghim từ Desktop sang CLI | `python .\scripts\sync-sessions.py --repo "C:\Projects\my-app"` |
+| Đồng bộ UPSERT lại phiên mới ghim từ Desktop sang CLI | `python .\scripts\sync-sessions.py --repo "C:\Projects\my-app" --pinned-only` |
 | Chỉnh chế độ hỏi duyệt ngay trong phiên đang mở | Gõ `/permissions` |
 | Gặp giới hạn 100 request/phiên từ cổng trung gian | Gõ `/new` *(code trên đĩa còn nguyên, không bấm Hoàn tác)* |
 
 ---
 
 ## Tài liệu chi tiết đi kèm
-* 📘 **[Hướng dẫn Chi tiết & Khai báo Mã nguồn / Công cụ (Manifest)](docs/GUIDE_AND_MANIFEST.md)** — Khai báo minh bạch từng tệp, từng hàm mã nguồn, đường dẫn đọc/ghi, toàn bộ bảng tham số CLI và hướng dẫn gỡ bỏ an toàn 100%.
-* 🛡️ **[Mô hình Bảo vệ 4 Lớp, Cách ly Phân tích tĩnh & Khiên Git](docs/SECURITY_MODEL.md)**
+* 📘 **[Hướng dẫn Chi tiết & Khai báo Mã nguồn / Công cụ (Manifest)](docs/GUIDE_AND_MANIFEST.md)** — Khai báo minh bạch từng tệp, từng hàm mã nguồn, đường dẫn đọc/ghi, toàn bộ bảng tham số CLI và hướng dẫn gỡ bỏ an toàn.
+* ✅ **[Danh sách Kiểm chứng Thực tế (Real Codex Verification Checklist)](docs/REAL_CODEX_CHECKLIST.md)** — Các lệnh thực nghiệm để tự kiểm tra không lộ key, probe `execpolicy`, merge TOML và test UPSERT SQLite.
+* 🛡️ **[Mô hình Phòng thủ 4 Lớp, Ranh giới Mềm vs Cứng & Khiên Git](docs/SECURITY_MODEL.md)**
 * 🔧 **[Cẩm nang Xử lý 7 Lỗi Thực Chiến](docs/TROUBLESHOOTING.md)**
 
 ---

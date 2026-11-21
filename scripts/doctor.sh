@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real-time compatibility & health diagnostic for Codex Dual-Lane & Security Kit on macOS / Linux / WSL.
+# Real-time compatibility, health & behavioral security diagnostic for Codex Dual-Lane & Security Kit on macOS / Linux / WSL.
 # Author    : Lê Hoàng Ngọc Tươi
 # Copyright : Copyright 2026 Lê Hoàng Ngọc Tươi
 # License   : Apache-2.0 (https://www.apache.org/licenses/LICENSE-2.0)
@@ -71,7 +71,7 @@ else
   report "WARN" "Shared Brain Symlinks" "${LINKED_OK}/6 healthy; missing/non-symlink: ${BROKEN}"
 fi
 
-# 5. Security guardrails (config + default.rules + AGENTS.md + static-only + sandbox_net)
+# 5. Security guardrails (config + default.rules + AGENTS.md + behavioral execpolicy probe)
 check_lane() {
   local label="$1"
   local dir="$2"
@@ -87,8 +87,16 @@ check_lane() {
     if grep -Eq '^network_access[[:space:]]*=[[:space:]]*false' "${cfg}"; then
       net_label="sandbox_net=restricted"
     fi
+    local probe_note="static_rules=OK"
+    if [ -n "${CODEX_FOUND}" ]; then
+      local p_ok=0
+      if "${CODEX_FOUND}" execpolicy check --rules "${rules}" -- php -r "echo 1;" 2>/dev/null | grep -q '"decision":"forbidden"'; then p_ok=$((p_ok + 1)); fi
+      if "${CODEX_FOUND}" execpolicy check --rules "${rules}" -- vssadmin delete shadows 2>/dev/null | grep -q '"decision":"forbidden"'; then p_ok=$((p_ok + 1)); fi
+      if "${CODEX_FOUND}" execpolicy check --rules "${rules}" -- Start-Process calc.exe 2>/dev/null | grep -q '"decision":"forbidden"'; then p_ok=$((p_ok + 1)); fi
+      probe_note="engine_probe=${p_ok}/3 forbidden"
+    fi
     if [ "${static_ok}" -eq 1 ]; then
-      report "PASS" "${label} Guardrails" "config + rules + AGENTS.md | static-only=ON | ${net_label}"
+      report "PASS" "${label} Guardrails" "config + AGENTS.md | ${probe_note} | ${net_label}"
     else
       report "WARN" "${label} Guardrails" "config + rules + AGENTS.md present, but static-only isolation rules incomplete (${net_label})"
     fi

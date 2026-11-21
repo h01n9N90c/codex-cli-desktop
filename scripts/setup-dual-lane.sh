@@ -14,10 +14,14 @@ LANE1_HOME="${CODEX_LANE1_HOME:-${HOME}/.codex}"
 LANE2_HOME="${CODEX_LANE2_HOME:-${HOME}/.codex-official}"
 LOCAL_BIN="${CODEX_LOCAL_BIN:-${HOME}/.local/bin}"
 CARGO_TARGET_LANE2="${CODEX_CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/codex-lane2-target}"
-APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-never}"
+APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-on-request}"
 SANDBOX_NETWORK="${CODEX_SANDBOX_NETWORK:-false}"
+USE_GIT_WORKTREE=0
+LANE2_WORKTREE_PATH=""
+LANE2_BRANCH="dual-lane-2"
 INSTALL_BRIDGE=0
 SYNC_SESSIONS=0
+PINNED_ONLY=0
 DRY_RUN=0
 
 usage() {
@@ -25,12 +29,16 @@ usage() {
 Usage: ./scripts/setup-dual-lane.sh [REPO_PATH] [OPTIONS]
 
 Options:
-  --repo PATH               Target repository directory (default: current directory)
-  --allow-sandbox-network   Enable network_access=true inside [sandbox_workspace_write]
-  --install-bridge          Copy templates/DUAL_LANE_BRIDGE.md into <repo>/artifacts/dual-lane/
-  --sync-sessions           Run scripts/sync-sessions.py after install (requires python3)
-  --dry-run                 Preview every step without writing any files
-  -h, --help                Show this help message
+  --repo PATH                 Target repository directory (default: current directory)
+  --approval-policy MODE      'on-request' (default, secure) or 'never' (unattended)
+  --allow-sandbox-network     Enable network_access=true inside [sandbox_workspace_write]
+  --use-git-worktree          Create an isolated Git worktree (<repo>-lane2) for OS-level file isolation
+  --worktree-path PATH        Custom worktree path when using --use-git-worktree
+  --install-bridge            Copy templates/DUAL_LANE_BRIDGE.md into <repo>/artifacts/dual-lane/
+  --sync-sessions             Run scripts/sync-sessions.py after install (requires python3)
+  --pinned-only               With --sync-sessions, only sync pinned threads
+  --dry-run                   Preview every step without writing any files
+  -h, --help                  Show this help message
 EOF
 }
 
@@ -40,9 +48,21 @@ while [ "$#" -gt 0 ]; do
       REPO_PATH="$2"
       shift 2
       ;;
+    --approval-policy)
+      APPROVAL_POLICY="$2"
+      shift 2
+      ;;
     --allow-sandbox-network)
       SANDBOX_NETWORK="true"
       shift
+      ;;
+    --use-git-worktree)
+      USE_GIT_WORKTREE=1
+      shift
+      ;;
+    --worktree-path)
+      LANE2_WORKTREE_PATH="$2"
+      shift 2
       ;;
     --install-bridge)
       INSTALL_BRIDGE=1
@@ -50,6 +70,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --sync-sessions)
       SYNC_SESSIONS=1
+      shift
+      ;;
+    --pinned-only)
+      PINNED_ONLY=1
       shift
       ;;
     --dry-run)
@@ -107,12 +131,30 @@ HAS_GOALS_FLAG=0
 if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^daemon_auto_start[[:space:]]+'; then HAS_DAEMON_FLAG=1; fi
 if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^goals[[:space:]]+'; then HAS_GOALS_FLAG=1; fi
 
-# 3. Prepare directories
+# 3. Optional: Create isolated Git worktree for Lane 2 (OS-level workspace-write boundary)
+EFFECTIVE_LANE2_REPO="${REPO_PATH}"
+if [ "${USE_GIT_WORKTREE}" -eq 1 ]; then
+  WT_TARGET="${LANE2_WORKTREE_PATH:-${REPO_PATH}-lane2}"
+  if [ -d "${WT_TARGET}" ]; then
+    EFFECTIVE_LANE2_REPO="$(cd "${WT_TARGET}" && pwd)"
+    echo "    Existing Lane 2 worktree: ${EFFECTIVE_LANE2_REPO}"
+  else
+    if [ "${DRY_RUN}" -eq 0 ]; then
+      git -C "${REPO_PATH}" worktree add -B "${LANE2_BRANCH}" "${WT_TARGET}" HEAD
+      EFFECTIVE_LANE2_REPO="$(cd "${WT_TARGET}" && pwd)"
+    else
+      EFFECTIVE_LANE2_REPO="${WT_TARGET}"
+    fi
+    echo "    Created Lane 2 Git worktree: ${EFFECTIVE_LANE2_REPO} (branch: ${LANE2_BRANCH})"
+  fi
+fi
+
+# 4. Prepare directories
 if [ "${DRY_RUN}" -eq 0 ]; then
   mkdir -p "${LANE1_HOME}/rules" "${LANE2_HOME}/rules" "${LOCAL_BIN}"
 fi
 
-# 4. Share memories, sessions, skills, plugins via symlinks (never delete existing dirs without backup)
+# 5. Share memories, sessions, skills, plugins via symlinks (never delete existing dirs without backup)
 stamp="$(date +%Y%m%d-%H%M%S)"
 for d in memories memories_v2 sessions archived_sessions skills plugins; do
   if [ "${DRY_RUN}" -eq 0 ]; then mkdir -p "${LANE1_HOME}/${d}"; fi
@@ -131,7 +173,7 @@ for d in memories memories_v2 sessions archived_sessions skills plugins; do
   echo "    Linked: ${LANE2_HOME}/${d} -> ${LANE1_HOME}/${d}"
 done
 
-# 5. Install firewall rules & global AGENTS.md (with timestamped backup)
+# 6. Install firewall rules & global AGENTS.md (with timestamped backup)
 backup_and_copy() {
   local src="$1"
   local dst="$2"
@@ -148,11 +190,25 @@ backup_and_copy "${KIT_ROOT}/templates/default.rules" "${LANE2_HOME}/rules/defau
 backup_and_copy "${KIT_ROOT}/templates/AGENTS.lane1.md" "${LANE1_HOME}/AGENTS.md"
 backup_and_copy "${KIT_ROOT}/templates/AGENTS.lane2.md" "${LANE2_HOME}/AGENTS.md"
 
-# 6. Write Lane 2 Official config.toml (without hardcoding model/tier; offline sandbox default)
+# 7. Non-destructively merge & write Lane 2 Official config.toml
 CFG2="${LANE2_HOME}/config.toml"
+PRESERVED_USER_SECTIONS=""
 if [ -f "${CFG2}" ]; then
   if [ "${DRY_RUN}" -eq 0 ]; then cp "${CFG2}" "${CFG2}.backup-${stamp}"; fi
   echo "    Backup saved: ${CFG2}.backup-${stamp}"
+  # Extract custom user sections (e.g. [mcp_servers.*], [tui], [plugins.*]) so they are not lost
+  PRESERVED_USER_SECTIONS="$(awk '
+    /^\[.*\]$/ {
+      sec = $0
+      gsub(/^\[|\]$/, "", sec)
+      if (sec == "windows" || sec == "features" || sec == "memories" || sec == "sandbox_workspace_write" || sec == "shell_environment_policy" || sec == "shell_environment_policy.set") {
+        keep = 0
+      } else {
+        keep = 1
+      }
+    }
+    keep == 1 { print $0 }
+  ' "${CFG2}" || true)"
 fi
 
 escape_toml() {
@@ -160,6 +216,7 @@ escape_toml() {
 }
 
 ESC_REPO="$(escape_toml "${REPO_PATH}")"
+ESC_LANE2_REPO="$(escape_toml "${EFFECTIVE_LANE2_REPO}")"
 ESC_CARGO="$(escape_toml "${CARGO_TARGET_LANE2}")"
 
 if [ "${DRY_RUN}" -eq 0 ]; then
@@ -167,8 +224,14 @@ if [ "${DRY_RUN}" -eq 0 ]; then
     printf '# Official OpenAI / ChatGPT Codex CLI configuration (LANE 2)\n'
     printf 'sandbox_mode = "workspace-write"\n'
     printf 'approval_policy = "%s"\n\n' "${APPROVAL_POLICY}"
-    printf '[projects."%s"]\n' "${ESC_REPO}"
-    printf 'trust_level = "trusted"\n\n'
+    if ! printf '%s\n' "${PRESERVED_USER_SECTIONS}" | grep -Fq "[projects.\"${ESC_REPO}\"]"; then
+      printf '[projects."%s"]\n' "${ESC_REPO}"
+      printf 'trust_level = "trusted"\n\n'
+    fi
+    if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! printf '%s\n' "${PRESERVED_USER_SECTIONS}" | grep -Fq "[projects.\"${ESC_LANE2_REPO}\"]"; then
+      printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
+      printf 'trust_level = "trusted"\n\n'
+    fi
     printf '[features]\n'
     [ "${HAS_DAEMON_FLAG}" -eq 1 ] && printf 'daemon_auto_start = false\n'
     printf 'memories = true\n'
@@ -184,11 +247,14 @@ if [ "${DRY_RUN}" -eq 0 ]; then
     printf '[shell_environment_policy.set]\n'
     printf 'CODEX_ACTIVE_LANE = "LANE_2"\n'
     printf 'CARGO_TARGET_DIR = "%s"\n' "${ESC_CARGO}"
+    if [ -n "${PRESERVED_USER_SECTIONS}" ]; then
+      printf '\n# Preserved existing sections\n%s\n' "${PRESERVED_USER_SECTIONS}"
+    fi
   } > "${CFG2}"
 fi
-echo "    Wrote: ${CFG2} (network_access=${SANDBOX_NETWORK})"
+echo "    Wrote: ${CFG2} (approval_policy=${APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK})"
 
-# 7. Install launchers
+# 8. Install launchers
 if [ "${DRY_RUN}" -eq 0 ]; then
   for name in codex codex-official; do
     cat > "${LOCAL_BIN}/${name}" <<EOF
@@ -211,21 +277,23 @@ EOF
 fi
 echo "    Installed wrappers in: ${LOCAL_BIN}"
 
-# 8. Optional bridge template
+# 9. Optional bridge template
 if [ "${INSTALL_BRIDGE}" -eq 1 ]; then
-  BRIDGE_DST="${REPO_PATH}/artifacts/dual-lane/DUAL_LANE_BRIDGE.md"
-  if [ ! -f "${BRIDGE_DST}" ]; then
-    if [ "${DRY_RUN}" -eq 0 ]; then
-      mkdir -p "$(dirname "${BRIDGE_DST}")"
-      cp "${KIT_ROOT}/templates/DUAL_LANE_BRIDGE.md" "${BRIDGE_DST}"
+  for target_repo in "${REPO_PATH}" "${EFFECTIVE_LANE2_REPO}"; do
+    BRIDGE_DST="${target_repo}/artifacts/dual-lane/DUAL_LANE_BRIDGE.md"
+    if [ ! -f "${BRIDGE_DST}" ]; then
+      if [ "${DRY_RUN}" -eq 0 ]; then
+        mkdir -p "$(dirname "${BRIDGE_DST}")"
+        cp "${KIT_ROOT}/templates/DUAL_LANE_BRIDGE.md" "${BRIDGE_DST}"
+      fi
+      echo "    Created: ${BRIDGE_DST}"
+    else
+      echo "    Kept existing: ${BRIDGE_DST}"
     fi
-    echo "    Created: ${BRIDGE_DST}"
-  else
-    echo "    Kept existing: ${BRIDGE_DST}"
-  fi
+  done
 fi
 
-# 9. Optional session sync
+# 10. Optional session sync
 if [ "${SYNC_SESSIONS}" -eq 1 ]; then
   PY_BIN=""
   for cand in python3 python; do
@@ -237,7 +305,8 @@ if [ "${SYNC_SESSIONS}" -eq 1 ]; then
     fi
   done
   if [ -n "${PY_BIN}" ]; then
-    SYNC_ARGS=("${KIT_ROOT}/scripts/sync-sessions.py" --lane1 "${LANE1_HOME}" --lane2 "${LANE2_HOME}" --repo "${REPO_PATH}" --approval-mode "${APPROVAL_POLICY}")
+    SYNC_ARGS=("${KIT_ROOT}/scripts/sync-sessions.py" --lane1 "${LANE1_HOME}" --lane2 "${LANE2_HOME}" --repo "${EFFECTIVE_LANE2_REPO}" --approval-mode "${APPROVAL_POLICY}")
+    [ "${PINNED_ONLY}" -eq 1 ] && SYNC_ARGS+=(--pinned-only)
     [ "${DRY_RUN}" -eq 1 ] && SYNC_ARGS+=(--dry-run)
     "${PY_BIN}" "${SYNC_ARGS[@]}"
   else

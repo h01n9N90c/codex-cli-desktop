@@ -6,20 +6,24 @@ Tài liệu này giải thích các rủi ro thực tế khi chạy AI coding ag
 
 ---
 
-## 1. Bốn lớp bảo vệ cài sẵn bởi `setup-dual-lane.ps1`
+## 1. Bốn lớp phòng thủ nhiều tầng (Defense-in-Depth) & Ranh giới kỹ thuật thực tế
 
-### Lớp 1: Khóa Sandbox phạm vi Workspace & Cách ly mạng (`sandbox_mode = "workspace-write"` + `network_access = false`)
-* Agent **chỉ được quyền ghi** trong thư mục dự án bạn đang mở và `%TEMP%`.
-* Toàn bộ ổ `C:\`, thư mục hệ thống Windows, và thậm chí cả `.git/`, `.codex/`, `.agents/`, `.aws/` bên trong thư mục dự án đều bị khóa **chỉ-đọc (`read-only`)** ở tầng sandbox Windows (`[windows] sandbox = "elevated"`).
-* Mặc định `[sandbox_workspace_write] network_access = false`: **ngắt mạng đầu ra của mọi lệnh shell trong sandbox** (ngăn reverse shell / tải payload), trong khi bản thân Codex vẫn gọi API LLM ở tiến trình ngoài bình thường. (Chỉ mở lại bằng cờ `-AllowSandboxNetwork` khi cần.)
+### Lớp 1: Khóa Sandbox phạm vi Workspace & Cách ly mạng (`sandbox_mode = "workspace-write"` + `network_access = false` + `approval_policy = "on-request"`)
+* **Cưỡng chế ở cấp Hệ điều hành (Hard OS Boundary):** Agent chỉ được quyền ghi tự động trong thư mục làm việc hiện tại (`cwd`) và `%TEMP%`. Toàn bộ ổ `C:\`, thư mục hệ thống Windows, và các thư mục `.git/`, `.codex/`, `.agents/`, `.aws/` bên trong dự án bị khóa chỉ-đọc (`read-only`) ở tầng sandbox Windows (`[windows] sandbox = "elevated"`).
+* **Chế độ phê duyệt mặc định an toàn (`approval_policy = "on-request"`):** Các thao tác đọc/ghi/test hợp lệ bên trong sandbox chạy tự động; bất kỳ lệnh nào yêu cầu quyền vượt ra ngoài giới hạn sandbox hoặc khớp quy tắc `decision = "prompt"` sẽ bắt buộc chờ người dùng phê duyệt. (Chỉ chuyển sang `never` khi bạn chủ động truyền `-ApprovalPolicy never` cho tác vụ chạy tự động đã cô lập).
+* **Ngắt mạng đầu ra mặc định trong Shell Sandbox (`[sandbox_workspace_write] network_access = false`):** Chặn các tiến trình con trong sandbox mở kết nối mạng ra ngoài, trong khi tiến trình Codex ở ngoài vẫn gọi API LLM bình thường.
+* **Phân vùng ghi giữa 2 Agent — Ranh giới Mềm vs Ranh giới Cứng (`-UseGitWorktree`):**
+  * Nếu 2 luồng chạy chung trên **cùng 1 thư mục dự án**, phân vùng thư mục giữa Luồng 1 và Luồng 2 là **Ranh giới mềm (Prompt Boundary)** qua `AGENTS.md` và `DUAL_LANE_BRIDGE.md`.
+  * Nếu cần **cưỡng chế phân quyền ghi ở cấp hệ điều hành giữa 2 luồng**, hãy chạy bộ cài với cờ **`-UseGitWorktree`** (`--use-git-worktree` trên Unix): bộ cài sẽ tạo một Git worktree riêng (`<repo>-lane2`) cho Luồng 2 để sandbox `workspace-write` khóa cứng từng luồng vào cây thư mục riêng biệt.
 
-### Lớp 2: Lọc biến môi trường nhạy cảm (`[shell_environment_policy]`)
-Trong `config.toml`:
+### Lớp 2: Quản lý Secret bằng `env_key` & Lọc biến môi trường (`[shell_environment_policy]`)
+* Khi cấu hình cổng API bên thứ 3 (`-ConfigureGateway`), bộ kit sử dụng thuộc tính **`env_key = "CODEX_GATEWAY_API_KEY"`** (kết hợp nhập ẩn qua `-PromptGatewayApiKey`), **không bao giờ lưu plaintext API key hay `experimental_bearer_token` vào `config.toml` hoặc các file `.backup-*`**.
+* Trong `config.toml`:
 ```toml
 [shell_environment_policy]
 exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]
 ```
-* Khi agent mở PowerShell/CMD để chạy lệnh build hoặc test, mọi biến môi trường chứa từ khóa nhạy cảm sẽ tự động bị lọc bỏ, không truyền xuống tiến trình con.
+* Khi agent mở PowerShell/CMD để chạy lệnh build hoặc test, các biến môi trường khớp mẫu nhạy cảm sẽ bị lọc bỏ, không truyền xuống tiến trình shell con.
 
 ### Lớp 3: Tường lửa chặn lệnh nguy hiểm & Cách ly phân tích tĩnh (`rules/default.rules`)
 Codex kiểm tra file Starlark `rules/default.rules` **trước khi chạy lệnh trực tiếp** (có hiệu lực ngay cả khi bật `approval_policy = "never"`!):

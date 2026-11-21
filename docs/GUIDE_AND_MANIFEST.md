@@ -41,8 +41,13 @@
 | :--- | :--- |
 | [`README.md`](../README.md) | Trang tổng quan, bảng chọn kịch bản theo nhu cầu, sơ đồ kiến trúc và lệnh cài nhanh 3 bước. |
 | [`docs/GUIDE_AND_MANIFEST.md`](./GUIDE_AND_MANIFEST.md) | Chính tài liệu bạn đang đọc — khai báo chi tiết mã nguồn, hàm, tham số và hướng dẫn gỡ bỏ. |
-| [`docs/SECURITY_MODEL.md`](./SECURITY_MODEL.md) | Phân tích sâu 4 lớp bảo vệ, cách ly chỉ phân tích tĩnh, nguyên tắc Khiên Git và rủi ro khi dùng cổng API bên thứ 3. |
+| [`docs/REAL_CODEX_CHECKLIST.md`](./REAL_CODEX_CHECKLIST.md) | Danh sách lệnh kiểm chứng thực nghiệm trước & sau khi cài đặt (kiểm tra 0 plaintext key, behavioral `execpolicy check`, UPSERT SQLite, ranh giới Mềm vs Cứng). |
+| [`docs/SECURITY_MODEL.md`](./SECURITY_MODEL.md) | Phân tích sâu 4 lớp phòng thủ, ranh giới Mềm (`AGENTS.md`) vs Cứng (`-UseGitWorktree`), nguyên tắc Khiên Git và rủi ro khi dùng cổng API bên thứ 3. |
 | [`docs/TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) | Hướng dẫn khắc phục 7 lỗi thực chiến thường gặp (bao gồm cảnh báo nhầm Windows Defender trên file `.jsonl`). |
+| [`tests/test_sync_sessions.py`](../tests/test_sync_sessions.py) | Bộ Unit Test Python (`unittest`) kiểm chứng UPSERT (`INSERT` khi DB đích trống + `UPDATE`), `--pinned-only`, lệch cột schema và `--dry-run`. |
+| [`tests/test-kit.ps1`](../tests/test-kit.ps1) | Bộ Smoke & Integration Test PowerShell kiểm chứng merge `config.toml` không phá hủy, mặc định `on-request`, cô lập key qua `env_key` và chuẩn UTF-8 không BOM. |
+| [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | Pipeline GitHub Actions CI tự động chạy toàn bộ unit test & smoke test trên `windows-latest` và `ubuntu-latest`. |
+| [`.gitattributes`](../.gitattributes) | Khóa định dạng xuống dòng (`eol=lf` cho `.sh`/`.py`/`.md`/`.rules`, `eol=crlf` cho `.ps1`/`.cmd`). |
 | [`.gitignore`](../.gitignore) | Chặn tuyệt đối không để lỡ commit `.env`, `config.toml`, `auth.json`, `*.sqlite`, `*.key`, `__pycache__/`. |
 | [`LICENSE`](../LICENSE) | Giấy phép mã nguồn mở **Apache License 2.0**. |
 | [`NOTICE`](../NOTICE) | Thông báo bản quyền chuẩn Apache-2.0 (`Copyright 2026 Lê Hoàng Ngọc Tươi`). |
@@ -96,6 +101,7 @@
 | `Resolve-CodexExecutable` | `ExplicitPath`, `ExcludedDir` | Tự dò đường dẫn thật của `codex.exe`/`codex.cmd` theo 4 nguồn: tham số `-CodexPath` $\rightarrow$ `WindowsApps` (`OpenAI.Codex`) $\rightarrow$ `PATH` *(loại trừ `~/.local/bin` tránh vòng lặp đệ quy)* $\rightarrow$ `%APPDATA%\npm` & `%LOCALAPPDATA%\Programs`. |
 | `Get-SupportedCodexFeatures` | `ExePath`, `ProbeHome` | Chạy thử `& $ExePath features list` trong một thư mục tạm `CODEX_HOME` riêng để lấy danh sách feature flags thật mà bản Codex trên máy hỗ trợ, rồi dọn sạch thư mục tạm. |
 | `Get-ExistingTrustedProjects` | `ConfigPaths[]` | Quét các `config.toml` cũ của cả Luồng 1 & Luồng 2 để giữ nguyên 100% danh sách `[projects.'...']` đã đánh dấu `trusted`. |
+| `Merge-CodexConfigToml` | `ExistingPath`, `ManagedTopBlock`, `ManagedSectionsBlock`, `ManagedTopKeys[]`, `ManagedSectionNames[]` | Hợp nhất không phá hủy vào `config.toml` hiện có: giữ nguyên mọi khóa top-level và các section tùy chỉnh của người dùng (như `[mcp_servers.*]`, `[tui]`, `[plugins.*]`, `[desktop.*]`), chỉ cập nhật các section do Dual-Lane quản lý. |
 
 #### `scripts/doctor.ps1` (PowerShell 5.1+ / 7+ — Chỉ đọc)
 | Thành phần / Mục kiểm tra | Thực hiện chính xác điều gì |
@@ -135,14 +141,20 @@
 | `-OfficialModel` | `string` | *(để trống)* | Đặt model mặc định cố định cho Luồng 2 (vd `gpt-6.2-sol`) |
 | `-OfficialReasoning` | `string` | *(để trống)* | Đặt mức suy luận (`low`, `medium`, `high`, `ultra`) nếu muốn cố định |
 | `-OfficialServiceTier` | `string` | *(để trống)* | Đặt `service_tier` (vd `priority`) nếu tài khoản của bạn có hỗ trợ |
-| `-ApprovalPolicy` | `never` \| `on-request` | `never` | Chế độ tự chạy trong sandbox (`never`) hay hỏi duyệt từng lệnh (`on-request`) |
+| `-ApprovalPolicy` | `on-request` \| `never` | `on-request` | Mặc định an toàn (`on-request`: chỉ hỏi duyệt khi lệnh vượt giới hạn sandbox hoặc chạm rule `prompt`); truyền `never` khi cần chạy tự động không tương tác |
 | `-AllowSandboxNetwork` | `switch` | `false` | Mặc định ngắt mạng trong shell sandbox (`network_access = false`) để cách ly phân tích tĩnh; bật cờ này nếu cần lệnh shell truy cập Internet |
-| `-ConfigureGateway` | `switch` | `false` | Bật cấu hình cổng API bên thứ 3 cho Luồng 1 |
+| `-UseGitWorktree` | `switch` | `false` | Tự động tạo Git worktree riêng (`<RepoPath>-lane2`) cho Luồng 2 để cưỡng chế phân quyền ghi giữa 2 agent ở cấp OS Sandbox |
+| `-Lane2WorktreePath` | `string` | `<RepoPath>-lane2` | Đường dẫn tùy chỉnh cho Git worktree của Luồng 2 khi bật `-UseGitWorktree` |
+| `-Lane2Branch` | `string` | `dual-lane-2` | Tên nhánh Git dùng cho worktree của Luồng 2 khi bật `-UseGitWorktree` |
+| `-ConfigureGateway` | `switch` | `false` | Bật cấu hình cổng API bên thứ 3 cho Luồng 1 (sử dụng `env_key`, không lưu plaintext key trong `config.toml`) |
 | `-GatewayProviderName` | `string` | `OpenAI` | Tên mục `[model_providers.<Name>]` cho Luồng 1 |
 | `-GatewayBaseUrl` | `string` | *(trống)* | Base URL của cổng API bên thứ 3 (vd `https://example.com/v1`) |
 | `-GatewayModel` | `string` | *(trống)* | Model mặc định cho Luồng 1 khi dùng `-ConfigureGateway` |
-| `-GatewayApiKey` | `string` | *(trống)* | API key truyền lúc chạy (không lưu trong repo) |
-| `-SyncSessions` | `switch` | `false` | Gọi `sync-sessions.py` để đồng bộ `session_index.jsonl`, `Pinned` và `Goals` |
+| `-GatewayApiKeyEnv` | `string` | `CODEX_GATEWAY_API_KEY` | Tên biến môi trường lưu API key cho thuộc tính `env_key` của Codex |
+| `-PromptGatewayApiKey` | `switch` | `false` | Nhập ẩn API key lúc chạy qua `Read-Host -AsSecureString` rồi lưu vào biến môi trường User `-GatewayApiKeyEnv` (không lộ trong lịch sử lệnh hay `config.toml`) |
+| `-GatewayApiKey` | `string` | *(trống)* | *(Tương thích ngược)* Lưu key vào biến môi trường User `-GatewayApiKeyEnv`, không ghi vào `config.toml` |
+| `-SyncSessions` | `switch` | `false` | Gọi `sync-sessions.py` để đồng bộ UPSERT (`INSERT` + `UPDATE`) `session_index.jsonl`, `Pinned` và `Goals` |
+| `-PinnedOnlySync` | `switch` | `false` | Khi dùng cùng `-SyncSessions`, chỉ đồng bộ các phiên đã ghim (`Pinned`) |
 | `-InstallBridgeTemplate` | `switch` | `false` | Tạo file mẫu `artifacts/dual-lane/DUAL_LANE_BRIDGE.md` trong `-RepoPath` |
 | `-SkipPathUpdate` | `switch` | `false` | Bỏ qua bước tự sửa biến môi trường User `PATH` (hữu ích khi test sandbox/CI hoặc tự quản lý `PATH`) |
 | `-DryRun` | `switch` | `false` | Chạy kiểm tra thực tế và in kế hoạch mà **không sửa bất kỳ tệp nào trên đĩa** |
