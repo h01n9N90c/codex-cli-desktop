@@ -855,9 +855,16 @@ theme = "light"
 
         # Hard Fail-Closed Worktree Regression B2: Existing worktree directory where `cd /d` fails (inaccessible ACL)
         # MUST FAIL CLOSED (exit != 0, error explains refusal to remain in primary repo, fake codex NOT executed!).
+        # WHY explicit DENY '*S-1-1-0:(X)' on BOTH $expectedWtRoot and $expectedWtSub (instead of /inheritance:r):
+        # On GitHub Actions windows-latest (elevated runneradmin), directories may carry explicit Allow ACEs that
+        # survive /inheritance:r AND override inherited Deny ACEs in NTFS canonical order. Explicit DENY (X) on
+        # both root and subdir always overrides explicit Allow ACEs, keeps `if exist "<wt>\"` true so the actual
+        # `cd /d` failure branch (`:_dl_wt_cd_fail`) is exercised, and preserves WRITE_DAC for clean removal.
         try {
-            $null = & icacls.exe $expectedWtRoot /inheritance:r 2>&1
-            $global:LASTEXITCODE = 0
+            $denyRootOut = (& icacls.exe $expectedWtRoot /deny '*S-1-1-0:(X)' 2>&1) -join "`n"
+            Assert-True ($LASTEXITCODE -eq 0) "icacls /deny on worktree root failed: $denyRootOut"
+            $denySubOut = (& icacls.exe $expectedWtSub /deny '*S-1-1-0:(X)' 2>&1) -join "`n"
+            Assert-True ($LASTEXITCODE -eq 0) "icacls /deny on worktree subdir failed: $denySubOut"
             Push-Location $wtSub
             try {
                 $prevEap = $ErrorActionPreference
@@ -871,7 +878,8 @@ theme = "light"
                 Assert-True (-not $outCdFail.Contains('WT_ACTIVE_CWD=')) "CRITICAL: Failed worktree cd MUST NOT execute fake codex!`nOutput:`n$outCdFail"
             } finally { Pop-Location }
         } finally {
-            $null = & icacls.exe $expectedWtRoot /inheritance:e 2>&1
+            $null = & icacls.exe $expectedWtSub /remove:d '*S-1-1-0' 2>&1
+            $null = & icacls.exe $expectedWtRoot /remove:d '*S-1-1-0' 2>&1
             $global:LASTEXITCODE = 0
         }
     } finally {
