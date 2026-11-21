@@ -51,18 +51,36 @@ if ($homeVol -and $homeVol.FileSystem -eq 'NTFS') {
     Report 'FAIL' 'Home Drive Filesystem' "${homeDrive}: is NOT NTFS ($($homeVol.FileSystem)); Junctions will fail"
 }
 
-# 3. Codex CLI launcher resolution
+# 3. Codex CLI launcher resolution & PATH precedence
+$normBin = $LocalBin.TrimEnd('\').ToLowerInvariant()
 $codexCmd = Get-Command codex -ErrorAction SilentlyContinue
 if ($codexCmd) {
-    $ver = (& $codexCmd.Source --version 2>&1 | Select-Object -First 1)
-    Report 'PASS' 'codex CLI in PATH' "$($codexCmd.Source) ($ver)"
+    $ver = (& $codexCmd.Source --version 2>&1 | Where-Object { $_ -notmatch '^WARNING:' } | Select-Object -First 1)
+    $parent = (Split-Path -Parent $codexCmd.Source).TrimEnd('\').ToLowerInvariant()
+    if ($parent -eq $normBin) {
+        Report 'PASS' 'codex CLI in PATH' "$($codexCmd.Source) ($ver)"
+    } else {
+        Report 'WARN' 'codex CLI in PATH' "Resolved to $($codexCmd.Source) instead of $LocalBin\codex.cmd (reopen terminal or put $LocalBin first in PATH)"
+    }
 } else {
-    Report 'WARN' 'codex CLI in PATH' "Not found in PATH. Run setup-dual-lane.ps1 and reopen terminal."
+    $localFallback = Join-Path $LocalBin 'codex.cmd'
+    if (Test-Path -LiteralPath $localFallback) {
+        Report 'WARN' 'codex CLI in PATH' "Wrapper exists at $localFallback but is not yet in PATH (reopen terminal)"
+    } else {
+        Report 'WARN' 'codex CLI in PATH' "Not found in PATH. Run setup-dual-lane.ps1 and reopen terminal."
+    }
 }
 
 $codexT3Cmd = Get-Command codex-t3 -ErrorAction SilentlyContinue
 if ($codexT3Cmd) {
-    Report 'PASS' 'codex-t3 CLI in PATH' $codexT3Cmd.Source
+    $t3Parent = (Split-Path -Parent $codexT3Cmd.Source).TrimEnd('\').ToLowerInvariant()
+    if ($t3Parent -eq $normBin) {
+        Report 'PASS' 'codex-t3 CLI in PATH' $codexT3Cmd.Source
+    } else {
+        Report 'WARN' 'codex-t3 CLI in PATH' "Resolved to $($codexT3Cmd.Source) instead of $LocalBin\codex-t3.cmd"
+    }
+} elseif (Test-Path -LiteralPath (Join-Path $LocalBin 'codex-t3.cmd')) {
+    Report 'WARN' 'codex-t3 CLI in PATH' "Wrapper exists at $(Join-Path $LocalBin 'codex-t3.cmd') (reopen terminal for PATH)"
 } else {
     Report 'WARN' 'codex-t3 CLI in PATH' 'Not found in PATH'
 }
@@ -124,12 +142,23 @@ if ($m2 -ne 'not-logged-in') {
     Report 'WARN' 'Auth Isolation' "Lane 1=$m1 | Lane 2=$m2 (run 'codex login' for Lane 2)"
 }
 
-# 7. Python 3 availability (optional, for sync-sessions.py)
-$py = Get-Command python -ErrorAction SilentlyContinue
-if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
-if ($py) {
-    $pyVer = (& $py.Source --version 2>&1 | Select-Object -First 1)
-    Report 'PASS' 'Python 3 (Optional Sync)' "$pyVer ($($py.Source))"
+# 7. Python 3 availability (optional, for sync-sessions.py; ignore Microsoft Store stub)
+$realPy = $null
+$realPyVer = ''
+foreach ($cand in @('python', 'python3')) {
+    foreach ($cmd in (Get-Command $cand -All -ErrorAction SilentlyContinue)) {
+        if (-not $cmd.Source -or ($cmd.Source -like '*\WindowsApps\*')) { continue }
+        $v = (& $cmd.Source --version 2>&1 | Select-Object -First 1)
+        if ($v -match '^Python 3\.') {
+            $realPy = $cmd.Source
+            $realPyVer = [string]$v
+            break
+        }
+    }
+    if ($realPy) { break }
+}
+if ($realPy) {
+    Report 'PASS' 'Python 3 (Optional Sync)' "$realPyVer ($realPy)"
 } else {
     Report 'WARN' 'Python 3 (Optional Sync)' 'Not installed (only needed if running scripts/sync-sessions.py)'
 }

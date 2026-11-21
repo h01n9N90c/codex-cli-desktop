@@ -21,9 +21,10 @@
 | Tệp | Ngôn ngữ / Runtime | Vai trò chính | Đường dẫn ĐỌC | Đường dẫn GHI |
 | :--- | :--- | :--- | :--- | :--- |
 | [`scripts/setup-dual-lane.ps1`](../scripts/setup-dual-lane.ps1) | PowerShell 5.1+ / 7+ (Windows) | Bộ cài đặt chính 1 chạm cho Windows (hỗ trợ `-DryRun`) | `Get-AppxPackage OpenAI.Codex`, `PATH`, `Get-Volume`, `codex features list`, `templates/*`, `config.toml` cũ | `~/.codex-official/config.toml`, `~/.codex*/rules/default.rules`, `~/.codex*/AGENTS.md`, 6 NTFS Junctions trong `~/.codex-official/`, 3 wrapper `.cmd` trong `~/.local/bin/`, User `PATH`, tùy chọn `~/.codex/config.toml` & `<repo>/artifacts/dual-lane/DUAL_LANE_BRIDGE.md` |
-| [`scripts/setup-dual-lane.sh`](../scripts/setup-dual-lane.sh) | Bash (`set -euo pipefail`, macOS / Linux / WSL) | Bộ cài đặt tương đương cho hệ Unix | `which -a codex`, `templates/*` | `~/.codex-official/config.toml`, 6 symlinks (`ln -s`), `rules/default.rules`, `AGENTS.md`, 3 wrapper shell trong `~/.local/bin/` |
-| [`scripts/doctor.ps1`](../scripts/doctor.ps1) | PowerShell 5.1+ / 7+ (Windows) | Kiểm tra sức khỏe, tương thích hệ thống & trạng thái cách ly phân tích tĩnh (**Chỉ đọc — Read-Only**) | `OSVersion`, `Get-Volume`, `Get-Command codex/codex-t3/python`, thuộc tính Junction, `default.rules`/`AGENTS.md`/`config.toml`, `auth.json` *(chỉ đọc trường `auth_mode`, không in giá trị token/key)* | **Không ghi bất kỳ tệp nào** |
-| [`scripts/sync-sessions.py`](../scripts/sync-sessions.py) | Python 3.8+ (thư viện chuẩn `sqlite3`, `json`, `glob`, `re`) | Đồng bộ tên phiên, mục đã ghim (`Pinned`) & `Goals` từ Luồng 1 sang Luồng 2 (hỗ trợ `--dry-run`) | `~/.codex/session_index.jsonl`, `~/.codex/state_*.sqlite`, `~/.codex/goals_*.sqlite`, `PRAGMA table_info(...)` | `~/.codex-official/session_index.jsonl`, `~/.codex-official/state_*.sqlite`, `~/.codex-official/goals_*.sqlite` *(kèm `PRAGMA wal_checkpoint(TRUNCATE)`)* |
+| [`scripts/setup-dual-lane.sh`](../scripts/setup-dual-lane.sh) | Bash (`set -euo pipefail`, macOS / Linux / WSL) | Bộ cài đặt tương đương cho hệ Unix (hỗ trợ `--dry-run`, `--install-bridge`, `--sync-sessions`, `--allow-sandbox-network`) | `type -ap codex`, `codex features list`, `templates/*` | `~/.codex-official/config.toml`, 6 symlinks (`ln -s`), `rules/default.rules`, `AGENTS.md`, 3 wrapper shell trong `~/.local/bin/` |
+| [`scripts/doctor.ps1`](../scripts/doctor.ps1) | PowerShell 5.1+ / 7+ (Windows) | Kiểm tra sức khỏe, tương thích hệ thống, thứ tự ưu tiên `PATH` & trạng thái cách ly phân tích tĩnh (**Chỉ đọc — Read-Only**) | `OSVersion`, `Get-Volume`, `Get-Command codex/codex-t3/python`, thuộc tính Junction, `default.rules`/`AGENTS.md`/`config.toml`, `auth.json` *(chỉ đọc trường `auth_mode`, không in giá trị token/key)* | **Không ghi bất kỳ tệp nào** |
+| [`scripts/doctor.sh`](../scripts/doctor.sh) | Bash (macOS / Linux / WSL) | Phiên bản chẩn đoán hệ thống tương đương cho Unix (**Chỉ đọc — Read-Only**) | `uname`, `df`, `command -v codex/codex-t3/python3`, 6 symlinks, `default.rules`/`AGENTS.md`/`config.toml`, trường `auth_mode` trong `auth.json` | **Không ghi bất kỳ tệp nào** |
+| [`scripts/sync-sessions.py`](../scripts/sync-sessions.py) | Python 3.8+ (thư viện chuẩn `sqlite3`, `json`, `glob`, `re`, `pathlib`) | Đồng bộ tên phiên, mục đã ghim (`Pinned`) & `Goals` từ Luồng 1 (mở **chỉ-đọc `?mode=ro`**) sang Luồng 2 (hỗ trợ `--dry-run`) | `~/.codex/session_index.jsonl`, `~/.codex/state_*.sqlite` *(read-only URI)*, `~/.codex/goals_*.sqlite` *(read-only URI)*, `PRAGMA table_info(...)` | `~/.codex-official/session_index.jsonl`, `~/.codex-official/state_*.sqlite`, `~/.codex-official/goals_*.sqlite` *(kèm `PRAGMA wal_checkpoint(TRUNCATE)`)* |
 
 ### 2.2. Tệp mẫu chính sách & phối hợp (`templates/`)
 
@@ -45,6 +46,7 @@
 | [`.gitignore`](../.gitignore) | Chặn tuyệt đối không để lỡ commit `.env`, `config.toml`, `auth.json`, `*.sqlite`, `*.key`, `__pycache__/`. |
 | [`LICENSE`](../LICENSE) | Giấy phép mã nguồn mở **Apache License 2.0**. |
 | [`NOTICE`](../NOTICE) | Thông báo bản quyền chuẩn Apache-2.0 (`Copyright 2026 Lê Hoàng Ngọc Tươi`). |
+| [`SECURITY.md`](../SECURITY.md) | Chính sách bảo mật & quy trình báo cáo lỗ hổng riêng tư hiển thị trên tab **Security** của GitHub. |
 
 ---
 
@@ -104,6 +106,7 @@
 #### `scripts/sync-sessions.py` (Python 3.8+ — Chỉ dùng thư viện chuẩn)
 | Tên hàm | Đầu vào | Thực hiện chính xác điều gì |
 | :--- | :--- | :--- |
+| `connect_readonly` | `db_path` | Mở file SQLite nguồn của Luồng 1 ở chế độ chỉ-đọc (`file:...?mode=ro`, `timeout=15.0`) để tuyệt đối không chiếm khóa ghi khi Luồng 1 đang chạy. |
 | `find_latest_versioned_db` | `directory`, `prefix` | Tự dò file SQLite phiên bản mới nhất (`state_*.sqlite`, `goals_*.sqlite`) theo số thứ tự lớn nhất. |
 | `get_tables` / `get_columns` | `conn`, `table` | Truy vấn `sqlite_master` và `PRAGMA table_info(...)` để tương thích động mọi phiên bản schema Codex. |
 | `sync_session_index` | `lane1`, `lane2`, `dry_run` | Hợp nhất không trùng lặp các bản ghi theo `id` giữa 2 tệp `session_index.jsonl`. |
@@ -141,6 +144,7 @@
 | `-GatewayApiKey` | `string` | *(trống)* | API key truyền lúc chạy (không lưu trong repo) |
 | `-SyncSessions` | `switch` | `false` | Gọi `sync-sessions.py` để đồng bộ `session_index.jsonl`, `Pinned` và `Goals` |
 | `-InstallBridgeTemplate` | `switch` | `false` | Tạo file mẫu `artifacts/dual-lane/DUAL_LANE_BRIDGE.md` trong `-RepoPath` |
+| `-SkipPathUpdate` | `switch` | `false` | Bỏ qua bước tự sửa biến môi trường User `PATH` (hữu ích khi test sandbox/CI hoặc tự quản lý `PATH`) |
 | `-DryRun` | `switch` | `false` | Chạy kiểm tra thực tế và in kế hoạch mà **không sửa bất kỳ tệp nào trên đĩa** |
 
 ### 4.2. `scripts/sync-sessions.py`

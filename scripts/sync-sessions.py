@@ -21,6 +21,7 @@ import argparse
 import glob
 import json
 import os
+from pathlib import Path
 import re
 import sqlite3
 import sys
@@ -28,6 +29,11 @@ import sys
 __author__ = "Lê Hoàng Ngọc Tươi"
 __copyright__ = "Copyright 2026 Lê Hoàng Ngọc Tươi"
 __license__ = "Apache-2.0"
+
+
+def connect_readonly(db_path: str) -> sqlite3.Connection:
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=15.0)
 
 
 def find_latest_versioned_db(directory: str, prefix: str) -> str | None:
@@ -123,7 +129,8 @@ def sync_state_db(
         )
         return (None, 0)
 
-    c1, c2 = sqlite3.connect(st1), sqlite3.connect(st2)
+    c1 = connect_readonly(st1)
+    c2 = sqlite3.connect(st2, timeout=15.0)
     try:
         for tbl in ("thread_sections", "projects", "project_roots"):
             copy_shared_table(c1, c2, tbl, dry_run)
@@ -203,7 +210,8 @@ def sync_goals_db(lane1: str, lane2: str, dry_run: bool) -> int:
     if not g1 or not g2:
         return 0
 
-    c1, c2 = sqlite3.connect(g1), sqlite3.connect(g2)
+    c1 = connect_readonly(g1)
+    c2 = sqlite3.connect(g2, timeout=15.0)
     try:
         goals_count = copy_shared_table(c1, c2, "thread_goals", dry_run)
         copy_shared_table(c1, c2, "thread_goal_continuation_deferrals", dry_run)

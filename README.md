@@ -59,20 +59,22 @@ flowchart LR
 ## Cấu trúc thư mục
 
 ```text
-codex-dual-lane-kit/
+codex-cli-desktop-/
 ├── README.md                     # Hướng dẫn tổng hợp (file bạn đang đọc)
 ├── LICENSE                       # Giấy phép Apache License 2.0
 ├── NOTICE                        # Khai báo bản quyền tác giả (Apache-2.0)
+├── SECURITY.md                   # Chính sách bảo mật & báo cáo lỗ hổng (tab Security trên GitHub)
 ├── .gitignore                    # Chặn tuyệt đối không commit key / auth.json / config.toml
 ├── scripts/
 │   ├── setup-dual-lane.ps1       # Bộ cài đặt tự thích nghi cho Windows 10/11 (hỗ trợ -DryRun)
-│   ├── setup-dual-lane.sh        # Bộ cài đặt tương đương cho macOS / Linux / WSL
-│   ├── doctor.ps1                # Công cụ chẩn đoán hệ thống thực tế (read-only, zero mock data)
-│   └── sync-sessions.py          # Đồng bộ phiên, mục đã ghim (Pinned) & Goals (tự đọc schema SQLite)
+│   ├── setup-dual-lane.sh        # Bộ cài đặt tương đương cho macOS / Linux / WSL (hỗ trợ --dry-run)
+│   ├── doctor.ps1                # Chẩn đoán hệ thống thực tế cho Windows (read-only, zero mock data)
+│   ├── doctor.sh                 # Chẩn đoán hệ thống thực tế cho macOS / Linux / WSL (read-only)
+│   └── sync-sessions.py          # Đồng bộ phiên, mục đã ghim (Pinned) & Goals (SQLite read-only nguồn)
 ├── templates/
-│   ├── default.rules             # Tường lửa chặn lệnh nguy hiểm (Starlark execpolicy)
-│   ├── AGENTS.lane1.md           # Chỉ thị bảo vệ & phân luồng toàn cục cho Luồng 1
-│   ├── AGENTS.lane2.md           # Chỉ thị bảo vệ & phân luồng toàn cục cho Luồng 2
+│   ├── default.rules             # Tường lửa chặn lệnh nguy hiểm & LOLBins (Starlark execpolicy)
+│   ├── AGENTS.lane1.md           # Chỉ thị bảo vệ, phân tích tĩnh & phân luồng cho Luồng 1
+│   ├── AGENTS.lane2.md           # Chỉ thị bảo vệ, phân tích tĩnh & phân luồng cho Luồng 2
 │   └── DUAL_LANE_BRIDGE.md       # Mẫu cầu nối giao tiếp 2 luồng cho bất kỳ dự án nào
 └── docs/
     ├── GUIDE_AND_MANIFEST.md     # Hướng dẫn chi tiết, khai báo từng tệp/hàm/tham số & cách gỡ an toàn
@@ -84,9 +86,11 @@ codex-dual-lane-kit/
 
 ## Hướng dẫn cài đặt nhanh (Windows — 3 bước)
 
-### Bước 0 *(Khuyên làm trước)* — Chạy thử `-DryRun` để kiểm tra máy của bạn
-Mở PowerShell tại thư mục `codex-dual-lane-kit` và chạy (không sửa bất kỳ file nào):
+### Bước 0 *(Khuyên làm trước)* — Tải kho & chạy thử `-DryRun` để kiểm tra máy của bạn
+Mở PowerShell và chạy (chế độ `-DryRun` không sửa bất kỳ file nào):
 ```powershell
+git clone https://github.com/h01n9N90c/codex-cli-desktop-.git
+cd codex-cli-desktop-
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 `
     -RepoPath "C:\Projects\my-app" `
     -DryRun
@@ -142,8 +146,12 @@ Sau khi toàn bộ mục báo `[PASS]`:
 
 ## Người dùng macOS / Linux / WSL
 ```bash
-chmod +x ./scripts/setup-dual-lane.sh
-./scripts/setup-dual-lane.sh /path/to/your-project
+git clone https://github.com/h01n9N90c/codex-cli-desktop-.git
+cd codex-cli-desktop-
+chmod +x ./scripts/setup-dual-lane.sh ./scripts/doctor.sh
+./scripts/setup-dual-lane.sh --repo /path/to/your-project --dry-run
+./scripts/setup-dual-lane.sh --repo /path/to/your-project --install-bridge
+./scripts/doctor.sh
 codex login
 codex
 ```

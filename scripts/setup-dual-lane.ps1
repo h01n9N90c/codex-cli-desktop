@@ -45,6 +45,7 @@ param(
     [string]$GatewayApiKey = '',
     [switch]$SyncSessions,
     [switch]$InstallBridgeTemplate,
+    [switch]$SkipPathUpdate,
     [switch]$DryRun
 )
 
@@ -84,7 +85,12 @@ function Resolve-CodexExecutable([string]$ExplicitPath, [string]$ExcludedDir) {
     }
 
     # 2. Microsoft Store / MSIX OpenAI.Codex Desktop package
-    $appx = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $appx = $null
+    try {
+        $appx = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue | Select-Object -First 1
+    } catch {
+        $appx = $null
+    }
     if ($appx -and $appx.InstallLocation) {
         $msixExe = Join-Path $appx.InstallLocation 'app\resources\codex.exe'
         if (Test-Path -LiteralPath $msixExe) {
@@ -92,17 +98,33 @@ function Resolve-CodexExecutable([string]$ExplicitPath, [string]$ExcludedDir) {
         }
     }
 
-    # 3. Existing codex binary in PATH (strictly excluding our own ~/.local/bin wrapper to avoid recursion)
+    # 3. Existing codex binary in PATH (strictly excluding our own ~/.local/bin wrapper and non-cmd .ps1 shims)
     $excludedNorm = $ExcludedDir.TrimEnd('\').ToLowerInvariant()
     $cmdCandidates = Get-Command codex -All -ErrorAction SilentlyContinue
+    $exeMatch = $null
+    $batchMatch = $null
     foreach ($cmd in $cmdCandidates) {
         if (-not $cmd.Source) { continue }
-        $parent = (Split-Path -Parent $cmd.Source).TrimEnd('\').ToLowerInvariant()
+        $src = $cmd.Source
+        $parent = (Split-Path -Parent $src).TrimEnd('\').ToLowerInvariant()
         if ($parent -eq $excludedNorm) { continue }
-        if (Test-Path -LiteralPath $cmd.Source) {
-            return [PSCustomObject]@{ Path = $cmd.Source; Source = 'PATH' }
+        $ext = [System.IO.Path]::GetExtension($src).ToLowerInvariant()
+        # On Windows, npm creates codex.ps1 alongside codex.cmd; cmd.exe wrappers cannot execute .ps1 directly
+        if ($ext -eq '.ps1' -or $ext -eq '') {
+            $siblingExe = Join-Path (Split-Path -Parent $src) 'codex.exe'
+            $siblingCmd = Join-Path (Split-Path -Parent $src) 'codex.cmd'
+            if ((Test-Path -LiteralPath $siblingExe) -and -not $exeMatch) { $exeMatch = $siblingExe }
+            elseif ((Test-Path -LiteralPath $siblingCmd) -and -not $batchMatch) { $batchMatch = $siblingCmd }
+            continue
+        }
+        if ($ext -eq '.exe' -and (Test-Path -LiteralPath $src) -and -not $exeMatch) {
+            $exeMatch = $src
+        } elseif (($ext -eq '.cmd' -or $ext -eq '.bat') -and (Test-Path -LiteralPath $src) -and -not $batchMatch) {
+            $batchMatch = $src
         }
     }
+    if ($exeMatch) { return [PSCustomObject]@{ Path = $exeMatch; Source = 'PATH' } }
+    if ($batchMatch) { return [PSCustomObject]@{ Path = $batchMatch; Source = 'PATH' } }
 
     # 4. Common standalone / npm global locations
     $fallbacks = @(
@@ -190,7 +212,8 @@ Write-Host "    Version : $codexVersion"
 # 2. Check NTFS & free disk space on user home and Cargo target drives
 Write-Step 'Checking filesystem compatibility (NTFS) and free disk space...'
 $homeDrive = ([System.IO.Path]::GetPathRoot($Lane2Home)).TrimEnd(':\')
-$homeVol = Get-Volume -DriveLetter $homeDrive -ErrorAction SilentlyContinue
+$homeVol = $null
+try { $homeVol = Get-Volume -DriveLetter $homeDrive -ErrorAction SilentlyContinue } catch { $homeVol = $null }
 if ($homeVol -and $homeVol.FileSystem -ne 'NTFS') {
     throw "Drive ${homeDrive}: uses $($homeVol.FileSystem). NTFS is required for Directory Junctions. Pass -Lane2Home on an NTFS drive."
 }
@@ -199,7 +222,8 @@ $homeFreeGB = if ($homeVol) { [math]::Round($homeVol.SizeRemaining / 1GB, 2) } e
 Write-Host ("    Home drive {0}: FileSystem={1}, Free={2} GB" -f $homeDrive, $homeFs, $homeFreeGB)
 
 $targetDrive = ([System.IO.Path]::GetPathRoot($CargoTargetDir)).TrimEnd(':\')
-$targetVol = Get-Volume -DriveLetter $targetDrive -ErrorAction SilentlyContinue
+$targetVol = $null
+try { $targetVol = Get-Volume -DriveLetter $targetDrive -ErrorAction SilentlyContinue } catch { $targetVol = $null }
 if ($targetVol) {
     $freeGB = [math]::Round($targetVol.SizeRemaining / 1GB, 2)
     Write-Host ("    Build drive {0}: Free={1} GB (CARGO_TARGET_DIR={2})" -f $targetDrive, $freeGB, $CargoTargetDir)
@@ -420,7 +444,7 @@ $invokePrefix  = if ($isBatchTarget) { 'call ' } else { '' }
 $windowsAppsRefresh = if ($CodexSource -eq 'WindowsApps') {
 @"
 if not exist "%CODEX_EXE%" (
-    for /f "usebackq delims=" %%I in (``powershell -NoProfile -Command "(Get-AppxPackage OpenAI.Codex).InstallLocation"``) do (
+    for /f "usebackq delims=" %%I in (``powershell -NoProfile -Command "(Get-AppxPackage OpenAI.Codex | Select-Object -First 1).InstallLocation"``) do (
         set "CODEX_EXE=%%I\app\resources\codex.exe"
     )
 )
@@ -439,6 +463,7 @@ set "CARGO_TARGET_DIR=$CargoTargetDir"
 set "CODEX_EXE=$CodexExe"
 $windowsAppsRefresh
 ${invokePrefix}"%CODEX_EXE%" %*
+exit /b %ERRORLEVEL%
 "@
 
 $t3Wrapper = @"
@@ -449,6 +474,7 @@ set "CODEX_ACTIVE_LANE=LANE_1"
 set "CODEX_EXE=$CodexExe"
 $windowsAppsRefresh
 ${invokePrefix}"%CODEX_EXE%" %*
+exit /b %ERRORLEVEL%
 "@
 
 if (-not $DryRun) {
@@ -459,20 +485,24 @@ if (-not $DryRun) {
 Write-Host "    Installed wrappers in: $LocalBin"
 
 # Prepend ~/.local/bin to User PATH so our wrappers take precedence over npm/global codex shims
-$userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
-$pathEntries = @()
-if ($userPath) {
-    $pathEntries = $userPath -split ';' | Where-Object { $_ -and $_.Trim() -ne '' }
-}
-$normLocalBin = $LocalBin.TrimEnd('\').ToLowerInvariant()
-$firstIsLocalBin = ($pathEntries.Count -gt 0) -and ($pathEntries[0].TrimEnd('\').ToLowerInvariant() -eq $normLocalBin)
-if (-not $firstIsLocalBin) {
-    $filtered = @($pathEntries | Where-Object { $_.TrimEnd('\').ToLowerInvariant() -ne $normLocalBin })
-    $newPath = (@($LocalBin) + $filtered) -join ';'
-    if (-not $DryRun) {
-        [System.Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+if (-not $SkipPathUpdate) {
+    $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    $pathEntries = @()
+    if ($userPath) {
+        $pathEntries = $userPath -split ';' | Where-Object { $_ -and $_.Trim() -ne '' }
     }
-    Write-Host "    Prepended $LocalBin to User PATH (highest priority). Open a new terminal window to pick up PATH changes." -ForegroundColor Yellow
+    $normLocalBin = $LocalBin.TrimEnd('\').ToLowerInvariant()
+    $firstIsLocalBin = ($pathEntries.Count -gt 0) -and ($pathEntries[0].TrimEnd('\').ToLowerInvariant() -eq $normLocalBin)
+    if (-not $firstIsLocalBin) {
+        $filtered = @($pathEntries | Where-Object { $_.TrimEnd('\').ToLowerInvariant() -ne $normLocalBin })
+        $newPath = (@($LocalBin) + $filtered) -join ';'
+        if (-not $DryRun) {
+            [System.Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+        }
+        Write-Host "    Prepended $LocalBin to User PATH (highest priority). Open a new terminal window to pick up PATH changes." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "    Skipped User PATH modification (-SkipPathUpdate)." -ForegroundColor DarkGray
 }
 
 # 11. Optional: copy DUAL_LANE_BRIDGE.md into target repository
@@ -494,14 +524,27 @@ if ($InstallBridgeTemplate) {
 # 12. Optional: sync session metadata & pinned threads
 if ($SyncSessions) {
     Write-Step 'Syncing session index, pinned threads, and goals via sync-sessions.py...'
-    $python = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $python) { $python = Get-Command python3 -ErrorAction SilentlyContinue }
-    if (-not $python) {
-        Write-Warning 'Python 3 was not found in PATH; skipping SQLite session sync.'
+    $pythonExe = $null
+    foreach ($cand in @('python', 'python3')) {
+        foreach ($cmd in (Get-Command $cand -All -ErrorAction SilentlyContinue)) {
+            if (-not $cmd.Source -or ($cmd.Source -like '*\WindowsApps\*')) { continue }
+            $prevPyPref = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $v = (& $cmd.Source --version 2>&1 | Select-Object -First 1)
+            } finally {
+                $ErrorActionPreference = $prevPyPref
+            }
+            if ($v -match '^Python 3\.') { $pythonExe = $cmd.Source; break }
+        }
+        if ($pythonExe) { break }
+    }
+    if (-not $pythonExe) {
+        Write-Warning 'Real Python 3 was not found in PATH (ignoring Microsoft Store stub); skipping SQLite session sync.'
     } else {
         $pyArgs = @((Join-Path $KitRoot 'scripts\sync-sessions.py'), '--lane1', $Lane1Home, '--lane2', $Lane2Home, '--repo', $RepoPath, '--approval-mode', $ApprovalPolicy)
         if ($DryRun) { $pyArgs += '--dry-run' }
-        & $python.Source @pyArgs
+        & $pythonExe @pyArgs
     }
 }
 
