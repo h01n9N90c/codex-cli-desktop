@@ -73,14 +73,35 @@ function Write-Utf8NoBom([string]$FilePath, [string]$Text) {
     [System.IO.File]::WriteAllText($FilePath, $Text, $utf8NoBom)
 }
 
+$script:SnapshotEntries = New-Object 'System.Collections.Generic.List[object]'
+$script:InstallStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+
+function Get-FileSha256([string]$FilePath) {
+    if (-not (Test-Path -LiteralPath $FilePath)) { return '' }
+    return (Get-FileHash -LiteralPath $FilePath -Algorithm SHA256).Hash
+}
+
 function Backup-IfExists([string]$FilePath) {
     if (Test-Path -LiteralPath $FilePath) {
-        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $backup = "$FilePath.backup-$stamp"
+        $origHash = Get-FileSha256 $FilePath
+        $backup = "$FilePath.backup-$($script:InstallStamp)"
         if (-not $DryRun) {
             Copy-Item -LiteralPath $FilePath -Destination $backup -Force
         }
-        Write-Host "    Backup saved: $backup" -ForegroundColor DarkGray
+        $script:SnapshotEntries.Add([PSCustomObject]@{
+            TargetPath   = $FilePath
+            ExistedPrior = $true
+            BackupPath   = $backup
+            OriginalSha256 = $origHash
+        })
+        Write-Host "    Backup saved: $backup (SHA256=$($origHash.Substring(0, 12))...)" -ForegroundColor DarkGray
+    } else {
+        $script:SnapshotEntries.Add([PSCustomObject]@{
+            TargetPath   = $FilePath
+            ExistedPrior = $false
+            BackupPath   = ''
+            OriginalSha256 = ''
+        })
     }
 }
 
@@ -725,6 +746,36 @@ if ($SyncSessions) {
 }
 
 if (-not $DryRun) {
+    # Save deterministic rollback manifest with SHA-256 hashes of all pre-existing files
+    $rollbackDir = Join-Path $Lane2Home '.rollback'
+    if (-not (Test-Path -LiteralPath $rollbackDir)) {
+        New-Item -ItemType Directory -Path $rollbackDir -Force | Out-Null
+    }
+    $manifestObj = [PSCustomObject]@{
+        SchemaVersion   = 1
+        Timestamp       = $script:InstallStamp
+        CreatedAtUtc    = (Get-Date).ToUniversalTime().ToString('o')
+        Lane1Home       = $Lane1Home
+        Lane2Home       = $Lane2Home
+        LocalBin        = $LocalBin
+        RepoPath        = $RepoPath
+        Lane2Worktree   = if ($UseGitWorktree) { $effectiveLane2Repo } else { '' }
+        GatewayApiKeyEnv = if ($ConfigureGateway) { $GatewayApiKeyEnv } else { '' }
+        SharedJunctions = $sharedDirs
+        Wrappers        = @(
+            (Join-Path $LocalBin 'codex.cmd'),
+            (Join-Path $LocalBin 'codex-official.cmd'),
+            (Join-Path $LocalBin 'codex-t3.cmd')
+        )
+        Files           = $script:SnapshotEntries.ToArray()
+    }
+    $manifestJson = $manifestObj | ConvertTo-Json -Depth 6
+    $snapPath = Join-Path $rollbackDir "snapshot-$($script:InstallStamp).json"
+    $latestPath = Join-Path $rollbackDir 'latest.json'
+    Write-Utf8NoBom -FilePath $snapPath -Text $manifestJson
+    Write-Utf8NoBom -FilePath $latestPath -Text $manifestJson
+    Write-Host "    Rollback manifest saved: $latestPath" -ForegroundColor DarkGray
+
     Write-Step 'Running post-install verification...'
     & (Join-Path $LocalBin 'codex.cmd') --version
 }

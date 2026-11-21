@@ -68,8 +68,10 @@ codex-dual-lane-kit/
 ├── .gitignore                    # Chặn không commit key / auth.json / config.toml
 ├── .github/workflows/ci.yml      # GitHub Actions CI tự động chạy test trên Windows & Linux
 ├── scripts/
-│   ├── setup-dual-lane.ps1       # Bộ cài đặt tự thích nghi cho Windows 10/11 (TOML merge, -DryRun)
+│   ├── setup-dual-lane.ps1       # Bộ cài đặt tự thích nghi cho Windows 10/11 (TOML merge, snapshot SHA-256)
 │   ├── setup-dual-lane.sh        # Bộ cài đặt tương đương cho macOS / Linux / WSL (hỗ trợ --dry-run)
+│   ├── restore-original.ps1      # Khôi phục chính xác 1 chạm cho Windows (kiểm chứng SHA-256, gỡ Junction an toàn)
+│   ├── restore-original.sh       # Khôi phục chính xác 1 chạm cho macOS / Linux / WSL
 │   ├── doctor.ps1                # Chẩn đoán hệ thống & test thực thi execpolicy cho Windows (read-only)
 │   ├── doctor.sh                 # Chẩn đoán hệ thống & test thực thi execpolicy cho macOS / Linux / WSL
 │   └── sync-sessions.py          # Đồng bộ UPSERT (INSERT + UPDATE) phiên, Pinned & Goals
@@ -171,7 +173,9 @@ codex
 | Mục đích | Lệnh |
 | :--- | :--- |
 | Chẩn đoán cấu hình máy & chạy probe thực thi `execpolicy` | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\doctor.ps1` |
-| Chạy toàn bộ Unit Test & Smoke Test của bộ kit | `powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1` |
+| Xem trước khôi phục chính xác về trạng thái gốc (`-DryRun`) | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1 -DryRun` |
+| Khôi phục chính xác 100% về trạng thái trước khi cài (kèm kiểm chứng SHA-256) | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1` |
+| Chạy toàn bộ Unit Test, Smoke Test & Rollback Test của bộ kit | `powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1` |
 | Chạy Codex CLI bằng **tài khoản OpenAI chính chủ (Luồng 2)** | `codex` *(hoặc `codex-official`)* |
 | Chạy Codex CLI bằng **cấu hình Desktop / Gateway (Luồng 1)** | `codex-t3` |
 | Đổi model ngay trong khung chat TUI | Gõ `/model` |

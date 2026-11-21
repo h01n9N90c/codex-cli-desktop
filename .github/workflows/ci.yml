@@ -32,12 +32,14 @@ jobs:
         run: |
           bash -n ./scripts/setup-dual-lane.sh
           bash -n ./scripts/doctor.sh
+          bash -n ./scripts/restore-original.sh
           python3 -m unittest discover -s ./tests -v
-      - name: Run Unix installer & doctor smoke test with mock codex binary
+      - name: Run Unix installer, doctor & deterministic rollback smoke test
         run: |
           TMP_ROOT="$(mktemp -d)"
           FAKE_BIN="${TMP_ROOT}/fake-bin"
-          mkdir -p "${FAKE_BIN}" "${TMP_ROOT}/lane2"
+          mkdir -p "${FAKE_BIN}" "${TMP_ROOT}/lane1/sessions" "${TMP_ROOT}/lane2"
+          echo '{"id":"s1"}' > "${TMP_ROOT}/lane1/sessions/keep.jsonl"
           cat > "${FAKE_BIN}/codex" <<'EOF'
           #!/usr/bin/env bash
           if [ "${1:-}" = "--version" ]; then echo "codex-cli 0.171.0-ci"; exit 0; fi
@@ -50,6 +52,7 @@ jobs:
           [mcp_servers.custom_ci]
           command = "node"
           EOF
+          ORIG_HASH="$(sha256sum "${TMP_ROOT}/lane2/config.toml" | awk '{print $1}')"
           PATH="${FAKE_BIN}:${PATH}" \
           CODEX_LANE1_HOME="${TMP_ROOT}/lane1" \
           CODEX_LANE2_HOME="${TMP_ROOT}/lane2" \
@@ -63,4 +66,11 @@ jobs:
           CODEX_LANE2_HOME="${TMP_ROOT}/lane2" \
           CODEX_LOCAL_BIN="${TMP_ROOT}/local-bin" \
           ./scripts/doctor.sh
+          CODEX_LANE1_HOME="${TMP_ROOT}/lane1" \
+          CODEX_LANE2_HOME="${TMP_ROOT}/lane2" \
+          CODEX_LOCAL_BIN="${TMP_ROOT}/local-bin" \
+          ./scripts/restore-original.sh
+          RESTORED_HASH="$(sha256sum "${TMP_ROOT}/lane2/config.toml" | awk '{print $1}')"
+          [ "${ORIG_HASH}" = "${RESTORED_HASH}" ]
+          [ -f "${TMP_ROOT}/lane1/sessions/keep.jsonl" ]
           rm -rf "${TMP_ROOT}"

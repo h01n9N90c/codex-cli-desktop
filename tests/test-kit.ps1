@@ -51,6 +51,13 @@ args = ["server.js"]
 theme = "dark"
 "@
     [System.IO.File]::WriteAllText((Join-Path $l2 'config.toml'), $seedLane2, (New-Object System.Text.UTF8Encoding($false)))
+    $origLane2Hash = (Get-FileHash -LiteralPath (Join-Path $l2 'config.toml') -Algorithm SHA256).Hash
+
+    # Seed a critical session file in Lane 1 to prove rollback NEVER loses Lane 1 data through Junctions
+    New-Item -ItemType Directory -Path (Join-Path $l1 'sessions') -Force | Out-Null
+    $criticalSessionFile = Join-Path $l1 'sessions\important-session.jsonl'
+    [System.IO.File]::WriteAllText($criticalSessionFile, '{"id":"s-1","text":"important history"}', (New-Object System.Text.UTF8Encoding($false)))
+    $origSessionHash = (Get-FileHash -LiteralPath $criticalSessionFile -Algorithm SHA256).Hash
 
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $KitRoot 'scripts\setup-dual-lane.ps1') `
         -RepoPath $tmpRoot -CodexPath $fakeExe -Lane1Home $l1 -Lane2Home $l2 -LocalBin $bin -CargoTargetDir $cargo `
@@ -75,7 +82,35 @@ theme = "dark"
         throw 'Generated config.toml contains a UTF-8 BOM!'
     }
 
-    Write-Host "[PASS] All TOML merge, default on-request policy, env_key secret isolation, and UTF-8 no-BOM assertions passed!" -ForegroundColor Green
+    # Verify rollback snapshot manifest was generated
+    $manifestPath = Join-Path $l2 '.rollback\latest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath)) {
+        throw 'Rollback snapshot manifest (.rollback\latest.json) was not created!'
+    }
+
+    Write-Host "`n=== 3. Running Deterministic SHA-256 Rollback & Recovery Test ===" -ForegroundColor Cyan
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $KitRoot 'scripts\restore-original.ps1') `
+        -Lane1Home $l1 -Lane2Home $l2 -LocalBin $bin -SkipPathUpdate
+
+    $restoredLane2Hash = (Get-FileHash -LiteralPath (Join-Path $l2 'config.toml') -Algorithm SHA256).Hash
+    if ($restoredLane2Hash -ne $origLane2Hash) {
+        throw "Rollback SHA-256 mismatch on Lane 2 config.toml! Expected $origLane2Hash, got $restoredLane2Hash"
+    }
+    if (Test-Path -LiteralPath (Join-Path $l2 'AGENTS.md')) {
+        throw 'Newly created Lane 2 AGENTS.md should have been removed by rollback!'
+    }
+    if (Test-Path -LiteralPath (Join-Path $bin 'codex.cmd')) {
+        throw 'Wrapper codex.cmd should have been removed by rollback!'
+    }
+    if (-not (Test-Path -LiteralPath $criticalSessionFile)) {
+        throw 'CRITICAL: Lane 1 session file was lost during rollback!'
+    }
+    $afterSessionHash = (Get-FileHash -LiteralPath $criticalSessionFile -Algorithm SHA256).Hash
+    if ($afterSessionHash -ne $origSessionHash) {
+        throw 'CRITICAL: Lane 1 session file hash changed during rollback!'
+    }
+
+    Write-Host "[PASS] All TOML merge, default on-request policy, env_key secret isolation, UTF-8 no-BOM, and deterministic SHA-256 rollback assertions passed!" -ForegroundColor Green
 } finally {
     foreach ($d in @('memories','memories_v2','sessions','archived_sessions','skills','plugins')) {
         $jp = Join-Path $l2 $d

@@ -20,8 +20,10 @@
 
 | Tệp | Ngôn ngữ / Runtime | Vai trò chính | Đường dẫn ĐỌC | Đường dẫn GHI |
 | :--- | :--- | :--- | :--- | :--- |
-| [`scripts/setup-dual-lane.ps1`](../scripts/setup-dual-lane.ps1) | PowerShell 5.1+ / 7+ (Windows) | Bộ cài đặt chính 1 chạm cho Windows (hỗ trợ `-DryRun`) | `Get-AppxPackage OpenAI.Codex`, `PATH`, `Get-Volume`, `codex features list`, `templates/*`, `config.toml` cũ | `~/.codex-official/config.toml`, `~/.codex*/rules/default.rules`, `~/.codex*/AGENTS.md`, 6 NTFS Junctions trong `~/.codex-official/`, 3 wrapper `.cmd` trong `~/.local/bin/`, User `PATH`, tùy chọn `~/.codex/config.toml` & `<repo>/artifacts/dual-lane/DUAL_LANE_BRIDGE.md` |
-| [`scripts/setup-dual-lane.sh`](../scripts/setup-dual-lane.sh) | Bash (`set -euo pipefail`, macOS / Linux / WSL) | Bộ cài đặt tương đương cho hệ Unix (hỗ trợ `--dry-run`, `--install-bridge`, `--sync-sessions`, `--allow-sandbox-network`) | `type -ap codex`, `codex features list`, `templates/*` | `~/.codex-official/config.toml`, 6 symlinks (`ln -s`), `rules/default.rules`, `AGENTS.md`, 3 wrapper shell trong `~/.local/bin/` |
+| [`scripts/setup-dual-lane.ps1`](../scripts/setup-dual-lane.ps1) | PowerShell 5.1+ / 7+ (Windows) | Bộ cài đặt chính 1 chạm cho Windows (hỗ trợ `-DryRun`, TOML merge không phá hủy, ghi snapshot SHA-256) | `Get-AppxPackage OpenAI.Codex`, `PATH`, `Get-Volume`, `codex features list`, `templates/*`, `config.toml` cũ | `~/.codex-official/config.toml`, `~/.codex*/rules/default.rules`, `~/.codex*/AGENTS.md`, `~/.codex-official/.rollback/latest.json`, 6 NTFS Junctions, 3 wrapper `.cmd` trong `~/.local/bin/` |
+| [`scripts/setup-dual-lane.sh`](../scripts/setup-dual-lane.sh) | Bash (`set -euo pipefail`, macOS / Linux / WSL) | Bộ cài đặt tương đương cho hệ Unix (hỗ trợ `--dry-run`, `--install-bridge`, `--sync-sessions`, `--use-git-worktree`) | `type -ap codex`, `codex features list`, `templates/*` | `~/.codex-official/config.toml`, 6 symlinks (`ln -s`), `rules/default.rules`, `AGENTS.md`, 3 wrapper shell trong `~/.local/bin/` |
+| [`scripts/restore-original.ps1`](../scripts/restore-original.ps1) | PowerShell 5.1+ / 7+ (Windows) | **Khôi phục chính xác 1 chạm** về trạng thái gốc dựa trên manifest `.rollback/latest.json` và kiểm chứng mã băm **SHA-256** (hỗ trợ `-DryRun`, `-RemoveLane2Home`) | `~/.codex-official/.rollback/latest.json`, các bản `.backup-*`, mã băm SHA-256 | Tháo an toàn 6 NTFS Junction, hoàn trả byte-exact từng file cấu hình cũ (hoặc xóa file mới sinh), gỡ 3 wrapper `.cmd` và làm sạch `PATH` |
+| [`scripts/restore-original.sh`](../scripts/restore-original.sh) | Bash (`set -euo pipefail`, macOS / Linux / WSL) | Công cụ khôi phục chính xác tương đương cho macOS / Linux / WSL (hỗ trợ `--dry-run`, `--remove-lane2-home`) | Các bản `.backup-*` và symlink trong `~/.codex-official` | Tháo an toàn 6 symlink, hoàn trả bản sao lưu mới nhất và gỡ 3 wrapper CLI |
 | [`scripts/doctor.ps1`](../scripts/doctor.ps1) | PowerShell 5.1+ / 7+ (Windows) | Kiểm tra sức khỏe, tương thích hệ thống, thứ tự ưu tiên `PATH` & trạng thái cách ly phân tích tĩnh (**Chỉ đọc — Read-Only**) | `OSVersion`, `Get-Volume`, `Get-Command codex/codex-t3/python`, thuộc tính Junction, `default.rules`/`AGENTS.md`/`config.toml`, `auth.json` *(chỉ đọc trường `auth_mode`, không in giá trị token/key)* | **Không ghi bất kỳ tệp nào** |
 | [`scripts/doctor.sh`](../scripts/doctor.sh) | Bash (macOS / Linux / WSL) | Phiên bản chẩn đoán hệ thống tương đương cho Unix (**Chỉ đọc — Read-Only**) | `uname`, `df`, `command -v codex/codex-t3/python3`, 6 symlinks, `default.rules`/`AGENTS.md`/`config.toml`, trường `auth_mode` trong `auth.json` | **Không ghi bất kỳ tệp nào** |
 | [`scripts/sync-sessions.py`](../scripts/sync-sessions.py) | Python 3.8+ (thư viện chuẩn `sqlite3`, `json`, `glob`, `re`, `pathlib`) | Đồng bộ tên phiên, mục đã ghim (`Pinned`) & `Goals` từ Luồng 1 (mở **chỉ-đọc `?mode=ro`**) sang Luồng 2 (hỗ trợ `--dry-run`) | `~/.codex/session_index.jsonl`, `~/.codex/state_*.sqlite` *(read-only URI)*, `~/.codex/goals_*.sqlite` *(read-only URI)*, `PRAGMA table_info(...)` | `~/.codex-official/session_index.jsonl`, `~/.codex-official/state_*.sqlite`, `~/.codex-official/goals_*.sqlite` *(kèm `PRAGMA wal_checkpoint(TRUNCATE)`)* |
@@ -179,7 +181,26 @@
 
 ---
 
-## 5. Hướng dẫn Gỡ cài đặt / Hoàn tác an toàn 100%
+## 5. Cơ chế Khôi phục Chính xác 1 Chạm (Deterministic SHA-256 Rollback)
+
+Mỗi khi chạy `setup-dual-lane.ps1`, bộ cài tự động tính mã băm **SHA-256** của từng tệp cấu hình gốc trước khi sửa và ghi vào tệp trạng thái giao dịch `~/.codex-official/.rollback/latest.json` (kèm bản lịch sử `snapshot-yyyyMMdd-HHmmss.json`).
+
+Khi muốn quay về **chính xác 100% trạng thái ban đầu đến từng byte**, bạn không cần xóa thủ công mà chỉ cần gọi `scripts/restore-original.ps1`:
+
+```powershell
+# Bước 1 (Khuyên dùng): Xem trước kế hoạch khôi phục & kiểm tra khớp mã băm SHA-256 mà không sửa đĩa
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1 -DryRun
+
+# Bước 2: Thực thi khôi phục chính xác về trạng thái trước khi cài (giữ lại thư mục ~/.codex-official)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1
+
+# Hoặc: Khôi phục chính xác VÀ dọn sạch hoàn toàn thư mục ~/.codex-official (sau khi đã tháo an toàn 6 NTFS Junction)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1 -RemoveLane2Home
+```
+
+*(Trên macOS / Linux / WSL: chạy `./scripts/restore-original.sh --dry-run` rồi `./scripts/restore-original.sh --remove-lane2-home`).*
+
+### Quy trình gỡ thủ công (nếu bạn không còn giữ thư mục bộ kit)
 
 > [!CAUTION]
 > **Rất quan trọng khi gỡ trên Windows:** Các thư mục `memories`, `memories_v2`, `sessions`, `archived_sessions`, `skills`, `plugins` bên trong `~/.codex-official` là **NTFS Directory Junction** trỏ tới dữ liệu thật trong `~/.codex`.
