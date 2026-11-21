@@ -73,6 +73,19 @@ function Write-Utf8NoBom([string]$FilePath, [string]$Text) {
     [System.IO.File]::WriteAllText($FilePath, $Text, $utf8NoBom)
 }
 
+function Protect-SensitiveFileAcl([string]$FilePath) {
+    if ($DryRun -or -not (Test-Path -LiteralPath $FilePath)) { return }
+    # Remove inherited CodexSandboxUsers read access so sandboxed agent subshells are blocked at the Windows NT Kernel ACL layer
+    $prevPref = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & icacls.exe $FilePath /inheritance:d /remove:g "CodexSandboxUsers" >$null 2>&1
+    } catch {
+    } finally {
+        $ErrorActionPreference = $prevPref
+    }
+}
+
 $script:SnapshotEntries = New-Object 'System.Collections.Generic.List[object]'
 $script:InstallStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
@@ -87,6 +100,7 @@ function Backup-IfExists([string]$FilePath) {
         $backup = "$FilePath.backup-$($script:InstallStamp)"
         if (-not $DryRun) {
             Copy-Item -LiteralPath $FilePath -Destination $backup -Force
+            Protect-SensitiveFileAcl $backup
         }
         $script:SnapshotEntries.Add([PSCustomObject]@{
             TargetPath   = $FilePath
@@ -774,7 +788,18 @@ if (-not $DryRun) {
     $latestPath = Join-Path $rollbackDir 'latest.json'
     Write-Utf8NoBom -FilePath $snapPath -Text $manifestJson
     Write-Utf8NoBom -FilePath $latestPath -Text $manifestJson
-    Write-Host "    Rollback manifest saved: $latestPath" -ForegroundColor DarkGray
+    foreach ($secFile in @(
+        (Join-Path $Lane1Home 'auth.json'),
+        (Join-Path $Lane1Home 'config.toml'),
+        (Join-Path $Lane1Home 'config.backup.toml'),
+        (Join-Path $Lane2Home 'auth.json'),
+        (Join-Path $Lane2Home 'config.toml'),
+        $snapPath,
+        $latestPath
+    )) {
+        Protect-SensitiveFileAcl $secFile
+    }
+    Write-Host "    Rollback manifest saved & NTFS sandbox ACLs locked: $latestPath" -ForegroundColor DarkGray
 
     Write-Step 'Running post-install verification...'
     & (Join-Path $LocalBin 'codex.cmd') --version

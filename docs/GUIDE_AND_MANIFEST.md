@@ -99,7 +99,8 @@
 | `Write-Step` | `Message` | In tiêu đề từng bước cài đặt có màu sắc rõ ràng trên Console. |
 | `Escape-TomlBasicString` | `Value` | Escape ký tự `\` và `"` thành chuỗi TOML hợp lệ (an toàn với đường dẫn có dấu cách, tiếng Việt, ký tự `&`). |
 | `Write-Utf8NoBom` | `FilePath`, `Text` | Ghi tệp `config.toml` và `.cmd` theo chuẩn **UTF-8 không BOM** (tránh lỗi TOML parser trên Windows PowerShell 5.1 và giữ nguyên dấu tiếng Việt/Unicode trên tên người dùng Windows). |
-| `Backup-IfExists` | `FilePath` | Kiểm tra file đích; nếu đã tồn tại thì sao lưu sang `<FilePath>.backup-yyyyMMdd-HHmmss` trước khi ghi đè (tôn trọng `-DryRun`). |
+| `Protect-SensitiveFileAcl` | `FilePath` | Dùng `icacls.exe /inheritance:d /remove:g CodexSandboxUsers` để gỡ quyền đọc kế thừa của tài khoản sandbox khỏi `auth.json`, `config.toml` và các bản sao lưu — chặn tiến trình con trong sandbox đọc trộm token ở tầng nhân Windows NTFS ACL. |
+| `Backup-IfExists` | `FilePath` | Kiểm tra file đích; nếu đã tồn tại thì sao lưu sang `<FilePath>.backup-yyyyMMdd-HHmmss` kèm mã băm SHA-256 và khóa ACL trước khi ghi đè (tôn trọng `-DryRun`). |
 | `Resolve-CodexExecutable` | `ExplicitPath`, `ExcludedDir` | Tự dò đường dẫn thật của `codex.exe`/`codex.cmd` theo 4 nguồn: tham số `-CodexPath` $\rightarrow$ `WindowsApps` (`OpenAI.Codex`) $\rightarrow$ `PATH` *(loại trừ `~/.local/bin` tránh vòng lặp đệ quy)* $\rightarrow$ `%APPDATA%\npm` & `%LOCALAPPDATA%\Programs`. |
 | `Get-SupportedCodexFeatures` | `ExePath`, `ProbeHome` | Chạy thử `& $ExePath features list` trong một thư mục tạm `CODEX_HOME` riêng để lấy danh sách feature flags thật mà bản Codex trên máy hỗ trợ, rồi dọn sạch thư mục tạm. |
 | `Get-ExistingTrustedProjects` | `ConfigPaths[]` | Quét các `config.toml` cũ của cả Luồng 1 & Luồng 2 để giữ nguyên 100% danh sách `[projects.'...']` đã đánh dấu `trusted`. |

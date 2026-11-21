@@ -251,6 +251,10 @@ if [ "${DRY_RUN}" -eq 0 ]; then
       printf '\n# Preserved existing sections\n%s\n' "${PRESERVED_USER_SECTIONS}"
     fi
   } > "${CFG2}"
+  chmod 600 "${CFG2}" 2>/dev/null || true
+  for sec_f in "${LANE1_HOME}/auth.json" "${LANE1_HOME}/config.toml" "${LANE2_HOME}/auth.json"; do
+    [ -f "${sec_f}" ] && chmod 600 "${sec_f}" 2>/dev/null || true
+  done
 fi
 echo "    Wrote: ${CFG2} (approval_policy=${APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK})"
 

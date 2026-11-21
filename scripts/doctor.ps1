@@ -164,15 +164,23 @@ foreach ($pair in @(@('Lane 1', $Lane1Home), @('Lane 2', $Lane2Home))) {
     }
 }
 
-# 6. Auth isolation check (no secret values printed!)
+# 6. Auth & Kernel ACL isolation check (no secret values printed!)
 $a1 = Join-Path $Lane1Home 'auth.json'
 $a2 = Join-Path $Lane2Home 'auth.json'
 $m1 = if (Test-Path -LiteralPath $a1) { try { (Get-Content -LiteralPath $a1 -Raw | ConvertFrom-Json).auth_mode } catch { 'unreadable' } } else { 'not-configured' }
 $m2 = if (Test-Path -LiteralPath $a2) { try { (Get-Content -LiteralPath $a2 -Raw | ConvertFrom-Json).auth_mode } catch { 'unreadable' } } else { 'not-logged-in' }
-if ($m2 -ne 'not-logged-in') {
-    Report 'PASS' 'Auth Isolation' "Lane 1=$m1 | Lane 2=$m2 (isolated auth.json files)"
+$sandboxAclLeaks = 0
+foreach ($sf in @($a1, (Join-Path $Lane1Home 'config.toml'), $a2, (Join-Path $Lane2Home 'config.toml'))) {
+    if (Test-Path -LiteralPath $sf) {
+        $sRules = @((Get-Acl -LiteralPath $sf).Access | Where-Object { $_.IdentityReference -like '*CodexSandboxUsers*' })
+        $sandboxAclLeaks += $sRules.Count
+    }
+}
+$aclLabel = if ($sandboxAclLeaks -eq 0) { 'kernel_acl=locked' } else { "kernel_acl=exposed($sandboxAclLeaks)" }
+if ($m2 -ne 'not-logged-in' -and $sandboxAclLeaks -eq 0) {
+    Report 'PASS' 'Auth & ACL Isolation' "Lane 1=$m1 | Lane 2=$m2 | $aclLabel"
 } else {
-    Report 'WARN' 'Auth Isolation' "Lane 1=$m1 | Lane 2=$m2 (run 'codex login' for Lane 2)"
+    Report 'WARN' 'Auth & ACL Isolation' "Lane 1=$m1 | Lane 2=$m2 | $aclLabel"
 }
 
 # 7. Python 3 availability (optional, for sync-sessions.py; ignore Microsoft Store stub)

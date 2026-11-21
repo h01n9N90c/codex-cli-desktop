@@ -45,6 +45,19 @@ function Get-FileSha256([string]$FilePath) {
     return (Get-FileHash -LiteralPath $FilePath -Algorithm SHA256).Hash
 }
 
+function Test-PathInsideAllowedRoots([string]$CandidatePath, [string[]]$AllowedRoots) {
+    if (-not $CandidatePath) { return $false }
+    $full = [System.IO.Path]::GetFullPath($CandidatePath).TrimEnd('\').ToLowerInvariant()
+    foreach ($root in $AllowedRoots) {
+        if (-not $root) { continue }
+        $rFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\').ToLowerInvariant()
+        if ($full -eq $rFull -or $full.StartsWith("$rFull\")) {
+            return $true
+        }
+    }
+    return $false
+}
+
 Write-Host "=== Codex Dual-Lane Deterministic Rollback & Recovery ===" -ForegroundColor Green
 if ($DryRun) { Write-Host "[DRY-RUN MODE] Verifying snapshot and previewing rollback without modifying disk." -ForegroundColor Yellow }
 
@@ -99,11 +112,18 @@ foreach ($name in @('sessions', 'memories')) {
 
 # 2. Restore backed-up files with SHA-256 verification (or remove newly created files)
 Write-Step 'Step 2: Restoring files & verifying SHA-256 integrity...'
+$allowedRestoreRoots = @($Lane1Home, $Lane2Home, $LocalBin)
 if ($manifest -and $manifest.Files) {
     foreach ($entry in $manifest.Files) {
         $target = [string]$entry.TargetPath
+        if (-not (Test-PathInsideAllowedRoots -CandidatePath $target -AllowedRoots $allowedRestoreRoots)) {
+            throw "Security violation: Snapshot target path '$target' is outside allowed Codex directories!"
+        }
         if ([bool]$entry.ExistedPrior) {
             $bkp = [string]$entry.BackupPath
+            if (-not (Test-PathInsideAllowedRoots -CandidatePath $bkp -AllowedRoots $allowedRestoreRoots)) {
+                throw "Security violation: Snapshot backup path '$bkp' is outside allowed Codex directories!"
+            }
             if (-not (Test-Path -LiteralPath $bkp)) {
                 Write-Warning "Backup file missing: $bkp (cannot restore $target)"
                 continue
