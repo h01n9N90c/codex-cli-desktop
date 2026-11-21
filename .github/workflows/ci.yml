@@ -349,6 +349,28 @@ jobs:
             echo "[FAIL] Unix wrapper failed to block --cd= targeting primary subdir!" >&2; exit 1
           fi
 
+          # Regression: CODEX_NO_AUTO_WORKTREE_CD=1 leaves cwd in primary repo but argument check still blocks -C.
+          NO_AUTO_CWD="$(cd "${REPO_DIR}/src/sub dir" && CODEX_NO_AUTO_WORKTREE_CD=1 "${LOCAL_BIN}/codex" pwd-check)"
+          case "${NO_AUTO_CWD}" in
+            */my\ repo/src/sub\ dir) ;;
+            *) echo "[FAIL] Expected primary repo subdir with CODEX_NO_AUTO_WORKTREE_CD=1, got ${NO_AUTO_CWD}" >&2; exit 1 ;;
+          esac
+          if CODEX_NO_AUTO_WORKTREE_CD=1 "${LOCAL_BIN}/codex" -C "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
+            echo "[FAIL] CODEX_NO_AUTO_WORKTREE_CD=1 must NOT bypass -C argument block!" >&2; exit 1
+          fi
+
+          # Regression: Missing/deleted worktree directory leaves cwd in primary repo but argument check still blocks -C.
+          mv "${REPO_DIR}-lane2" "${REPO_DIR}-lane2-bak"
+          MISSING_WT_CWD="$(cd "${REPO_DIR}/src/sub dir" && "${LOCAL_BIN}/codex" pwd-check)"
+          case "${MISSING_WT_CWD}" in
+            */my\ repo/src/sub\ dir) ;;
+            *) echo "[FAIL] Expected primary repo subdir with deleted worktree, got ${MISSING_WT_CWD}" >&2; exit 1 ;;
+          esac
+          if "${LOCAL_BIN}/codex" -C "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
+            echo "[FAIL] Missing worktree directory must NOT bypass -C argument block!" >&2; exit 1
+          fi
+          mv "${REPO_DIR}-lane2-bak" "${REPO_DIR}-lane2"
+
           # 3) doctor.sh passes and never echoes auth secret canary.
           DOC_OUT="$(
             PATH="${LOCAL_BIN}:${FAKE_BIN}:${PATH}" \

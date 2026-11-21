@@ -1643,8 +1643,11 @@ $worktreeCdBlock = if ($UseGitWorktree -and ($effectiveLane2Repo -ne $RepoPath))
 @"
 set "CODEX_PRIMARY_REPO=$cmdRepoPath"
 set "CODEX_LANE2_WORKTREE=$cmdLane2Repo"
-if defined CODEX_NO_AUTO_WORKTREE_CD goto :_dl_wt_done
-if not exist "%CODEX_LANE2_WORKTREE%\" goto :_dl_wt_done
+
+rem === Guard 1: Auto worktree cwd switch ===
+rem (Disabled when CODEX_NO_AUTO_WORKTREE_CD is defined, or if the worktree directory is missing)
+if defined CODEX_NO_AUTO_WORKTREE_CD goto :_dl_wt_scan_args
+if not exist "%CODEX_LANE2_WORKTREE%\" goto :_dl_wt_scan_args
 set "_DL_CUR=%CD%"
 if "%_DL_CUR:~-1%"=="\" if not "%_DL_CUR:~-2%"==":\" set "_DL_CUR=%_DL_CUR:~0,-1%"
 set "_DL_REL="
@@ -1667,6 +1670,9 @@ cd /d "%CODEX_LANE2_WORKTREE%\%_DL_REL%"
 goto :_dl_wt_scan_args
 :_dl_wt_root
 cd /d "%CODEX_LANE2_WORKTREE%"
+
+rem === Guard 2: Argument scan & primary repo blocking ===
+rem (ALWAYS executes, even if CODEX_NO_AUTO_WORKTREE_CD is set or worktree is deleted)
 :_dl_wt_scan_args
 if "%~1"=="" goto :_dl_wt_done
 set "_DL_A=%~1"

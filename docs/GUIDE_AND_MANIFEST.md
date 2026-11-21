@@ -188,6 +188,7 @@
 | `--pinned-only` | tắt | Đi cùng `--sync-sessions`, chỉ đồng bộ các phiên đã ghim |
 | `--dry-run` | tắt | Xem trước mọi bước mà không ghi tệp nào lên đĩa |
 | `CODEX_LANE1_HOME`, `CODEX_LANE2_HOME`, `CODEX_LOCAL_BIN`, `CODEX_CARGO_TARGET_DIR`, `CODEX_LANE2_BRANCH` | `~/.codex`, `~/.codex-official`, `~/.local/bin`, `${TMPDIR:-/tmp}/codex-lane2-target`, `dual-lane-2` | Biến môi trường ghi đè đường dẫn mặc định và tên nhánh worktree trên Unix |
+| `CODEX_NO_AUTO_WORKTREE_CD` | *(trống)* | Đặt `=1` để tắt tự động đổi `cwd` vào worktree của wrapper Luồng 2 (cơ chế quét & chặn cờ `-C`/`--cd`/`--add-dir` bảo vệ repo chính vẫn luôn hoạt động fail-closed) |
 
 ### 4.5. `scripts/restore-original.sh` & `scripts/doctor.sh` (macOS / Linux / WSL)
 

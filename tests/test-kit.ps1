@@ -524,14 +524,23 @@ theme = "light"
         Push-Location $wtSub
         try {
             $outSub = (& (Join-Path $wtBin 'codex.cmd') 'run' 2>&1) -join "`n"
-            Assert-True ($LASTEXITCODE -eq 0 -and $outSub.Contains("WT_ACTIVE_CWD=`"$expectedWtSub`"")) "Lane 2 wrapper failed to map subdirectory into worktree! Got: $outSub"
+            $subExit = $LASTEXITCODE
+            Assert-True ($subExit -eq 0) "Lane 2 wrapper returned non-zero exit code ($subExit) running from worktree subdirectory.`nOutput:`n$outSub"
+            Assert-True ($outSub.Contains("WT_ACTIVE_CWD=`"$expectedWtSub`"")) "Lane 2 wrapper active cwd mismatch!`n  Expected: WT_ACTIVE_CWD=`"$expectedWtSub`"`n  Actual output:`n$outSub"
+
             $outT3 = (& (Join-Path $wtBin 'codex-t3.cmd') 'run' 2>&1) -join "`n"
-            Assert-True ($LASTEXITCODE -eq 0 -and $outT3.Contains("WT_ACTIVE_CWD=`"$wtSub`"")) "Lane 1 wrapper should remain in primary repo subdir! Got: $outT3"
+            $t3Exit = $LASTEXITCODE
+            Assert-True ($t3Exit -eq 0) "Lane 1 wrapper returned non-zero exit code ($t3Exit) in primary repo subdir.`nOutput:`n$outT3"
+            Assert-True ($outT3.Contains("WT_ACTIVE_CWD=`"$wtSub`"")) "Lane 1 wrapper active cwd mismatch!`n  Expected: WT_ACTIVE_CWD=`"$wtSub`"`n  Actual output:`n$outT3"
         } finally { Pop-Location }
+
         Push-Location $wtSib
         try {
             $outSib = (& (Join-Path $wtBin 'codex.cmd') 'run' 2>&1) -join "`n"
-            Assert-True ($LASTEXITCODE -eq 0 -and $outSib.Contains("WT_ACTIVE_CWD=`"$wtSib`"")) "Lane 2 wrapper falsely matched sibling directory! Got: $outSib"
+            $sibExit = $LASTEXITCODE
+            Assert-True ($sibExit -eq 0) "Lane 2 wrapper returned non-zero exit code ($sibExit) running from sibling directory.`nOutput:`n$outSib"
+            Assert-True ($outSib.Contains("WT_ACTIVE_CWD=`"$wtSib`"")) "Lane 2 wrapper falsely matched sibling directory!`n  Expected: WT_ACTIVE_CWD=`"$wtSib`"`n  Actual output:`n$outSib"
+
             # Block tests: codex.cmd must EXIT 1 when given -C/--cd/--add-dir targeting the primary repo.
             # We temporarily set ErrorActionPreference = 'Continue' so PowerShell does NOT throw
             # NativeCommandError on the non-zero exit code before we can inspect $LASTEXITCODE.
@@ -547,10 +556,61 @@ theme = "light"
             } finally {
                 $ErrorActionPreference = $prevEapBlk
             }
-            Assert-True ($blk1Exit -ne 0) "Lane 2 wrapper MUST reject '-C <PrimaryRepo>' (exit=$blk1Exit)`n$outBlk1"
-            Assert-True ($blk2Exit -ne 0) "Lane 2 wrapper MUST reject '--cd=<PrimaryRepoSub>' (exit=$blk2Exit)`n$outBlk2"
-            Assert-True ($blk3Exit -ne 0) "Lane 2 wrapper MUST reject '--add-dir <PrimaryRepo>' (exit=$blk3Exit)`n$outBlk3"
+            Assert-True ($blk1Exit -ne 0) "Lane 2 wrapper MUST reject '-C <PrimaryRepo>' (expected non-zero exit code, got exit=$blk1Exit)`n$outBlk1"
+            Assert-True ($blk2Exit -ne 0) "Lane 2 wrapper MUST reject '--cd=<PrimaryRepoSub>' (expected non-zero exit code, got exit=$blk2Exit)`n$outBlk2"
+            Assert-True ($blk3Exit -ne 0) "Lane 2 wrapper MUST reject '--add-dir <PrimaryRepo>' (expected non-zero exit code, got exit=$blk3Exit)`n$outBlk3"
         } finally { Pop-Location }
+
+        # Regression Test: CODEX_NO_AUTO_WORKTREE_CD=1 disables cwd auto-redirection,
+        # but argument guard MUST still block -C targeting the primary repo fail-closed!
+        Push-Location $wtSub
+        try {
+            $env:CODEX_NO_AUTO_WORKTREE_CD = '1'
+            try {
+                $outNoAuto = (& (Join-Path $wtBin 'codex.cmd') 'run' 2>&1) -join "`n"
+                $noAutoExit = $LASTEXITCODE
+                Assert-True ($noAutoExit -eq 0) "Lane 2 wrapper returned non-zero exit code ($noAutoExit) with CODEX_NO_AUTO_WORKTREE_CD=1.`nOutput:`n$outNoAuto"
+                Assert-True ($outNoAuto.Contains("WT_ACTIVE_CWD=`"$wtSub`"")) "CODEX_NO_AUTO_WORKTREE_CD=1 should NOT change cwd into worktree!`n  Expected: WT_ACTIVE_CWD=`"$wtSub`"`n  Actual output:`n$outNoAuto"
+
+                $prevEap = $ErrorActionPreference
+                try {
+                    $ErrorActionPreference = 'Continue'
+                    $outNoAutoBlk = (& (Join-Path $wtBin 'codex.cmd') '-C' $wtRepo 'status' 2>&1) -join "`n"
+                    $noAutoBlkExit = $LASTEXITCODE
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+                Assert-True ($noAutoBlkExit -ne 0) "CODEX_NO_AUTO_WORKTREE_CD=1 MUST NOT bypass -C primary repo guard! (expected non-zero exit, got $noAutoBlkExit)`n$outNoAutoBlk"
+            } finally {
+                Remove-Item Env:CODEX_NO_AUTO_WORKTREE_CD -ErrorAction SilentlyContinue
+            }
+        } finally { Pop-Location }
+
+        # Regression Test: Missing/deleted worktree directory leaves cwd untouched,
+        # does not crash, and argument guard MUST still block -C targeting primary repo!
+        $wtBakDir = "$expectedWtRoot-temp-deleted"
+        Rename-Item -LiteralPath $expectedWtRoot -NewName (Split-Path $wtBakDir -Leaf)
+        try {
+            Push-Location $wtSub
+            try {
+                $outMissing = (& (Join-Path $wtBin 'codex.cmd') 'run' 2>&1) -join "`n"
+                $missingExit = $LASTEXITCODE
+                Assert-True ($missingExit -eq 0) "Lane 2 wrapper returned non-zero exit code ($missingExit) when worktree dir is missing.`nOutput:`n$outMissing"
+                Assert-True ($outMissing.Contains("WT_ACTIVE_CWD=`"$wtSub`"")) "Missing worktree dir should NOT change cwd!`n  Expected: WT_ACTIVE_CWD=`"$wtSub`"`n  Actual output:`n$outMissing"
+
+                $prevEap = $ErrorActionPreference
+                try {
+                    $ErrorActionPreference = 'Continue'
+                    $outMissingBlk = (& (Join-Path $wtBin 'codex.cmd') '-C' $wtRepo 'status' 2>&1) -join "`n"
+                    $missingBlkExit = $LASTEXITCODE
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+                Assert-True ($missingBlkExit -ne 0) "Missing worktree directory MUST NOT bypass -C primary repo guard! (expected non-zero exit, got $missingBlkExit)`n$outMissingBlk"
+            } finally { Pop-Location }
+        } finally {
+            Rename-Item -LiteralPath $wtBakDir -NewName (Split-Path $expectedWtRoot -Leaf)
+        }
     } finally {
         foreach ($d in @('memories','memories_v2','sessions','archived_sessions','skills','plugins')) {
             $jp = Join-Path $wtL2 $d
