@@ -97,8 +97,8 @@ codex-dual-lane-kit/
 ### Bước 0 *(Khuyên làm trước)* — Tải kho & chạy thử `-DryRun` để kiểm tra máy của bạn
 Mở PowerShell và chạy (chế độ `-DryRun` không sửa bất kỳ file nào):
 ```powershell
-git clone https://github.com/h01n9N90c/codex-cli-desktop-.git codex-dual-lane-kit
-cd codex-dual-lane-kit
+git clone https://github.com/h01n9N90c/codex-cli-desktop.git
+cd codex-cli-desktop
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 `
     -RepoPath "C:\Projects\my-app" `
     -DryRun
@@ -156,8 +156,8 @@ Sau khi toàn bộ mục báo `[PASS]`:
 
 ## Người dùng macOS / Linux / WSL
 ```bash
-git clone https://github.com/h01n9N90c/codex-cli-desktop-.git codex-dual-lane-kit
-cd codex-dual-lane-kit
+git clone https://github.com/h01n9N90c/codex-cli-desktop.git
+cd codex-cli-desktop
 chmod +x ./scripts/setup-dual-lane.sh ./scripts/doctor.sh
 ./scripts/setup-dual-lane.sh --repo /path/to/your-project --dry-run
 ./scripts/setup-dual-lane.sh --repo /path/to/your-project --install-bridge

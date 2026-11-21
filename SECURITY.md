@@ -2,7 +2,7 @@
 
 ## Security Posture of This Repository
 
-**Codex Dual-Lane & Security Kit** (`codex-cli-desktop-`) is a local configuration and guardrail toolkit licensed under **Apache License 2.0** (`Copyright 2026 Lê Hoàng Ngọc Tươi`).
+**Codex Dual-Lane & Security Kit** (`codex-cli-desktop`) is a local configuration and guardrail toolkit licensed under **Apache License 2.0** (`Copyright 2026 Lê Hoàng Ngọc Tươi`).
 
 * **Zero telemetry / zero remote code execution:** All scripts run 100% locally and never download binaries or send data to external servers.
 * **Zero secrets committed:** No API keys, OAuth tokens, or personal host configurations are stored in this repository.
@@ -19,5 +19,5 @@ See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for full details and honest
 If you discover a security bug or bypass in any script or template in this repository:
 
 1. **Do not** disclose exploit details or secrets in public issues.
-2. Report privately via GitHub **Security Advisories** (Report a vulnerability) on `https://github.com/h01n9N90c/codex-cli-desktop-`.
+2. Report privately via GitHub **Security Advisories** (Report a vulnerability) on `https://github.com/h01n9N90c/codex-cli-desktop`.
 3. Include affected file(s), OS/shell version, reproduction steps, and suggested remediation.
