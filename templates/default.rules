@@ -1,0 +1,57 @@
+# Codex Execpolicy Command Firewall (Starlark rules)
+# Author    : Lê Hoàng Ngọc Tươi
+# Copyright : Copyright 2026 Lê Hoàng Ngọc Tươi
+# License   : Apache-2.0 (https://www.apache.org/licenses/LICENSE-2.0)
+# Place at: %USERPROFILE%\.codex\rules\default.rules
+#      and: %USERPROFILE%\.codex-official\rules\default.rules
+
+# Hard-block Windows system tampering, persistence, and ransomware-like commands
+prefix_rule(pattern=["vssadmin"], decision="forbidden")
+prefix_rule(pattern=["bcdedit"], decision="forbidden")
+prefix_rule(pattern=["wbadmin"], decision="forbidden")
+prefix_rule(pattern=["diskpart"], decision="forbidden")
+prefix_rule(pattern=["format"], decision="forbidden")
+prefix_rule(pattern=["schtasks"], decision="forbidden")
+prefix_rule(pattern=["sc"], decision="forbidden")
+prefix_rule(pattern=["sc.exe"], decision="forbidden")
+prefix_rule(pattern=["reg", "add"], decision="forbidden")
+prefix_rule(pattern=["reg", "delete"], decision="forbidden")
+prefix_rule(pattern=["reg", "import"], decision="forbidden")
+
+# Hard-block force-pushing Git history
+prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "-f"], decision="forbidden")
+
+# Static-analysis-only isolation: hard-block executing samples, DLLs, scripts, and Windows LOLBins
+prefix_rule(pattern=["php"], decision="forbidden")
+prefix_rule(pattern=["php.exe"], decision="forbidden")
+prefix_rule(pattern=["ruby"], decision="forbidden")
+prefix_rule(pattern=["ruby.exe"], decision="forbidden")
+prefix_rule(pattern=["perl"], decision="forbidden")
+prefix_rule(pattern=["perl.exe"], decision="forbidden")
+prefix_rule(pattern=["cscript"], decision="forbidden")
+prefix_rule(pattern=["cscript.exe"], decision="forbidden")
+prefix_rule(pattern=["wscript"], decision="forbidden")
+prefix_rule(pattern=["wscript.exe"], decision="forbidden")
+prefix_rule(pattern=["mshta"], decision="forbidden")
+prefix_rule(pattern=["mshta.exe"], decision="forbidden")
+prefix_rule(pattern=["rundll32"], decision="forbidden")
+prefix_rule(pattern=["rundll32.exe"], decision="forbidden")
+prefix_rule(pattern=["regsvr32"], decision="forbidden")
+prefix_rule(pattern=["regsvr32.exe"], decision="forbidden")
+prefix_rule(pattern=["certutil"], decision="forbidden")
+prefix_rule(pattern=["certutil.exe"], decision="forbidden")
+prefix_rule(pattern=["bitsadmin"], decision="forbidden")
+prefix_rule(pattern=["bitsadmin.exe"], decision="forbidden")
+prefix_rule(pattern=["msiexec"], decision="forbidden")
+prefix_rule(pattern=["msiexec.exe"], decision="forbidden")
+prefix_rule(pattern=["wmic"], decision="forbidden")
+prefix_rule(pattern=["wmic.exe"], decision="forbidden")
+prefix_rule(pattern=["Start-Process"], decision="forbidden")
+prefix_rule(pattern=["Invoke-Expression"], decision="forbidden")
+prefix_rule(pattern=["iex"], decision="forbidden")
+
+# Require explicit human approval before pushing or discarding local changes
+prefix_rule(pattern=["git", "push"], decision="prompt")
+prefix_rule(pattern=["git", "reset", "--hard"], decision="prompt")
+prefix_rule(pattern=["git", "clean"], decision="prompt")

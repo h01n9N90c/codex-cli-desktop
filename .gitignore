@@ -1,0 +1,15 @@
+# Never commit real secrets, keys, or personal Codex configs
+.env
+.env.*
+config.toml
+config.backup.toml
+auth.json
+*.key
+*.pem
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
