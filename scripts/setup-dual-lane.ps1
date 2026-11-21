@@ -58,6 +58,11 @@ function Escape-TomlBasicString([string]$Value) {
     return ($Value -replace '\\', '\\' -replace '"', '\"')
 }
 
+function Write-Utf8NoBom([string]$FilePath, [string]$Text) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($FilePath, $Text, $utf8NoBom)
+}
+
 function Backup-IfExists([string]$FilePath) {
     if (Test-Path -LiteralPath $FilePath) {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -171,7 +176,13 @@ Write-Step 'Detecting real Codex installation on this machine...'
 $resolvedCodex = Resolve-CodexExecutable -ExplicitPath $CodexPath -ExcludedDir $LocalBin
 $CodexExe = $resolvedCodex.Path
 $CodexSource = $resolvedCodex.Source
-$codexVersion = (& $CodexExe --version 2>&1 | Select-Object -First 1)
+$prevVerPref = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $codexVersion = (& $CodexExe --version 2>&1 | Where-Object { $_ -notmatch '^WARNING:' } | Select-Object -First 1)
+} finally {
+    $ErrorActionPreference = $prevVerPref
+}
 Write-Host "    Source  : $CodexSource"
 Write-Host "    Binary  : $CodexExe"
 Write-Host "    Version : $codexVersion"
@@ -236,7 +247,9 @@ foreach ($name in $sharedDirs) {
             Write-Host "    Already linked: $name -> $($item.Target)"
             continue
         }
-        if (-not $DryRun) { Remove-Item -LiteralPath $dst -Recurse -Force }
+        $dirBackup = "$dst.backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        if (-not $DryRun) { Move-Item -LiteralPath $dst -Destination $dirBackup -Force }
+        Write-Host "    Moved existing directory safely to: $dirBackup" -ForegroundColor DarkGray
     }
     if (-not $DryRun) { New-Item -ItemType Junction -Path $dst -Target $src | Out-Null }
     Write-Host "    Linked: $dst -> $src"
@@ -331,7 +344,7 @@ CARGO_TARGET_DIR = "$(Escape-TomlBasicString $CargoTargetDir)"
 "@
 
 Backup-IfExists $lane2ConfigPath
-if (-not $DryRun) { Set-Content -LiteralPath $lane2ConfigPath -Value $lane2Config -Encoding UTF8 }
+if (-not $DryRun) { Write-Utf8NoBom -FilePath $lane2ConfigPath -Text $lane2Config }
 Write-Host "    Wrote: $lane2ConfigPath (preserved $($trustedProjects.Count) trusted project(s))"
 
 # 9. Optional: configure Lane 1 third-party gateway ONLY if explicitly requested
@@ -396,7 +409,7 @@ exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]
 [shell_environment_policy.set]
 CODEX_ACTIVE_LANE = "LANE_1"
 "@
-    if (-not $DryRun) { Set-Content -LiteralPath $lane1ConfigPath -Value $lane1Config -Encoding UTF8 }
+    if (-not $DryRun) { Write-Utf8NoBom -FilePath $lane1ConfigPath -Text $lane1Config }
     Write-Host "    Wrote: $lane1ConfigPath"
 }
 
@@ -414,10 +427,13 @@ if not exist "%CODEX_EXE%" (
 "@
 } else { '' }
 
+$needsUtf8Codepage = ($Lane1Home -match '[^\x00-\x7F]') -or ($Lane2Home -match '[^\x00-\x7F]') -or ($CargoTargetDir -match '[^\x00-\x7F]') -or ($CodexExe -match '[^\x00-\x7F]')
+$utf8Header = if ($needsUtf8Codepage) { "chcp 65001 >nul`r`n" } else { '' }
+
 $officialWrapper = @"
 @echo off
 setlocal
-set "CODEX_HOME=$Lane2Home"
+${utf8Header}set "CODEX_HOME=$Lane2Home"
 set "CODEX_ACTIVE_LANE=LANE_2"
 set "CARGO_TARGET_DIR=$CargoTargetDir"
 set "CODEX_EXE=$CodexExe"
@@ -428,7 +444,7 @@ ${invokePrefix}"%CODEX_EXE%" %*
 $t3Wrapper = @"
 @echo off
 setlocal
-set "CODEX_HOME=$Lane1Home"
+${utf8Header}set "CODEX_HOME=$Lane1Home"
 set "CODEX_ACTIVE_LANE=LANE_1"
 set "CODEX_EXE=$CodexExe"
 $windowsAppsRefresh
@@ -436,20 +452,27 @@ ${invokePrefix}"%CODEX_EXE%" %*
 "@
 
 if (-not $DryRun) {
-    Set-Content -LiteralPath (Join-Path $LocalBin 'codex.cmd') -Value $officialWrapper -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $LocalBin 'codex-official.cmd') -Value $officialWrapper -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $LocalBin 'codex-t3.cmd') -Value $t3Wrapper -Encoding ASCII
+    Write-Utf8NoBom -FilePath (Join-Path $LocalBin 'codex.cmd') -Text $officialWrapper
+    Write-Utf8NoBom -FilePath (Join-Path $LocalBin 'codex-official.cmd') -Text $officialWrapper
+    Write-Utf8NoBom -FilePath (Join-Path $LocalBin 'codex-t3.cmd') -Text $t3Wrapper
 }
 Write-Host "    Installed wrappers in: $LocalBin"
 
-# Add ~/.local/bin to User PATH if missing
+# Prepend ~/.local/bin to User PATH so our wrappers take precedence over npm/global codex shims
 $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
-if ($userPath -notlike "*$LocalBin*") {
+$pathEntries = @()
+if ($userPath) {
+    $pathEntries = $userPath -split ';' | Where-Object { $_ -and $_.Trim() -ne '' }
+}
+$normLocalBin = $LocalBin.TrimEnd('\').ToLowerInvariant()
+$firstIsLocalBin = ($pathEntries.Count -gt 0) -and ($pathEntries[0].TrimEnd('\').ToLowerInvariant() -eq $normLocalBin)
+if (-not $firstIsLocalBin) {
+    $filtered = @($pathEntries | Where-Object { $_.TrimEnd('\').ToLowerInvariant() -ne $normLocalBin })
+    $newPath = (@($LocalBin) + $filtered) -join ';'
     if (-not $DryRun) {
-        $newPath = if ($userPath) { "$userPath;$LocalBin" } else { $LocalBin }
         [System.Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
     }
-    Write-Host "    Added $LocalBin to User PATH. Open a new terminal window to pick up PATH changes." -ForegroundColor Yellow
+    Write-Host "    Prepended $LocalBin to User PATH (highest priority). Open a new terminal window to pick up PATH changes." -ForegroundColor Yellow
 }
 
 # 11. Optional: copy DUAL_LANE_BRIDGE.md into target repository

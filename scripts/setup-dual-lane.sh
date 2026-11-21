@@ -18,7 +18,7 @@ CARGO_TARGET_LANE2="${TMPDIR:-/tmp}/codex-lane2-target"
 APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-never}"
 SANDBOX_NETWORK="${CODEX_SANDBOX_NETWORK:-false}"
 
-# Detect real codex binary (excluding ~/.local/bin/codex wrapper)
+# Detect real codex binary using bash built-in `type -ap` (excluding ~/.local/bin/codex wrapper)
 CODEX_BIN=""
 while IFS= read -r candidate; do
   [ -z "${candidate}" ] && continue
@@ -26,7 +26,7 @@ while IFS= read -r candidate; do
     CODEX_BIN="${candidate}"
     break
   fi
-done < <(which -a codex 2>/dev/null || true)
+done < <(type -ap codex 2>/dev/null || true)
 
 if [ -z "${CODEX_BIN}" ]; then
   echo "[FAIL] No 'codex' binary found in PATH. Install with 'npm i -g @openai/codex' first." >&2
@@ -36,20 +36,21 @@ fi
 echo "[+] Found codex binary: ${CODEX_BIN} ($(${CODEX_BIN} --version 2>/dev/null || echo unknown))"
 mkdir -p "${LANE1_HOME}/rules" "${LANE2_HOME}/rules" "${LOCAL_BIN}"
 
-# Share memories, sessions, skills, plugins via symlinks
+# Share memories, sessions, skills, plugins via symlinks (never delete existing dirs without backup)
+stamp="$(date +%Y%m%d-%H%M%S)"
 for d in memories memories_v2 sessions archived_sessions skills plugins; do
   mkdir -p "${LANE1_HOME}/${d}"
   if [ -L "${LANE2_HOME}/${d}" ]; then
     continue
   elif [ -e "${LANE2_HOME}/${d}" ]; then
-    rm -rf "${LANE2_HOME}/${d}"
+    mv "${LANE2_HOME}/${d}" "${LANE2_HOME}/${d}.backup-${stamp}"
+    echo "    Backed up existing directory: ${LANE2_HOME}/${d}.backup-${stamp}"
   fi
   ln -s "${LANE1_HOME}/${d}" "${LANE2_HOME}/${d}"
   echo "    Linked: ${LANE2_HOME}/${d} -> ${LANE1_HOME}/${d}"
 done
 
 # Install firewall rules & global AGENTS.md (with timestamped backup)
-stamp="$(date +%Y%m%d-%H%M%S)"
 for target in "${LANE1_HOME}/rules/default.rules" "${LANE2_HOME}/rules/default.rules"; do
   [ -f "${target}" ] && cp "${target}" "${target}.backup-${stamp}"
   cp "${KIT_ROOT}/templates/default.rules" "${target}"
