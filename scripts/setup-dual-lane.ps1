@@ -79,7 +79,8 @@ function Protect-SensitiveFileAcl([string]$FilePath) {
     $prevPref = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & icacls.exe $FilePath /inheritance:d /remove:g "CodexSandboxUsers" >$null 2>&1
+        & icacls.exe $FilePath /inheritance:d >$null 2>&1
+        & icacls.exe $FilePath /remove:g "CodexSandboxUsers" >$null 2>&1
     } catch {
     } finally {
         $ErrorActionPreference = $prevPref
