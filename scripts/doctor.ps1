@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Real-time, strictly read-only compatibility, health & behavioral security diagnostic for
     Codex Dual-Lane & Security Kit on Windows.
@@ -82,13 +82,144 @@ function Report([string]$Status, [string]$Label, [string]$Detail) {
     }
 }
 
+function Resolve-CanonicalLongPath {
+    <#
+    .SYNOPSIS
+        Canonicalizes a Windows filesystem path to its full long-name form (expanding 8.3 short
+        segments such as RUNNER~1 or PROGRA~1) without dereferencing NTFS Junctions or symlinks.
+        WHY:
+          Ensures PATH precedence and NTFS Junction target checks compare consistently even when
+          one side uses an 8.3 short path segment and the other uses the long name (for example
+          on Windows CI runners under PowerShell 7+ where GetFullPath does not expand 8.3 names).
+    #>
+    param(
+        [AllowEmptyString()][string]$PathValue
+    )
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return '' }
+
+    $inputPath = $PathValue
+    if (-not [System.IO.Path]::IsPathRooted($inputPath)) {
+        try {
+            $psCwd = (Get-Location -PSProvider FileSystem).ProviderPath
+            if (-not [string]::IsNullOrEmpty($psCwd)) {
+                $inputPath = [System.IO.Path]::Combine($psCwd, $inputPath)
+            }
+        } catch {}
+    }
+
+    $full = [System.IO.Path]::GetFullPath($inputPath)
+    $root = [System.IO.Path]::GetPathRoot($full)
+    $normalized = if ($full.Length -gt $root.Length) { $full.TrimEnd('\', '/') } else { $full }
+
+    $useWin32 = $false
+    try {
+        if (-not ('CodexDualLane.NativePathApi' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace CodexDualLane {
+    public static class NativePathApi {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetLongPathNameW(
+            string lpszShortPath,
+            StringBuilder lpszLongPath,
+            uint cchBuffer
+        );
+
+        public static string TryGetLongPath(string path) {
+            if (string.IsNullOrEmpty(path)) return null;
+            StringBuilder sb = new StringBuilder(Math.Max(260, path.Length + 64));
+            uint required = GetLongPathNameW(path, sb, (uint)sb.Capacity);
+            if (required == 0) return null;
+            if (required > sb.Capacity) {
+                sb = new StringBuilder((int)required + 1);
+                required = GetLongPathNameW(path, sb, (uint)sb.Capacity);
+                if (required == 0 || required > sb.Capacity) return null;
+            }
+            return sb.ToString();
+        }
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $useWin32 = $true
+    } catch {
+        $useWin32 = $false
+    }
+
+    $tailSegments = New-Object 'System.Collections.Generic.Stack[string]'
+    $probe = $normalized
+    $resolvedBase = $null
+
+    while (-not [string]::IsNullOrEmpty($probe)) {
+        if ($useWin32) {
+            $candidate = [CodexDualLane.NativePathApi]::TryGetLongPath($probe)
+            if (-not [string]::IsNullOrEmpty($candidate)) {
+                $resolvedBase = $candidate
+                break
+            }
+        } else {
+            if ([System.IO.File]::Exists($probe) -or [System.IO.Directory]::Exists($probe)) {
+                $resolvedBase = $probe
+                break
+            }
+        }
+
+        $parent = [System.IO.Path]::GetDirectoryName($probe)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $probe) {
+            $resolvedBase = $probe
+            break
+        }
+        $leaf = [System.IO.Path]::GetFileName($probe)
+        $tailSegments.Push($leaf)
+        $probe = $parent
+    }
+
+    if ([string]::IsNullOrEmpty($resolvedBase)) {
+        $resolvedBase = $normalized
+    }
+
+    if (-not $useWin32) {
+        $baseRoot = [System.IO.Path]::GetPathRoot($resolvedBase)
+        if (-not [string]::IsNullOrEmpty($baseRoot) -and $resolvedBase.Length -gt $baseRoot.Length) {
+            $relParts = $resolvedBase.Substring($baseRoot.Length).Split([char[]]@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)
+            $acc = $baseRoot
+            foreach ($part in $relParts) {
+                $nextAcc = $null
+                try {
+                    $di = New-Object System.IO.DirectoryInfo($acc)
+                    $entries = @($di.GetFileSystemInfos($part))
+                    if ($entries.Count -eq 1) {
+                        $nextAcc = $entries[0].FullName
+                    }
+                } catch {}
+                $acc = if ($nextAcc) { $nextAcc } else { [System.IO.Path]::Combine($acc, $part) }
+            }
+            $resolvedBase = $acc
+        }
+    }
+
+    $result = $resolvedBase
+    while ($tailSegments.Count -gt 0) {
+        $result = [System.IO.Path]::Combine($result, $tailSegments.Pop())
+    }
+
+    if ($result.Length -ge 2 -and $result[1] -eq ':') {
+        $result = [char]::ToUpperInvariant($result[0]) + $result.Substring(1)
+    }
+    $resRoot = [System.IO.Path]::GetPathRoot($result)
+    if ($result.Length -gt $resRoot.Length) {
+        $result = $result.TrimEnd('\', '/')
+    }
+    return $result
+}
+
 function Get-NormalizedFullPath([string]$PathValue) {
     if ([string]::IsNullOrWhiteSpace($PathValue)) { return '' }
     try {
-        $full = [System.IO.Path]::GetFullPath($PathValue)
-        $root = [System.IO.Path]::GetPathRoot($full)
-        if ($full.Length -gt $root.Length) { return $full.TrimEnd('\', '/') }
-        return $full
+        return (Resolve-CanonicalLongPath -PathValue $PathValue)
     } catch {
         return $PathValue
     }
@@ -357,7 +488,7 @@ if ($codexCmd -and $codexCmd.Source) {
             $ver = if ($rawVer.Length -gt 80) { $rawVer.Substring(0, 80) } else { $rawVer }
         }
     } catch {}
-    $parent = (Split-Path -Parent $codexCmd.Source).TrimEnd('\').ToLowerInvariant()
+    $parent = (Get-NormalizedFullPath (Split-Path -Parent $codexCmd.Source)).TrimEnd('\').ToLowerInvariant()
     if ($parent -eq $normBin) {
         Report 'PASS' 'codex CLI in PATH' "$($codexCmd.Source) ($ver)"
     } else {
@@ -374,7 +505,7 @@ if ($codexCmd -and $codexCmd.Source) {
 
 $codexT3Cmd = Get-Command codex-t3 -ErrorAction SilentlyContinue
 if ($codexT3Cmd -and $codexT3Cmd.Source) {
-    $t3Parent = (Split-Path -Parent $codexT3Cmd.Source).TrimEnd('\').ToLowerInvariant()
+    $t3Parent = (Get-NormalizedFullPath (Split-Path -Parent $codexT3Cmd.Source)).TrimEnd('\').ToLowerInvariant()
     if ($t3Parent -eq $normBin) {
         Report 'PASS' 'codex-t3 CLI in PATH' $codexT3Cmd.Source
     } else {
@@ -394,15 +525,16 @@ $linkedOk = 0
 $broken = New-Object 'System.Collections.Generic.List[string]'
 foreach ($d in $sharedDirs) {
     $p = Join-Path $Lane2Home $d
-    $expectedTarget = (Join-Path $Lane1Home $d).TrimEnd('\').ToLowerInvariant()
+    $expectedTarget = (Get-NormalizedFullPath (Join-Path $Lane1Home $d)).TrimEnd('\').ToLowerInvariant()
     if (Test-Path -LiteralPath $p) {
         $it = Get-Item -LiteralPath $p -Force
         if ($it.LinkType -eq 'Junction') {
             $rawTarget = (@($it.Target) | Select-Object -First 1)
-            $normTarget = if ($rawTarget) { ($rawTarget -replace '^\\\?\?\\', '').TrimEnd('\').ToLowerInvariant() } else { '' }
+            $cleanTarget = if ($rawTarget) { ($rawTarget -replace '^\\\?\?\\', '') } else { '' }
+            $normTarget  = if ($cleanTarget) { (Get-NormalizedFullPath $cleanTarget).TrimEnd('\').ToLowerInvariant() } else { '' }
             if ($normTarget -and ($normTarget -ne $expectedTarget)) {
                 $broken.Add("$d (target mismatch)")
-            } elseif ($rawTarget -and -not (Test-Path -LiteralPath ($rawTarget -replace '^\\\?\?\\', ''))) {
+            } elseif ($cleanTarget -and -not (Test-Path -LiteralPath $cleanTarget)) {
                 $broken.Add("$d (dangling target)")
             } else {
                 $linkedOk++
@@ -610,7 +742,43 @@ if (-not $denyStateL1.Present -and -not $denyStateL2.Present) {
 }
 
 # ============================================================================
-# Check 8: Python 3 Availability (Optional, for scripts\sync-sessions.py)
+# Check 8: Crash-Safe Rollback Journal Health (Read-Only)
+# ============================================================================
+$rbDirPath = Join-Path $Lane2Home '.rollback'
+$rbLatestPath = Join-Path $rbDirPath 'latest.json'
+$rbDirIsReparse = $false
+$rbLatestIsReparse = $false
+try {
+    if ([System.IO.File]::GetAttributes($rbDirPath) -band [System.IO.FileAttributes]::ReparsePoint) { $rbDirIsReparse = $true }
+} catch {}
+try {
+    if ([System.IO.File]::GetAttributes($rbLatestPath) -band [System.IO.FileAttributes]::ReparsePoint) { $rbLatestIsReparse = $true }
+} catch {}
+
+if ($rbDirIsReparse -or $rbLatestIsReparse) {
+    Report 'WARN' 'Rollback Journal' 'Symlink/reparse point detected on .rollback or latest.json (refuse untrusted links)'
+} elseif (-not (Test-Path -LiteralPath $rbLatestPath -PathType Leaf)) {
+    Report 'PASS' 'Rollback Journal' 'No rollback journal present yet (created automatically on first setup-dual-lane.ps1 run)'
+} else {
+    try {
+        $rbObj = Get-Content -LiteralPath $rbLatestPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $compProp = if ($null -ne $rbObj) { $rbObj.PSObject.Properties['Completed'] } else { $null }
+        $stageProp = if ($null -ne $rbObj) { $rbObj.PSObject.Properties['LastStage'] } else { $null }
+        $stageVal = if ($null -ne $stageProp -and -not [string]::IsNullOrWhiteSpace([string]$stageProp.Value)) { ([string]$stageProp.Value) -replace '[^A-Za-z0-9_.:-]', '_' } else { 'unknown' }
+        if ($null -ne $compProp -and (-not [bool]$compProp.Value)) {
+            Report 'WARN' 'Rollback Journal' "Interrupted mid-install journal detected (Completed=false, LastStage=$stageVal); run restore-original.ps1 or re-run setup-dual-lane.ps1"
+        } else {
+            $filesProp = if ($null -ne $rbObj) { $rbObj.PSObject.Properties['Files'] } else { $null }
+            $trackedFiles = if ($null -ne $filesProp -and $null -ne $filesProp.Value) { @($filesProp.Value).Count } else { 0 }
+            Report 'PASS' 'Rollback Journal' "Healthy & complete (tracked_files=$trackedFiles, LastStage=$stageVal)"
+        }
+    } catch {
+        Report 'WARN' 'Rollback Journal' 'Present at .rollback\latest.json but unreadable/malformed JSON'
+    }
+}
+
+# ============================================================================
+# Check 9: Python 3 Availability (Optional, for scripts\sync-sessions.py)
 # ============================================================================
 $realPy = $null
 $realPyVer = ''

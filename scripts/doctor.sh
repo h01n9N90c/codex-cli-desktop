@@ -79,13 +79,29 @@ first_line_or_default() {
   printf '%s\n' "${text}" | awk -v fb="${fallback}" 'NR==1 { line=$0 } END { if (line != "") print line; else print fb }'
 }
 
-# Portably read POSIX octal file permission bits (GNU `stat -c %a` / BSD `stat -f %Lp`).
+# Portably read standard POSIX owner/group/other octal permission bits (3 digits:
+# 000..777, stripping any special SUID/SGID/sticky leading digit) across GNU `stat -c %a`
+# and BSD/macOS `stat -f %Lp`. Returns empty string if unavailable.
 get_octal_mode() {
   local path="$1"
   local mode=""
   if mode="$(stat -c '%a' "${path}" 2>/dev/null)"; then
-    printf '%s' "${mode}"
+    :
   elif mode="$(stat -f '%Lp' "${path}" 2>/dev/null)"; then
+    :
+  else
+    printf ''
+    return 0
+  fi
+  if printf '%s' "${mode}" | grep -Eq '^[0-7]{4}$'; then
+    mode="${mode#?}"
+  fi
+  if printf '%s' "${mode}" | grep -Eq '^[0-7]{1,2}$'; then
+    while [ "${#mode}" -lt 3 ]; do
+      mode="0${mode}"
+    done
+  fi
+  if printf '%s' "${mode}" | grep -Eq '^[0-7]{3}$'; then
     printf '%s' "${mode}"
   else
     printf ''
@@ -447,6 +463,21 @@ if [ -n "${PY_FOUND}" ]; then
   report "PASS" "Python 3 (Optional Sync)" "${PY_FOUND}"
 else
   report "WARN" "Python 3 (Optional Sync)" "Not installed (only needed for scripts/sync-sessions.py)"
+fi
+
+# ------------------------------------------------------------------------------
+# 8. Rollback Journal Status (Read-Only Detection of Interrupted Installs)
+# ------------------------------------------------------------------------------
+ROLLBACK_DIR="${LANE2_HOME}/.rollback"
+ROLLBACK_LATEST="${ROLLBACK_DIR}/latest.tsv"
+if [ -L "${ROLLBACK_DIR}" ] || [ -L "${ROLLBACK_LATEST}" ]; then
+  report "WARN" "Rollback Journal" "Symlink detected at rollback path (${ROLLBACK_LATEST})"
+elif [ -f "${ROLLBACK_LATEST}" ]; then
+  if grep -Fq '# status=in-progress' "${ROLLBACK_LATEST}" 2>/dev/null; then
+    report "WARN" "Rollback Journal" "Partial/interrupted install detected (${ROLLBACK_LATEST}); run ./scripts/restore-original.sh or re-run setup"
+  else
+    report "PASS" "Rollback Journal" "Manifest healthy (${ROLLBACK_LATEST})"
+  fi
 fi
 
 printf '\nSummary: %d PASS | %d WARN | %d FAIL\n' "${PASS}" "${WARN}" "${FAIL}"

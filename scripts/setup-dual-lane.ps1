@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Universal, hardware-adaptive, security-hardened installer for Codex Dual-Lane & Security Kit on Windows.
 
@@ -16,14 +16,22 @@
          - Third-party gateway mode (-ConfigureGateway) writes ONLY `env_key = "<VAR>"` into config.toml
            and enforces a fail-closed pre-write assertion that blocks `experimental_bearer_token` or
            plaintext API keys from ever reaching config.toml or backup files.
-      2. Non-destructive TOML merge & atomic file writes:
+      2. Non-destructive TOML merge, canonical long-path normalization & crash-safe rollback:
+         - Normalizes all Windows paths via Win32 GetLongPathNameW (expanding 8.3 short names such
+           as RUNNER~1 / PROGRA~1 without dereferencing NTFS Junctions or symlinks) so containment,
+           trusted projects, and generated wrappers remain consistent on every Windows host.
          - Preserves custom top-level keys (including multi-line values), custom sections
            ([mcp_servers.*], [tui], [plugins.*], [[array_of_tables]]), and all existing [projects.*]
            trust entries.
          - Writes UTF-8 without BOM atomically via a same-directory temp file + File.Replace/Move so
            interrupted writes cannot corrupt config.toml.
-         - Records SHA-256 hashes of every pre-existing file into a deterministic rollback snapshot
-           (<Lane2Home>\.rollback\latest.json) for byte-exact recovery via restore-original.ps1.
+         - Persists SHA-256 hashes, Junctions, and launchers incrementally into an ACL-locked
+           rollback journal (<Lane2Home>\.rollback\latest.json) after every tracked mutation so even
+           an interrupted mid-install run recovers byte-for-byte via restore-original.ps1.
+         - When -UseGitWorktree is enabled, generated Lane 2 wrappers enforce a hard fail-closed
+           worktree boundary (refusing to run if the worktree is missing or cd fails, rather than
+           silently falling back to the primary repository) and always block -C/--cd/--add-dir
+           targeting the primary repo across both long and 8.3 short path forms.
       3. Two-step NTFS Kernel ACL hardening (Protect-SensitiveFileAcl):
          - Step 1 (`icacls /inheritance:d`): converts inherited ACEs to explicit ACEs so future
            parent-folder grants cannot leak into sensitive files.
@@ -204,15 +212,167 @@ $ErrorActionPreference = 'Stop'
 # prevents `finally` cleanup of our disposable feature-probe temp folder.
 $script:IsDryRun = $DryRun.IsPresent -or [bool]$WhatIfPreference
 $WhatIfPreference = $false
-$script:SnapshotEntries = New-Object 'System.Collections.Generic.List[object]'
-$script:InstallStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$script:SnapshotEntries    = New-Object 'System.Collections.Generic.List[object]'
+$script:TrackedJunctions   = New-Object 'System.Collections.Generic.List[string]'
+$script:InstalledWrappers  = New-Object 'System.Collections.Generic.List[string]'
+$script:InstallStamp       = Get-Date -Format 'yyyyMMdd-HHmmss'
+$script:CreatedAtUtc       = (Get-Date).ToUniversalTime().ToString('o')
+$script:RollbackDir        = ''
+$script:RollbackSnapPath   = ''
+$script:RollbackLatestPath = ''
+$script:ManifestContext    = $null
 
 # ============================================================================
-# Helper Functions: Logging, Input Validation & Injection Defense
+# Helper Functions: Logging, Canonical Path Normalization & Injection Defense
 # ============================================================================
 
 function Write-Step([string]$Message) {
     Write-Host "`n[+] $Message" -ForegroundColor Cyan
+}
+
+function Resolve-CanonicalLongPath {
+    <#
+    .SYNOPSIS
+        Canonicalizes a Windows filesystem path to its full long-name form (expanding 8.3 short
+        segments such as RUNNER~1 or PROGRA~1) without dereferencing NTFS Junctions or symlinks.
+        WHY:
+          On Windows CI runners and profiles with 8.3 short names, $env:TEMP / GetTempPath() can
+          return short-name segments while git worktree or cmd.exe produces the long name. On
+          PowerShell 7+ (.NET Core), [System.IO.Path]::GetFullPath() and Resolve-Path do NOT expand
+          8.3 short names. Win32 GetLongPathNameW expands every existing 8.3 segment without
+          following reparse points; walking upward to the deepest existing ancestor guarantees
+          consistent canonical paths even when leaf segments do not exist yet.
+    #>
+    param(
+        [AllowEmptyString()][string]$PathValue
+    )
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return '' }
+
+    # Respect PowerShell's current FileSystem location for relative paths (System.IO.Path.GetFullPath
+    # uses process Environment.CurrentDirectory which does not track PowerShell Push-Location).
+    $inputPath = $PathValue
+    if (-not [System.IO.Path]::IsPathRooted($inputPath)) {
+        try {
+            $psCwd = (Get-Location -PSProvider FileSystem).ProviderPath
+            if (-not [string]::IsNullOrEmpty($psCwd)) {
+                $inputPath = [System.IO.Path]::Combine($psCwd, $inputPath)
+            }
+        } catch {}
+    }
+
+    $full = [System.IO.Path]::GetFullPath($inputPath)
+    $root = [System.IO.Path]::GetPathRoot($full)
+    $normalized = if ($full.Length -gt $root.Length) { $full.TrimEnd('\', '/') } else { $full }
+
+    # Compile the Win32 GetLongPathNameW P/Invoke wrapper once per PowerShell session.
+    $useWin32 = $false
+    try {
+        if (-not ('CodexDualLane.NativePathApi' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace CodexDualLane {
+    public static class NativePathApi {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetLongPathNameW(
+            string lpszShortPath,
+            StringBuilder lpszLongPath,
+            uint cchBuffer
+        );
+
+        public static string TryGetLongPath(string path) {
+            if (string.IsNullOrEmpty(path)) return null;
+            StringBuilder sb = new StringBuilder(Math.Max(260, path.Length + 64));
+            uint required = GetLongPathNameW(path, sb, (uint)sb.Capacity);
+            if (required == 0) return null;
+            if (required > sb.Capacity) {
+                sb = new StringBuilder((int)required + 1);
+                required = GetLongPathNameW(path, sb, (uint)sb.Capacity);
+                if (required == 0 || required > sb.Capacity) return null;
+            }
+            return sb.ToString();
+        }
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $useWin32 = $true
+    } catch {
+        # Safe fallback if Add-Type is blocked (e.g., Constrained Language Mode / WDAC).
+        $useWin32 = $false
+    }
+
+    # Walk up to the deepest existing ancestor so non-existent leaf directories still get
+    # canonical long-path ancestors when re-attached.
+    $tailSegments = New-Object 'System.Collections.Generic.Stack[string]'
+    $probe = $normalized
+    $resolvedBase = $null
+
+    while (-not [string]::IsNullOrEmpty($probe)) {
+        if ($useWin32) {
+            $candidate = [CodexDualLane.NativePathApi]::TryGetLongPath($probe)
+            if (-not [string]::IsNullOrEmpty($candidate)) {
+                $resolvedBase = $candidate
+                break
+            }
+        } else {
+            if ([System.IO.File]::Exists($probe) -or [System.IO.Directory]::Exists($probe)) {
+                $resolvedBase = $probe
+                break
+            }
+        }
+
+        $parent = [System.IO.Path]::GetDirectoryName($probe)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $probe) {
+            $resolvedBase = $probe
+            break
+        }
+        $leaf = [System.IO.Path]::GetFileName($probe)
+        $tailSegments.Push($leaf)
+        $probe = $parent
+    }
+
+    if ([string]::IsNullOrEmpty($resolvedBase)) {
+        $resolvedBase = $normalized
+    }
+
+    # Pure-.NET segment expansion fallback when Win32 P/Invoke is unavailable.
+    if (-not $useWin32) {
+        $baseRoot = [System.IO.Path]::GetPathRoot($resolvedBase)
+        if (-not [string]::IsNullOrEmpty($baseRoot) -and $resolvedBase.Length -gt $baseRoot.Length) {
+            $relParts = $resolvedBase.Substring($baseRoot.Length).Split([char[]]@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)
+            $acc = $baseRoot
+            foreach ($part in $relParts) {
+                $nextAcc = $null
+                try {
+                    $di = New-Object System.IO.DirectoryInfo($acc)
+                    $entries = @($di.GetFileSystemInfos($part))
+                    if ($entries.Count -eq 1) {
+                        $nextAcc = $entries[0].FullName
+                    }
+                } catch {}
+                $acc = if ($nextAcc) { $nextAcc } else { [System.IO.Path]::Combine($acc, $part) }
+            }
+            $resolvedBase = $acc
+        }
+    }
+
+    $result = $resolvedBase
+    while ($tailSegments.Count -gt 0) {
+        $result = [System.IO.Path]::Combine($result, $tailSegments.Pop())
+    }
+
+    # Canonicalize drive letter to uppercase and trim trailing separator except for drive roots (C:\).
+    if ($result.Length -ge 2 -and $result[1] -eq ':') {
+        $result = [char]::ToUpperInvariant($result[0]) + $result.Substring(1)
+    }
+    $resRoot = [System.IO.Path]::GetPathRoot($result)
+    if ($result.Length -gt $resRoot.Length) {
+        $result = $result.TrimEnd('\', '/')
+    }
+    return $result
 }
 
 function Assert-NoControlChars {
@@ -235,7 +395,7 @@ function Assert-NoControlChars {
 function Assert-SafeWindowsPath {
     <#
     .SYNOPSIS
-        Validates and canonicalizes a Windows filesystem path parameter.
+        Validates and canonicalizes a Windows filesystem path parameter (including 8.3 long-path expansion).
         WHY: Blocks control characters, double-quote CMD breakout characters, NTFS Alternate
         Data Streams (path:stream), raw device prefixes (\\?\ / \\.\), and accidental targeting
         of OS/drive/profile roots for lane or build directories.
@@ -267,22 +427,21 @@ function Assert-SafeWindowsPath {
     }
 
     try {
-        $full = [System.IO.Path]::GetFullPath($PathValue)
+        $normalized = Resolve-CanonicalLongPath -PathValue $PathValue
     } catch {
         throw "Invalid path for -${ParamName} ('$PathValue'): $($_.Exception.Message)"
     }
 
-    # Trim trailing separator unless path is a drive root like C:\
-    $root = [System.IO.Path]::GetPathRoot($full)
-    $normalized = if ($full.Length -gt $root.Length) { $full.TrimEnd('\', '/') } else { $full }
+    $root = [System.IO.Path]::GetPathRoot($normalized)
 
     if ($DisallowRootOrProfile) {
         # Guard against catastrophic misconfiguration (e.g., pointing Lane2Home at C:\ or %USERPROFILE%).
+        # Canonicalize each blocked OS/env directory to its long path so 8.3 aliases cannot bypass the check.
         $blockedDirs = New-Object 'System.Collections.Generic.List[string]'
         if ($root) { $blockedDirs.Add($root.TrimEnd('\')) }
         foreach ($envDir in @($env:USERPROFILE, $env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:TEMP)) {
             if (-not [string]::IsNullOrWhiteSpace($envDir)) {
-                try { $blockedDirs.Add([System.IO.Path]::GetFullPath($envDir).TrimEnd('\')) } catch {}
+                try { $blockedDirs.Add((Resolve-CanonicalLongPath -PathValue $envDir).TrimEnd('\')) } catch {}
             }
         }
         $normNoTrail = $normalized.TrimEnd('\')
@@ -302,9 +461,11 @@ function Test-PathsOverlap([string]$PathA, [string]$PathB) {
         Returns $true if PathA and PathB are identical or one is nested inside the other.
         WHY: Overlapping Lane1Home/Lane2Home would create circular NTFS Directory Junctions, and
         nesting a Lane 2 Git worktree inside Lane 1's repo would break workspace-write isolation.
+        Both sides are canonicalized via Resolve-CanonicalLongPath so 8.3 short aliases cannot
+        evade overlap detection.
     #>
-    $a = $PathA.TrimEnd('\').ToLowerInvariant()
-    $b = $PathB.TrimEnd('\').ToLowerInvariant()
+    $a = (Resolve-CanonicalLongPath -PathValue $PathA).TrimEnd('\').ToLowerInvariant()
+    $b = (Resolve-CanonicalLongPath -PathValue $PathB).TrimEnd('\').ToLowerInvariant()
     return ($a -eq $b) -or $a.StartsWith("$b\") -or $b.StartsWith("$a\")
 }
 
@@ -400,7 +561,7 @@ function Assert-NotReparsePoint {
         [Parameter(Mandatory = $true)][string]$PathValue,
         [Parameter(Mandatory = $true)][string]$Label
     )
-    $full = [System.IO.Path]::GetFullPath($PathValue)
+    $full = Resolve-CanonicalLongPath -PathValue $PathValue
     try {
         $attrs = [System.IO.File]::GetAttributes($full)
         if ($attrs -band [System.IO.FileAttributes]::ReparsePoint) {
@@ -441,7 +602,7 @@ function Write-Utf8NoBom {
         [Parameter(Mandatory = $true)][string]$FilePath,
         [Parameter(Mandatory = $true)][string]$Text
     )
-    $fullPath = [System.IO.Path]::GetFullPath($FilePath)
+    $fullPath = Resolve-CanonicalLongPath -PathValue $FilePath
     $parentDir = [System.IO.Path]::GetDirectoryName($fullPath)
     if ($parentDir) {
         Assert-NotReparsePoint -PathValue $parentDir -Label 'Write-Utf8NoBom parent directory'
@@ -498,7 +659,7 @@ function Protect-SensitiveFileAcl([string]$FilePath) {
     #>
     if ($script:IsDryRun -or -not (Test-Path -LiteralPath $FilePath -PathType Leaf)) { return }
 
-    $fullPath = [System.IO.Path]::GetFullPath($FilePath)
+    $fullPath = Resolve-CanonicalLongPath -PathValue $FilePath
     Assert-NotReparsePoint -PathValue $fullPath -Label 'Protect-SensitiveFileAcl target file'
     if (-not (Get-Command 'icacls.exe' -ErrorAction SilentlyContinue)) {
         throw "Security error: 'icacls.exe' was not found in PATH; cannot lock NTFS DACL on '$fullPath'."
@@ -595,34 +756,85 @@ function Get-UniqueBackupPath([string]$BasePath) {
     return $candidate
 }
 
+function Save-RollbackManifestCheckpoint {
+    <#
+    .SYNOPSIS
+        Atomically persists the incremental rollback journal to both .rollback\latest.json and the
+        timestamped snapshot file, immediately locking NTFS DACLs on both files.
+        WHY: Writing the manifest ONLY at the end of installation leaves a crash window: if setup is
+        interrupted mid-way (Ctrl+C, disk error, or exception after creating Junctions or modifying
+        files), restore-original.ps1 would lack a manifest for those mutations. Calling this helper
+        incrementally after .rollback creation and after every tracked backup, Junction, file write,
+        and wrapper install guarantees crash-safe byte-exact recovery at every point in setup.
+    #>
+    param(
+        [string]$Stage = 'checkpoint',
+        [bool]$Completed = $false
+    )
+    if ($script:IsDryRun -or $null -eq $script:ManifestContext -or [string]::IsNullOrWhiteSpace($script:RollbackLatestPath)) {
+        return
+    }
+    Assert-NotReparsePoint -PathValue $script:RollbackDir -Label '.rollback directory'
+    if (-not (Test-Path -LiteralPath $script:RollbackDir)) {
+        [void][System.IO.Directory]::CreateDirectory($script:RollbackDir)
+    }
+
+    $manifestObj = [PSCustomObject]@{
+        SchemaVersion    = 1
+        Timestamp        = $script:InstallStamp
+        CreatedAtUtc     = $script:CreatedAtUtc
+        UpdatedAtUtc     = (Get-Date).ToUniversalTime().ToString('o')
+        Completed        = $Completed
+        LastStage        = $Stage
+        Lane1Home        = $script:ManifestContext.Lane1Home
+        Lane2Home        = $script:ManifestContext.Lane2Home
+        LocalBin         = $script:ManifestContext.LocalBin
+        RepoPath         = $script:ManifestContext.RepoPath
+        Lane2Worktree    = $script:ManifestContext.Lane2Worktree
+        GatewayApiKeyEnv = $script:ManifestContext.GatewayApiKeyEnv
+        SharedJunctions  = @($script:TrackedJunctions.ToArray())
+        Wrappers         = @($script:InstalledWrappers.ToArray())
+        Files            = @($script:SnapshotEntries.ToArray())
+    }
+    $manifestJson = $manifestObj | ConvertTo-Json -Depth 6
+    Write-Utf8NoBom -FilePath $script:RollbackSnapPath   -Text $manifestJson
+    Write-Utf8NoBom -FilePath $script:RollbackLatestPath -Text $manifestJson
+    Protect-SensitiveFileAcl $script:RollbackSnapPath
+    Protect-SensitiveFileAcl $script:RollbackLatestPath
+}
+
 function Backup-IfExists([string]$FilePath) {
     <#
     .SYNOPSIS
-        Backs up a pre-existing file with its SHA-256 hash and records the entry for deterministic
-        rollback via restore-original.ps1. Files that did not exist prior are also recorded so
-        rollback knows to delete them cleanly.
+        Backs up a pre-existing file with its SHA-256 hash, records the entry for deterministic
+        rollback via restore-original.ps1, and flushes an incremental rollback checkpoint BEFORE
+        the target file is overwritten. Files that did not exist prior are also recorded and
+        checkpointed so interrupted writes can still be cleaned up cleanly.
     #>
-    if (Test-Path -LiteralPath $FilePath -PathType Leaf) {
-        $origHash = Get-FileSha256 $FilePath
-        $backup = Get-UniqueBackupPath $FilePath
+    $canonicalPath = Resolve-CanonicalLongPath -PathValue $FilePath
+    if (Test-Path -LiteralPath $canonicalPath -PathType Leaf) {
+        $origHash = Get-FileSha256 $canonicalPath
+        $backup = Resolve-CanonicalLongPath -PathValue (Get-UniqueBackupPath $canonicalPath)
         if (-not $script:IsDryRun) {
-            Copy-Item -LiteralPath $FilePath -Destination $backup -Force
+            Copy-Item -LiteralPath $canonicalPath -Destination $backup -Force
             Protect-SensitiveFileAcl $backup
         }
         $script:SnapshotEntries.Add([PSCustomObject]@{
-            TargetPath     = $FilePath
+            TargetPath     = $canonicalPath
             ExistedPrior   = $true
             BackupPath     = $backup
             OriginalSha256 = $origHash
         })
+        Save-RollbackManifestCheckpoint -Stage ("backup:" + [System.IO.Path]::GetFileName($canonicalPath))
         Write-Host "    Backup saved: $backup (SHA256=$($origHash.Substring(0, 12))...)" -ForegroundColor DarkGray
     } else {
         $script:SnapshotEntries.Add([PSCustomObject]@{
-            TargetPath     = $FilePath
+            TargetPath     = $canonicalPath
             ExistedPrior   = $false
             BackupPath     = ''
             OriginalSha256 = ''
         })
+        Save-RollbackManifestCheckpoint -Stage ("track-new:" + [System.IO.Path]::GetFileName($canonicalPath))
     }
 }
 
@@ -667,7 +879,8 @@ function Resolve-CodexExecutable([string]$ExplicitPath, [string]$ExcludedDir) {
         if (-not (Test-Path -LiteralPath $ExplicitPath -PathType Leaf)) {
             throw "Specified -CodexPath does not exist or is not a file: $ExplicitPath"
         }
-        return [PSCustomObject]@{ Path = (Resolve-Path -LiteralPath $ExplicitPath).Path; Source = 'Explicit' }
+        $resolvedExplicit = Resolve-CanonicalLongPath -PathValue (Resolve-Path -LiteralPath $ExplicitPath).Path
+        return [PSCustomObject]@{ Path = $resolvedExplicit; Source = 'Explicit' }
     }
 
     # 2. Microsoft Store / MSIX OpenAI.Codex Desktop package
@@ -680,19 +893,19 @@ function Resolve-CodexExecutable([string]$ExplicitPath, [string]$ExcludedDir) {
     if ($appx -and $appx.InstallLocation) {
         $msixExe = Join-Path $appx.InstallLocation 'app\resources\codex.exe'
         if (Test-Path -LiteralPath $msixExe -PathType Leaf) {
-            return [PSCustomObject]@{ Path = $msixExe; Source = 'WindowsApps' }
+            return [PSCustomObject]@{ Path = (Resolve-CanonicalLongPath -PathValue $msixExe); Source = 'WindowsApps' }
         }
     }
 
     # 3. Existing codex binary in PATH (strictly excluding our own LocalBin wrapper to avoid infinite recursion)
-    $excludedNorm = $ExcludedDir.TrimEnd('\').ToLowerInvariant()
+    $excludedNorm = (Resolve-CanonicalLongPath -PathValue $ExcludedDir).TrimEnd('\').ToLowerInvariant()
     $cmdCandidates = @(Get-Command codex -All -ErrorAction SilentlyContinue)
     $exeMatch = $null
     $batchMatch = $null
     foreach ($cmd in $cmdCandidates) {
         if (-not $cmd -or -not $cmd.Source) { continue }
-        $src = $cmd.Source
-        $parent = (Split-Path -Parent $src).TrimEnd('\').ToLowerInvariant()
+        $src = Resolve-CanonicalLongPath -PathValue $cmd.Source
+        $parent = (Resolve-CanonicalLongPath -PathValue (Split-Path -Parent $src)).TrimEnd('\').ToLowerInvariant()
         if ($parent -eq $excludedNorm) { continue }
         $ext = [System.IO.Path]::GetExtension($src).ToLowerInvariant()
         # Prefer .exe / .cmd siblings over PowerShell .ps1 npm shims so our .cmd wrappers invoke cleanly.
@@ -1023,9 +1236,9 @@ function Merge-CodexConfigToml {
 # Pre-Flight Input Validation (Fail-Closed Before Any Disk Activity)
 # ============================================================================
 
-$KitRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$KitRoot = Resolve-CanonicalLongPath -PathValue (Join-Path $PSScriptRoot '..')
 
-# Validate and normalize all path parameters upfront.
+# Validate and normalize all path parameters upfront (including Win32 8.3 long-path expansion).
 $RepoPath       = Assert-SafeWindowsPath -PathValue $RepoPath       -ParamName 'RepoPath'
 $CodexPath      = Assert-SafeWindowsPath -PathValue $CodexPath      -ParamName 'CodexPath' -AllowEmpty
 $Lane1Home      = Assert-SafeWindowsPath -PathValue $Lane1Home      -ParamName 'Lane1Home' -DisallowRootOrProfile
@@ -1042,7 +1255,8 @@ $repoItem = Get-Item -LiteralPath $RepoPath -Force
 if ($repoItem.PSProvider.Name -ne 'FileSystem') {
     throw "Target -RepoPath must be a local filesystem directory: $RepoPath"
 }
-$RepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
+# Re-canonicalize via GetLongPathNameW because PowerShell's Resolve-Path preserves 8.3 short names.
+$RepoPath = Resolve-CanonicalLongPath -PathValue (Resolve-Path -LiteralPath $RepoPath).Path
 
 # Lane 1 and Lane 2 homes must be distinct, non-overlapping paths to prevent circular NTFS Junctions.
 if (Test-PathsOverlap -PathA $Lane1Home -PathB $Lane2Home) {
@@ -1251,7 +1465,7 @@ if ($UseGitWorktree) {
         if (-not (Test-Path -LiteralPath $wtTarget -PathType Container)) {
             throw "Existing path at -Lane2WorktreePath is a file, not a directory: $wtTarget"
         }
-        $effectiveLane2Repo = (Resolve-Path -LiteralPath $wtTarget).Path
+        $effectiveLane2Repo = Resolve-CanonicalLongPath -PathValue (Resolve-Path -LiteralPath $wtTarget).Path
         if (-not (Test-Path -LiteralPath (Join-Path $effectiveLane2Repo '.git'))) {
             Write-Warning "Existing directory '$effectiveLane2Repo' does not contain a .git pointer; verify it is a valid Git worktree."
         }
@@ -1279,21 +1493,46 @@ if ($UseGitWorktree) {
                 $ErrorActionPreference = $prevGitPref
                 $global:LASTEXITCODE = 0
             }
-            $effectiveLane2Repo = (Resolve-Path -LiteralPath $wtTarget).Path
+            $effectiveLane2Repo = Resolve-CanonicalLongPath -PathValue (Resolve-Path -LiteralPath $wtTarget).Path
             Write-Host "    Created Lane 2 Git worktree: $effectiveLane2Repo (branch: $Lane2Branch)"
         } else {
-            $effectiveLane2Repo = $wtTarget
+            $effectiveLane2Repo = Resolve-CanonicalLongPath -PathValue $wtTarget
             Write-Host "    [DRY-RUN] Would create Lane 2 Git worktree: $effectiveLane2Repo (branch: $Lane2Branch)"
         }
     }
 }
 
 # ============================================================================
-# Step 5: Prepare Directories for Lane 1, Lane 2, and CLI Wrappers
+# Step 5: Prepare Directories & Initialize Crash-Safe Incremental Rollback Journal
 # ============================================================================
 Write-Step "Preparing directories: $Lane1Home, $Lane2Home, $LocalBin..."
 foreach ($dir in @($Lane1Home, (Join-Path $Lane1Home 'rules'), $Lane2Home, (Join-Path $Lane2Home 'rules'), $LocalBin)) {
     Ensure-Directory $dir
+}
+
+# Initialize .rollback\latest.json BEFORE creating any NTFS Junctions or modifying any files so
+# that even an interrupted mid-install run (Ctrl+C, exception, power loss) can recover cleanly.
+$script:ManifestContext = [PSCustomObject]@{
+    Lane1Home        = $Lane1Home
+    Lane2Home        = $Lane2Home
+    LocalBin         = $LocalBin
+    RepoPath         = $RepoPath
+    Lane2Worktree    = if ($UseGitWorktree) { $effectiveLane2Repo } else { '' }
+    GatewayApiKeyEnv = if ($ConfigureGateway) { $GatewayApiKeyEnv } else { '' }
+}
+$script:RollbackDir = Resolve-CanonicalLongPath -PathValue (Join-Path $Lane2Home '.rollback')
+Assert-NotReparsePoint -PathValue $script:RollbackDir -Label '.rollback directory'
+$snapCandidate = Join-Path $script:RollbackDir "snapshot-$($script:InstallStamp).json"
+$snapSuffix = 1
+while (Test-Path -LiteralPath $snapCandidate) {
+    $snapCandidate = Join-Path $script:RollbackDir "snapshot-$($script:InstallStamp)-$snapSuffix.json"
+    $snapSuffix++
+}
+$script:RollbackSnapPath   = Resolve-CanonicalLongPath -PathValue $snapCandidate
+$script:RollbackLatestPath = Resolve-CanonicalLongPath -PathValue (Join-Path $script:RollbackDir 'latest.json')
+if (-not $script:IsDryRun) {
+    [void][System.IO.Directory]::CreateDirectory($script:RollbackDir)
+    Save-RollbackManifestCheckpoint -Stage 'initialized' -Completed $false
 }
 
 # ============================================================================
@@ -1304,8 +1543,8 @@ foreach ($dir in @($Lane1Home, (Join-Path $Lane1Home 'rules'), $Lane2Home, (Join
 Write-Step 'Linking shared memories, sessions, skills, and plugins via NTFS Junctions...'
 $sharedDirs = @('memories', 'memories_v2', 'sessions', 'archived_sessions', 'skills', 'plugins')
 foreach ($name in $sharedDirs) {
-    $src = Join-Path $Lane1Home $name
-    $dst = Join-Path $Lane2Home $name
+    $src = Resolve-CanonicalLongPath -PathValue (Join-Path $Lane1Home $name)
+    $dst = Resolve-CanonicalLongPath -PathValue (Join-Path $Lane2Home $name)
     if (-not (Test-Path -LiteralPath $src)) {
         if (-not $script:IsDryRun) { [void][System.IO.Directory]::CreateDirectory($src) }
     }
@@ -1313,13 +1552,18 @@ foreach ($name in $sharedDirs) {
         $item = Get-Item -LiteralPath $dst -Force
         if ($item.LinkType -eq 'Junction') {
             $existingTarget = (@($item.Target) | Select-Object -First 1)
-            $normExisting = if ($existingTarget) { ($existingTarget -replace '^\\\?\?\\', '').TrimEnd('\').ToLowerInvariant() } else { '' }
-            $normExpected = $src.TrimEnd('\').ToLowerInvariant()
+            $cleanExisting  = if ($existingTarget) { ($existingTarget -replace '^\\\?\?\\', '') } else { '' }
+            $normExisting   = if ($cleanExisting) { (Resolve-CanonicalLongPath -PathValue $cleanExisting).TrimEnd('\').ToLowerInvariant() } else { '' }
+            $normExpected   = $src.TrimEnd('\').ToLowerInvariant()
             if ($normExisting -and ($normExisting -ne $normExpected)) {
                 Write-Warning "Existing Junction '$dst' points to '$existingTarget' instead of expected '$src'."
             } else {
                 Write-Host "    Already linked: $name -> $existingTarget"
             }
+            if (-not $script:TrackedJunctions.Contains($name)) {
+                $script:TrackedJunctions.Add($name)
+            }
+            Save-RollbackManifestCheckpoint -Stage "junction:$name"
             continue
         }
         # Never delete a pre-existing real directory in Lane 2; move it safely aside with a unique backup name.
@@ -1328,6 +1572,10 @@ foreach ($name in $sharedDirs) {
         Write-Host "    Moved existing directory safely to: $dirBackup" -ForegroundColor DarkGray
     }
     if (-not $script:IsDryRun) { New-Item -ItemType Junction -Path $dst -Target $src | Out-Null }
+    if (-not $script:TrackedJunctions.Contains($name)) {
+        $script:TrackedJunctions.Add($name)
+    }
+    Save-RollbackManifestCheckpoint -Stage "junction:$name"
     Write-Host "    Linked: $dst -> $src"
 }
 
@@ -1341,7 +1589,10 @@ foreach ($homeDir in @($Lane1Home, $Lane2Home)) {
     Assert-NotReparsePoint -PathValue $rulesDir   -Label 'rules directory'
     Assert-NotReparsePoint -PathValue $targetRule -Label 'rules\default.rules'
     Backup-IfExists $targetRule
-    if (-not $script:IsDryRun) { Copy-Item -LiteralPath $rulesTemplate -Destination $targetRule -Force }
+    if (-not $script:IsDryRun) {
+        Copy-Item -LiteralPath $rulesTemplate -Destination $targetRule -Force
+        Save-RollbackManifestCheckpoint -Stage 'write:default.rules'
+    }
     Write-Host "    Installed: $targetRule"
 }
 
@@ -1354,10 +1605,14 @@ $lane2AgentsDst = Join-Path $Lane2Home 'AGENTS.md'
 Assert-NotReparsePoint -PathValue $lane1AgentsDst -Label 'Lane 1 AGENTS.md'
 Assert-NotReparsePoint -PathValue $lane2AgentsDst -Label 'Lane 2 AGENTS.md'
 Backup-IfExists $lane1AgentsDst
-Backup-IfExists $lane2AgentsDst
 if (-not $script:IsDryRun) {
     Copy-Item -LiteralPath $lane1AgentsSrc -Destination $lane1AgentsDst -Force
+    Save-RollbackManifestCheckpoint -Stage 'write:lane1-AGENTS.md'
+}
+Backup-IfExists $lane2AgentsDst
+if (-not $script:IsDryRun) {
     Copy-Item -LiteralPath $lane2AgentsSrc -Destination $lane2AgentsDst -Force
+    Save-RollbackManifestCheckpoint -Stage 'write:lane2-AGENTS.md'
 }
 Write-Host "    Installed: $lane1AgentsDst"
 Write-Host "    Installed: $lane2AgentsDst"
@@ -1370,9 +1625,13 @@ $lane2ConfigPath = Join-Path $Lane2Home 'config.toml'
 Assert-NotReparsePoint -PathValue $lane2ConfigPath -Label 'Lane 2 config.toml'
 $trustedProjects = Get-ExistingTrustedProjects -ConfigPaths @((Join-Path $Lane1Home 'config.toml'), $lane2ConfigPath)
 foreach ($rp in @($RepoPath, $effectiveLane2Repo)) {
-    $alreadyTrusted = @($trustedProjects | Where-Object { $_.Equals($rp, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+    $rpCanon = Resolve-CanonicalLongPath -PathValue $rp
+    $alreadyTrusted = @($trustedProjects | Where-Object {
+        $existingCanon = try { Resolve-CanonicalLongPath -PathValue $_ } catch { $_ }
+        $existingCanon.Equals($rpCanon, [System.StringComparison]::OrdinalIgnoreCase)
+    }).Count -gt 0
     if (-not $alreadyTrusted) {
-        $trustedProjects.Add($rp)
+        $trustedProjects.Add($rpCanon)
     }
 }
 
@@ -1468,6 +1727,7 @@ Backup-IfExists $lane2ConfigPath
 if (-not $script:IsDryRun) {
     Write-Utf8NoBom -FilePath $lane2ConfigPath -Text $mergedLane2Config
     Protect-SensitiveFileAcl $lane2ConfigPath
+    Save-RollbackManifestCheckpoint -Stage 'write:lane2-config.toml'
 }
 Write-Host "    Wrote: $lane2ConfigPath (preserved custom sections & $($trustedProjects.Count) trusted project(s))"
 
@@ -1517,10 +1777,14 @@ if ($ConfigureGateway) {
     Assert-NotReparsePoint -PathValue $lane1ConfigPath  -Label 'Lane 1 config.toml'
     Assert-NotReparsePoint -PathValue $lane1CleanBackup -Label 'Lane 1 config.backup.toml'
     # Preserve one immutable pre-gateway clean backup (only if it does not exist yet).
+    # Track newly created config.backup.toml (ExistedPrior=$false) so rollback removes stray
+    # backups cleanly without ever touching a pre-existing user config.backup.toml.
     if ((Test-Path -LiteralPath $lane1ConfigPath -PathType Leaf) -and -not (Test-Path -LiteralPath $lane1CleanBackup)) {
+        Backup-IfExists $lane1CleanBackup
         if (-not $script:IsDryRun) {
             Copy-Item -LiteralPath $lane1ConfigPath -Destination $lane1CleanBackup -Force
             Protect-SensitiveFileAcl $lane1CleanBackup
+            Save-RollbackManifestCheckpoint -Stage 'write:lane1-config.backup.toml'
         }
         Write-Host "    Saved clean original backup: $lane1CleanBackup"
     }
@@ -1600,6 +1864,7 @@ CODEX_ACTIVE_LANE = "LANE_1"
     if (-not $script:IsDryRun) {
         Write-Utf8NoBom -FilePath $lane1ConfigPath -Text $mergedLane1Config
         Protect-SensitiveFileAcl $lane1ConfigPath
+        Save-RollbackManifestCheckpoint -Stage 'write:lane1-config.toml'
     }
     Write-Host "    Wrote: $lane1ConfigPath (zero plaintext keys; reads from env $GatewayApiKeyEnv)"
 }
@@ -1611,21 +1876,20 @@ Write-Step "Installing codex.cmd, codex-official.cmd, and codex-t3.cmd into $Loc
 
 # For Microsoft Store / MSIX installs, the versioned WindowsApps directory changes after updates;
 # this self-healing fallback re-queries Get-AppxPackage automatically when the cached path disappears.
+# Uses zero-parenthesis goto flow so paths containing '(' or ')' can never trigger cmd.exe syntax errors.
 $windowsAppsRefresh = if ($CodexSource -eq 'WindowsApps') {
 @"
-if not exist "%CODEX_EXE%" (
-    for /f "usebackq delims=" %%I in (``powershell -NoProfile -Command "(Get-AppxPackage OpenAI.Codex | Select-Object -First 1).InstallLocation"``) do (
-        set "CODEX_EXE=%%I\app\resources\codex.exe"
-    )
-)
-"@
+if exist "%CODEX_EXE%" goto :_dl_exe_ready
+for /f "usebackq delims=" %%I in (``powershell -NoProfile -Command "(Get-AppxPackage OpenAI.Codex | Select-Object -First 1).InstallLocation"``) do set "CODEX_EXE=%%I\app\resources\codex.exe"
+:_dl_exe_ready
+"@ + "`r`n"
 } else { '' }
 
 # Switch cmd.exe to UTF-8 codepage (65001) whenever any embedded path contains non-ASCII/Unicode characters.
 $needsUtf8Codepage = ($Lane1Home -match '[^\x00-\x7F]') -or ($Lane2Home -match '[^\x00-\x7F]') -or ($CargoTargetDir -match '[^\x00-\x7F]') -or ($CodexExe -match '[^\x00-\x7F]') -or ($RepoPath -match '[^\x00-\x7F]') -or ($effectiveLane2Repo -match '[^\x00-\x7F]')
 $utf8Header = if ($needsUtf8Codepage) { "chcp 65001 >nul`r`n" } else { '' }
 
-# Escape '%' -> '%%' and reject quotes/newlines before embedding paths into .cmd files.
+# Escape '%' -> '%%' and reject quotes/newlines before embedding canonical long paths into .cmd files.
 $cmdLane1Home = Escape-CmdSetValue -Value $Lane1Home          -Label 'Lane1Home'
 $cmdLane2Home = Escape-CmdSetValue -Value $Lane2Home          -Label 'Lane2Home'
 $cmdCargoDir  = Escape-CmdSetValue -Value $CargoTargetDir     -Label 'CargoTargetDir'
@@ -1633,26 +1897,49 @@ $cmdCodexExe  = Escape-CmdSetValue -Value $CodexExe           -Label 'CodexExe'
 $cmdRepoPath  = Escape-CmdSetValue -Value $RepoPath           -Label 'RepoPath'
 $cmdLane2Repo = Escape-CmdSetValue -Value $effectiveLane2Repo -Label 'Lane2WorktreePath'
 
-# When -UseGitWorktree is enabled, enforce OS workspace-write isolation using zero-parenthesis
-# batch labels (safe with spaces, '&', '(', ')', '!', '%', and Unicode):
-#   Guard 1: If launched from PrimaryRepo root OR ANY nested subdirectory (`PrimaryRepo\src\...`),
-#            automatically switch cwd to the matching worktree subdirectory (or worktree root).
-#   Guard 2: Scan CLI flags (before `--`) for `-C`, `--cd`, or `--add-dir` pointing inside
-#            PrimaryRepo and fail closed instead of letting Codex target PrimaryRepo directly.
+# When -UseGitWorktree is enabled, enforce a HARD FAIL-CLOSED OS workspace-write boundary using
+# zero-parenthesis batch labels (safe with spaces, '&', '(', ')', '!', '%', Unicode, and 8.3 short paths):
+#   Canonicalization: Computes %%~fs short-path equivalents (_DL_PRIMARY_SHORT, _DL_WT_SHORT) at
+#            runtime alongside the canonical long paths embedded by Resolve-CanonicalLongPath so
+#            8.3 short aliases (e.g. RUNNER~1 / PROGRA~1) always match their long names consistently.
+#   Guard 1: Unless CODEX_NO_AUTO_WORKTREE_CD is defined:
+#            - If %CODEX_LANE2_WORKTREE%\ is missing/deleted/not a directory, REFUSE TO RUN (exit 1)
+#              rather than silently falling back to the primary repo.
+#            - If launched from PrimaryRepo root or any nested subdirectory, switch cwd to the
+#              matching worktree subdirectory (or worktree root), check `if errorlevel 1` on `cd /d`,
+#              AND verify post-`cd` that %CD% actually switched inside %CODEX_LANE2_WORKTREE%.
+#            When CODEX_NO_AUTO_WORKTREE_CD IS defined: skips auto-cd ONLY; NEVER skips Guard 2.
+#   Guard 2: ALWAYS scans CLI flags (before `--`) for `-C`, `-C=`, attached `-C<path>`, `--cd`,
+#            `--cd=`, `--add-dir`, and `--add-dir=` targeting PrimaryRepo (long or 8.3 short path)
+#            and fails closed (exit 1). Strips embedded quotes safely without breaking cmd.exe parsing.
 $worktreeCdBlock = if ($UseGitWorktree -and ($effectiveLane2Repo -ne $RepoPath)) {
 @"
 set "CODEX_PRIMARY_REPO=$cmdRepoPath"
 set "CODEX_LANE2_WORKTREE=$cmdLane2Repo"
+set "_DL_PRIMARY_SHORT="
+for %%R in ("%CODEX_PRIMARY_REPO%") do set "_DL_PRIMARY_SHORT=%%~fsR"
+if "%_DL_PRIMARY_SHORT%"=="" set "_DL_PRIMARY_SHORT=%CODEX_PRIMARY_REPO%"
+if "%_DL_PRIMARY_SHORT:~-1%"=="\" if not "%_DL_PRIMARY_SHORT:~-2%"==":\" set "_DL_PRIMARY_SHORT=%_DL_PRIMARY_SHORT:~0,-1%"
+set "_DL_WT_SHORT="
+for %%W in ("%CODEX_LANE2_WORKTREE%") do set "_DL_WT_SHORT=%%~fsW"
+if "%_DL_WT_SHORT%"=="" set "_DL_WT_SHORT=%CODEX_LANE2_WORKTREE%"
+if "%_DL_WT_SHORT:~-1%"=="\" if not "%_DL_WT_SHORT:~-2%"==":\" set "_DL_WT_SHORT=%_DL_WT_SHORT:~0,-1%"
 
-rem === Guard 1: Auto worktree cwd switch ===
-rem (Disabled when CODEX_NO_AUTO_WORKTREE_CD is defined, or if the worktree directory is missing)
+rem === Guard 1: Mandatory fail-closed worktree boundary & auto cwd switch ===
+rem (CODEX_NO_AUTO_WORKTREE_CD skips auto-cd ONLY; Guard 2 still runs fail-closed)
 if defined CODEX_NO_AUTO_WORKTREE_CD goto :_dl_wt_scan_args
-if not exist "%CODEX_LANE2_WORKTREE%\" goto :_dl_wt_scan_args
+if not exist "%CODEX_LANE2_WORKTREE%\" goto :_dl_wt_missing
 set "_DL_CUR=%CD%"
 if "%_DL_CUR:~-1%"=="\" if not "%_DL_CUR:~-2%"==":\" set "_DL_CUR=%_DL_CUR:~0,-1%"
 set "_DL_REL="
 :_dl_wt_loop
 if /I "%_DL_CUR%"=="%CODEX_PRIMARY_REPO%" goto :_dl_wt_hit
+set "_DL_CUR_S="
+for %%S in ("%_DL_CUR%") do set "_DL_CUR_S=%%~fsS"
+if "%_DL_CUR_S%"=="" goto :_dl_wt_step
+if "%_DL_CUR_S:~-1%"=="\" if not "%_DL_CUR_S:~-2%"==":\" set "_DL_CUR_S=%_DL_CUR_S:~0,-1%"
+if /I "%_DL_CUR_S%"=="%_DL_PRIMARY_SHORT%" goto :_dl_wt_hit
+:_dl_wt_step
 for %%A in ("%_DL_CUR%") do set "_DL_PAR=%%~dpA" & set "_DL_LEAF=%%~nxA"
 if "%_DL_LEAF%"=="" goto :_dl_wt_scan_args
 if "%_DL_PAR:~-2%"==":\" goto :_dl_wt_scan_args
@@ -1667,27 +1954,66 @@ goto :_dl_wt_loop
 if "%_DL_REL%"=="" goto :_dl_wt_root
 if not exist "%CODEX_LANE2_WORKTREE%\%_DL_REL%\" goto :_dl_wt_root
 cd /d "%CODEX_LANE2_WORKTREE%\%_DL_REL%"
-goto :_dl_wt_scan_args
+if errorlevel 1 goto :_dl_wt_cd_fail
+goto :_dl_wt_verify_cd
 :_dl_wt_root
 cd /d "%CODEX_LANE2_WORKTREE%"
+if errorlevel 1 goto :_dl_wt_cd_fail
+:_dl_wt_verify_cd
+set "_DL_POST=%CD%"
+if "%_DL_POST:~-1%"=="\" if not "%_DL_POST:~-2%"==":\" set "_DL_POST=%_DL_POST:~0,-1%"
+:_dl_wt_verify_loop
+if /I "%_DL_POST%"=="%CODEX_LANE2_WORKTREE%" goto :_dl_wt_scan_args
+set "_DL_POST_S="
+for %%S in ("%_DL_POST%") do set "_DL_POST_S=%%~fsS"
+if "%_DL_POST_S%"=="" goto :_dl_wt_verify_step
+if "%_DL_POST_S:~-1%"=="\" if not "%_DL_POST_S:~-2%"==":\" set "_DL_POST_S=%_DL_POST_S:~0,-1%"
+if /I "%_DL_POST_S%"=="%_DL_WT_SHORT%" goto :_dl_wt_scan_args
+:_dl_wt_verify_step
+for %%A in ("%_DL_POST%") do set "_DL_VPAR=%%~dpA" & set "_DL_VLEAF=%%~nxA"
+if "%_DL_VLEAF%"=="" goto :_dl_wt_cd_fail
+if "%_DL_VPAR:~-2%"==":\" goto :_dl_wt_cd_fail
+set "_DL_POST=%_DL_VPAR:~0,-1%"
+goto :_dl_wt_verify_loop
+:_dl_wt_missing
+echo [FAIL] Lane 2 worktree "%CODEX_LANE2_WORKTREE%" is missing or inaccessible. Refusing to fall back to primary repo "%CODEX_PRIMARY_REPO%". Recreate it via setup-dual-lane.ps1 -UseGitWorktree, or set CODEX_NO_AUTO_WORKTREE_CD=1 to opt out of auto-cd. >&2
+exit /b 1
+:_dl_wt_cd_fail
+echo [FAIL] Lane 2 worktree isolation failed to switch working directory into "%CODEX_LANE2_WORKTREE%". Refusing to remain in primary repo "%CODEX_PRIMARY_REPO%". >&2
+exit /b 1
 
 rem === Guard 2: Argument scan & primary repo blocking ===
-rem (ALWAYS executes, even if CODEX_NO_AUTO_WORKTREE_CD is set or worktree is deleted)
+rem (ALWAYS executes, even if CODEX_NO_AUTO_WORKTREE_CD is defined)
 :_dl_wt_scan_args
-if "%~1"=="" goto :_dl_wt_done
-set "_DL_A=%~1"
+set "_DL_A="
+set _DL_A=%1
+if not defined _DL_A goto :_dl_wt_done
+set "_DL_A=%_DL_A:"=%"
+if not defined _DL_A goto :_dl_wt_skip_arg
 if "%_DL_A%"=="--" goto :_dl_wt_done
 if "%_DL_A%"=="-C" goto :_dl_chk_next
 if "%_DL_A%"=="--cd" goto :_dl_chk_next
 if "%_DL_A%"=="--add-dir" goto :_dl_chk_next
+if "%_DL_A:~0,3%"=="-C=" goto :_dl_chk_eq3
+if "%_DL_A:~0,2%"=="-C" goto :_dl_chk_c2
 if /I "%_DL_A:~0,5%"=="--cd=" goto :_dl_chk_eq5
 if /I "%_DL_A:~0,10%"=="--add-dir=" goto :_dl_chk_eq10
+:_dl_wt_skip_arg
 shift
 goto :_dl_wt_scan_args
 :_dl_chk_next
-if "%~2"=="" goto :_dl_wt_done
-set "_DL_CAND=%~2"
+set "_DL_CAND="
+set _DL_CAND=%2
+if not defined _DL_CAND goto :_dl_wt_done
 shift
+shift
+goto :_dl_chk_path
+:_dl_chk_eq3
+set "_DL_CAND=%_DL_A:~3%"
+shift
+goto :_dl_chk_path
+:_dl_chk_c2
+set "_DL_CAND=%_DL_A:~2%"
 shift
 goto :_dl_chk_path
 :_dl_chk_eq5
@@ -1698,13 +2024,21 @@ goto :_dl_chk_path
 set "_DL_CAND=%_DL_A:~10%"
 shift
 :_dl_chk_path
-if "%_DL_CAND%"=="" goto :_dl_wt_scan_args
+if not defined _DL_CAND goto :_dl_wt_scan_args
+set "_DL_CAND=%_DL_CAND:"=%"
+if not defined _DL_CAND goto :_dl_wt_scan_args
 set "_DL_ABS="
 for %%P in ("%_DL_CAND%") do set "_DL_ABS=%%~fP"
 if "%_DL_ABS%"=="" goto :_dl_wt_scan_args
 if "%_DL_ABS:~-1%"=="\" if not "%_DL_ABS:~-2%"==":\" set "_DL_ABS=%_DL_ABS:~0,-1%"
 :_dl_cand_loop
 if /I "%_DL_ABS%"=="%CODEX_PRIMARY_REPO%" goto :_dl_block_primary
+set "_DL_ABS_S="
+for %%S in ("%_DL_ABS%") do set "_DL_ABS_S=%%~fsS"
+if "%_DL_ABS_S%"=="" goto :_dl_cand_step
+if "%_DL_ABS_S:~-1%"=="\" if not "%_DL_ABS_S:~-2%"==":\" set "_DL_ABS_S=%_DL_ABS_S:~0,-1%"
+if /I "%_DL_ABS_S%"=="%_DL_PRIMARY_SHORT%" goto :_dl_block_primary
+:_dl_cand_step
 for %%A in ("%_DL_ABS%") do set "_DL_CPAR=%%~dpA" & set "_DL_CLEAF=%%~nxA"
 if "%_DL_CLEAF%"=="" goto :_dl_wt_scan_args
 if "%_DL_CPAR:~-2%"==":\" goto :_dl_wt_scan_args
@@ -1714,7 +2048,7 @@ goto :_dl_cand_loop
 echo [FAIL] Lane 2 worktree isolation blocked -C/--cd/--add-dir targeting primary repo "%CODEX_PRIMARY_REPO%". Use "%CODEX_LANE2_WORKTREE%" instead. >&2
 exit /b 1
 :_dl_wt_done
-"@
+"@ + "`r`n"
 } else { '' }
 
 # WHY direct `"%CODEX_EXE%" %*` (without `call`) is used for both .exe and .cmd/.bat targets:
@@ -1728,11 +2062,10 @@ ${utf8Header}set "CODEX_HOME=$cmdLane2Home"
 set "CODEX_ACTIVE_LANE=LANE_2"
 set "CARGO_TARGET_DIR=$cmdCargoDir"
 set "CODEX_EXE=$cmdCodexExe"
-$worktreeCdBlock$windowsAppsRefresh
-if not exist "%CODEX_EXE%" (
-    echo [ERROR] Codex binary not found at "%CODEX_EXE%". Re-run setup-dual-lane.ps1. >&2
-    exit /b 1
-)
+${worktreeCdBlock}${windowsAppsRefresh}if exist "%CODEX_EXE%" goto :_dl_exec_codex
+echo [ERROR] Codex binary not found at "%CODEX_EXE%". Re-run setup-dual-lane.ps1. >&2
+exit /b 1
+:_dl_exec_codex
 "%CODEX_EXE%" %*
 exit /b %ERRORLEVEL%
 "@
@@ -1743,27 +2076,36 @@ setlocal
 ${utf8Header}set "CODEX_HOME=$cmdLane1Home"
 set "CODEX_ACTIVE_LANE=LANE_1"
 set "CODEX_EXE=$cmdCodexExe"
-$windowsAppsRefresh
-if not exist "%CODEX_EXE%" (
-    echo [ERROR] Codex binary not found at "%CODEX_EXE%". Re-run setup-dual-lane.ps1. >&2
-    exit /b 1
-)
+${windowsAppsRefresh}if exist "%CODEX_EXE%" goto :_dl_exec_codex
+echo [ERROR] Codex binary not found at "%CODEX_EXE%". Re-run setup-dual-lane.ps1. >&2
+exit /b 1
+:_dl_exec_codex
 "%CODEX_EXE%" %*
 exit /b %ERRORLEVEL%
 "@
 
-# Back up any pre-existing launcher in LocalBin BEFORE writing so restore-original.ps1
-# restores pre-existing user launchers with SHA-256 verification instead of deleting them.
-foreach ($wrapperName in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd')) {
-    $wrapperFullPath = Join-Path $LocalBin $wrapperName
-    Assert-NotReparsePoint -PathValue $wrapperFullPath -Label "Launcher $wrapperName"
-    Backup-IfExists $wrapperFullPath
-}
+# Enforce strict CRLF line endings on generated .cmd wrappers so cmd.exe goto labels never corrupt.
+$officialWrapper = ($officialWrapper -replace "\r?\n", "`r`n").TrimEnd("`r", "`n") + "`r`n"
+$t3Wrapper       = ($t3Wrapper       -replace "\r?\n", "`r`n").TrimEnd("`r", "`n") + "`r`n"
 
-if (-not $script:IsDryRun) {
-    Write-Utf8NoBom -FilePath (Join-Path $LocalBin 'codex.cmd')          -Text $officialWrapper
-    Write-Utf8NoBom -FilePath (Join-Path $LocalBin 'codex-official.cmd') -Text $officialWrapper
-    Write-Utf8NoBom -FilePath (Join-Path $LocalBin 'codex-t3.cmd')       -Text $t3Wrapper
+# Back up, write, and checkpoint each launcher individually so even an interruption mid-Step 11
+# preserves pre-existing user launchers and tracks every newly written wrapper cleanly.
+$wrapperSpecs = @(
+    @{ Name = 'codex.cmd';          Content = $officialWrapper },
+    @{ Name = 'codex-official.cmd'; Content = $officialWrapper },
+    @{ Name = 'codex-t3.cmd';       Content = $t3Wrapper }
+)
+foreach ($spec in $wrapperSpecs) {
+    $wrapperFullPath = Resolve-CanonicalLongPath -PathValue (Join-Path $LocalBin $spec.Name)
+    Assert-NotReparsePoint -PathValue $wrapperFullPath -Label "Launcher $($spec.Name)"
+    Backup-IfExists $wrapperFullPath
+    if (-not $script:IsDryRun) {
+        Write-Utf8NoBom -FilePath $wrapperFullPath -Text $spec.Content
+        if (-not $script:InstalledWrappers.Contains($wrapperFullPath)) {
+            $script:InstalledWrappers.Add($wrapperFullPath)
+        }
+        Save-RollbackManifestCheckpoint -Stage "wrapper:$($spec.Name)"
+    }
 }
 Write-Host "    Installed wrappers in: $LocalBin"
 
@@ -1775,9 +2117,15 @@ if (-not $SkipPathUpdate) {
         $pathEntries = @($userPath -split ';' | Where-Object { $_ -and $_.Trim() -ne '' })
     }
     $normLocalBin = $LocalBin.TrimEnd('\').ToLowerInvariant()
-    $firstIsLocalBin = ($pathEntries.Count -gt 0) -and ($pathEntries[0].TrimEnd('\').ToLowerInvariant() -eq $normLocalBin)
+    $firstCanon = if ($pathEntries.Count -gt 0) {
+        try { (Resolve-CanonicalLongPath -PathValue $pathEntries[0]).TrimEnd('\').ToLowerInvariant() } catch { $pathEntries[0].TrimEnd('\').ToLowerInvariant() }
+    } else { '' }
+    $firstIsLocalBin = ($pathEntries.Count -gt 0) -and ($firstCanon -eq $normLocalBin)
     if (-not $firstIsLocalBin) {
-        $filtered = @($pathEntries | Where-Object { $_.TrimEnd('\').ToLowerInvariant() -ne $normLocalBin })
+        $filtered = @($pathEntries | Where-Object {
+            $entryCanon = try { (Resolve-CanonicalLongPath -PathValue $_).TrimEnd('\').ToLowerInvariant() } catch { $_.TrimEnd('\').ToLowerInvariant() }
+            $entryCanon -ne $normLocalBin
+        })
         $newPath = (@($LocalBin) + $filtered) -join ';'
         if (-not $script:IsDryRun) {
             [System.Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
@@ -1813,38 +2161,12 @@ if ($InstallBridgeTemplate) {
 }
 
 # ============================================================================
-# Step 13: Save Deterministic Rollback Manifest & Finalize NTFS ACL Lockdown
+# Step 13: Finalize Rollback Manifest & NTFS ACL Lockdown
 # ============================================================================
-# WHY: Persist the SHA-256 rollback manifest BEFORE optional post-steps (SyncSessions / smoke check)
-# so the user always has a complete rollback record even if an optional post-step emits a warning.
-$rollbackDir = Join-Path $Lane2Home '.rollback'
-Assert-NotReparsePoint -PathValue $rollbackDir -Label '.rollback directory'
+# WHY: Mark the incrementally persisted rollback journal Completed=$true BEFORE optional post-steps
+# (SyncSessions / smoke check) and run a final NTFS ACL lockdown sweep across all sensitive files.
 if (-not $script:IsDryRun) {
-    [void][System.IO.Directory]::CreateDirectory($rollbackDir)
-
-    $manifestObj = [PSCustomObject]@{
-        SchemaVersion    = 1
-        Timestamp        = $script:InstallStamp
-        CreatedAtUtc     = (Get-Date).ToUniversalTime().ToString('o')
-        Lane1Home        = $Lane1Home
-        Lane2Home        = $Lane2Home
-        LocalBin         = $LocalBin
-        RepoPath         = $RepoPath
-        Lane2Worktree    = if ($UseGitWorktree) { $effectiveLane2Repo } else { '' }
-        GatewayApiKeyEnv = if ($ConfigureGateway) { $GatewayApiKeyEnv } else { '' }
-        SharedJunctions  = $sharedDirs
-        Wrappers         = @(
-            (Join-Path $LocalBin 'codex.cmd'),
-            (Join-Path $LocalBin 'codex-official.cmd'),
-            (Join-Path $LocalBin 'codex-t3.cmd')
-        )
-        Files            = @($script:SnapshotEntries.ToArray())
-    }
-    $manifestJson = $manifestObj | ConvertTo-Json -Depth 6
-    $snapPath   = Join-Path $rollbackDir "snapshot-$($script:InstallStamp).json"
-    $latestPath = Join-Path $rollbackDir 'latest.json'
-    Write-Utf8NoBom -FilePath $snapPath   -Text $manifestJson
-    Write-Utf8NoBom -FilePath $latestPath -Text $manifestJson
+    Save-RollbackManifestCheckpoint -Stage 'complete' -Completed $true
 
     # Apply two-step NTFS ACL hardening across all sensitive credential, config, and manifest files.
     foreach ($secFile in @(
@@ -1853,12 +2175,12 @@ if (-not $script:IsDryRun) {
         (Join-Path $Lane1Home 'config.backup.toml'),
         (Join-Path $Lane2Home 'auth.json'),
         (Join-Path $Lane2Home 'config.toml'),
-        $snapPath,
-        $latestPath
+        $script:RollbackSnapPath,
+        $script:RollbackLatestPath
     )) {
         Protect-SensitiveFileAcl $secFile
     }
-    Write-Host "    Rollback manifest saved & NTFS sandbox ACLs locked: $latestPath" -ForegroundColor DarkGray
+    Write-Host "    Rollback manifest finalized & NTFS sandbox ACLs locked: $($script:RollbackLatestPath)" -ForegroundColor DarkGray
 }
 
 # ============================================================================

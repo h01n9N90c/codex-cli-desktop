@@ -15,17 +15,20 @@
 #        - Starlark AST & core policy check on templates/default.rules
 #        - Python syntax compilation (py_compile)
 #   2. test-windows (windows-latest):
-#        - Full tests/test-kit.ps1 under Windows PowerShell 5.1 AND PowerShell 7+
+#        - Full 10-stage tests/test-kit.ps1 under Windows PowerShell 5.1 AND PowerShell 7+
 #        - Covers AST parse, Python unittest, default.rules, -DryRun/-WhatIf,
 #          non-destructive TOML merge, env_key secret isolation, Protect-SensitiveFileAcl,
-#          doctor.ps1 zero-leakage/bypass checks, path-traversal rejection, and
-#          SHA-256 rollback inside paths containing spaces and '&'.
+#          8.3 short-path canonicalization, hard fail-closed worktree isolation,
+#          doctor.ps1 zero-leakage/bypass checks, path-traversal rejection,
+#          SHA-256 rollback, interrupted mid-install recovery, and 3x install/rollback loop.
 #   3. test-unix (ubuntu-latest & macos-latest):
 #        - bash -n syntax validation on all scripts/*.sh
 #        - py_compile + python3 -B -m unittest discover -s ./tests -v
 #        - Portable end-to-end smoke test (paths with spaces, --dry-run zero-mutation,
-#          TOML merge preservation, 0600 permissions, doctor.sh zero-secret-leakage,
-#          tampered path-traversal manifest rejection, and SHA-256 rollback).
+#          TOML merge preservation, 0600 permissions, hard fail-closed worktree routing
+#          & failed-cd/missing-worktree refusal, doctor.sh zero-secret-leakage,
+#          tampered path-traversal/SUID manifest rejection, SHA-256 + POSIX mode rollback,
+#          interrupted mid-install rollback recovery, and 3x install/rollback loop).
 # ==============================================================================
 name: CI
 
@@ -129,7 +132,7 @@ jobs:
           home_path_re = re.compile(r"(?:[A-Za-z]:\\+Users\\+|/Users/|/home/)([A-Za-z0-9._-]+)")
           allowed_usernames = {
               "user", "username", "yourname", "youruser", "your-user", "your_user",
-              "you", "alice", "bob", "example", "runner", "dev", "me",
+              "you", "alice", "bob", "example", "runner", "runneradmin", "dev", "me",
           }
 
           findings = []
@@ -160,10 +163,11 @@ jobs:
       - name: Validate templates/default.rules AST & compile Python scripts
         run: |
           python3 -B - <<'PY'
-          import ast, pathlib, py_compile
+          import ast, pathlib, py_compile, tempfile
 
-          py_compile.compile("scripts/sync-sessions.py", doraise=True)
-          py_compile.compile("tests/test_sync_sessions.py", doraise=True)
+          with tempfile.TemporaryDirectory() as td:
+              py_compile.compile("scripts/sync-sessions.py", cfile=str(pathlib.Path(td) / "sync_sessions.pyc"), doraise=True)
+              py_compile.compile("tests/test_sync_sessions.py", cfile=str(pathlib.Path(td) / "test_sync_sessions.pyc"), doraise=True)
 
           rules_path = pathlib.Path("templates/default.rules")
           tree = ast.parse(rules_path.read_text(encoding="utf-8"), filename=str(rules_path))
@@ -202,14 +206,14 @@ jobs:
         run: |
           python -B -m py_compile .\scripts\sync-sessions.py .\tests\test_sync_sessions.py
 
-      # WHAT: Runs full 8-stage test-kit.ps1 under Windows PowerShell 5.1 (default OS shell).
-      # PREVENTS: PS 5.1 strict-mode, BOM, encoding, ACL, TOML, or rollback regressions.
+      # WHAT: Runs full 10-stage test-kit.ps1 under Windows PowerShell 5.1 (default OS shell).
+      # PREVENTS: PS 5.1 strict-mode, BOM, encoding, 8.3 short-path, ACL, TOML, worktree, or rollback regressions.
       - name: Run Full Security & Rollback Test Suite (Windows PowerShell 5.1)
         shell: powershell
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1
 
-      # WHAT: Re-runs full 8-stage test-kit.ps1 under PowerShell 7+ (pwsh).
+      # WHAT: Re-runs full 10-stage test-kit.ps1 under PowerShell 7+ (pwsh).
       # PREVENTS: Cross-version PowerShell 7 incompatibilities.
       - name: Run Full Security & Rollback Test Suite (PowerShell 7+)
         shell: pwsh
@@ -242,11 +246,15 @@ jobs:
 
       # WHAT: End-to-end safety smoke test on both Linux and macOS inside a path with spaces:
       #       --dry-run zero-mutation, non-destructive TOML merge (top-level + sections),
-      #       0600 permissions, doctor.sh zero-secret-leakage, tampered traversal manifest
-      #       rejection, restore --dry-run, and SHA-256 verified rollback.
+      #       0600 permissions, hard fail-closed worktree routing (deleted worktree &
+      #       failed cd refusal, CODEX_NO_AUTO_WORKTREE_CD=1 opt-out with -C/--cd/--add-dir
+      #       still blocked), doctor.sh zero-secret-leakage, tampered traversal/SUID manifest
+      #       rejection, restore --dry-run, SHA-256 + exact POSIX mode rollback, interrupted
+      #       mid-install recovery, and 3x repeated install/rollback loop.
       # PREVENTS: Linux/macOS portability bugs (GNU vs BSD stat/sed/shasum/mktemp),
-      #           symlink traversal escapes, permission regressions, and Lane 1 data loss.
-      - name: Run Unix installer, doctor, traversal defense & SHA-256 rollback smoke test
+      #           silent primary-repo fallback, symlink traversal escapes, permission
+      #           regressions, partial-install corruption, and Lane 1 data loss.
+      - name: Run Unix installer, fail-closed worktree, interrupted rollback & 3x loop smoke test
         shell: bash
         run: |
           set -euo pipefail
@@ -259,7 +267,11 @@ jobs:
           }
 
           TMP_ROOT="$(mktemp -d 2>/dev/null || mktemp -d -t codex-kit-ci)"
-          trap 'rm -rf "${TMP_ROOT}"' EXIT
+          cleanup_tmp() {
+            chmod -R u+rwx "${TMP_ROOT}" 2>/dev/null || true
+            rm -rf "${TMP_ROOT}"
+          }
+          trap cleanup_tmp EXIT
 
           WORK_DIR="${TMP_ROOT}/my workspace"
           REPO_DIR="${WORK_DIR}/my repo"
@@ -268,6 +280,7 @@ jobs:
           LANE2="${WORK_DIR}/lane2"
           LOCAL_BIN="${WORK_DIR}/local bin"
           OUTSIDE_VICTIM="${TMP_ROOT}/outside_victim.txt"
+          EXEC_SENTINEL="${TMP_ROOT}/fake-codex-executed.flag"
 
           mkdir -p "${REPO_DIR}/src/sub dir" "${FAKE_BIN}" "${LANE1}/sessions" "${LANE2}" "${LOCAL_BIN}"
           git -C "${REPO_DIR}" init -q
@@ -288,6 +301,9 @@ jobs:
 
           cat > "${FAKE_BIN}/codex" <<'EOF'
           #!/usr/bin/env bash
+          if [ -n "${CODEX_TEST_SENTINEL:-}" ]; then
+            printf 'RAN:%s\n' "$*" >> "${CODEX_TEST_SENTINEL}"
+          fi
           if [ "${1:-}" = "--version" ]; then echo "codex-cli 0.171.0-ci"; exit 0; fi
           if [ "${1:-}" = "features" ]; then echo "memories stable true"; exit 0; fi
           if [ "${1:-}" = "execpolicy" ]; then echo '{"decision":"forbidden"}'; exit 0; fi
@@ -310,7 +326,7 @@ jobs:
           printf '{"auth_mode":"chatgpt","token":"%s"}\n' "${SECRET_CANARY}" > "${LANE2}/auth.json"
           chmod 600 "${LANE2}/auth.json"
 
-          # 1) --dry-run must perform zero disk mutations.
+          # 1) --dry-run must perform zero disk mutations (including zero .rollback journal creation).
           PATH="${FAKE_BIN}:${PATH}" \
           CODEX_LANE1_HOME="${LANE1}" \
           CODEX_LANE2_HOME="${LANE2}" \
@@ -320,9 +336,10 @@ jobs:
           [ ! -e "${LOCAL_BIN}/codex" ]
           [ ! -L "${LANE2}/sessions" ]
           [ ! -d "${REPO_DIR}-lane2" ]
+          [ ! -e "${LANE2}/.rollback" ]
 
           # 2) Full install with --use-git-worktree preserves top-level keys & custom sections,
-          #    enforces 0600 while live, creates 5-col manifest, and routes subdirs + blocks -C primary.
+          #    enforces 0600 while live, creates complete 5-col manifest, and routes subdirs + blocks -C primary.
           PATH="${FAKE_BIN}:${PATH}" \
           CODEX_LANE1_HOME="${LANE1}" \
           CODEX_LANE2_HOME="${LANE2}" \
@@ -334,42 +351,106 @@ jobs:
           grep -q 'model = "custom-ci-model"' "${LANE2}/config.toml"
           grep -q '\[mcp_servers\.custom_ci\]' "${LANE2}/config.toml"
           [ -f "${LANE2}/.rollback/latest.tsv" ]
+          grep -q '^# status=complete$' "${LANE2}/.rollback/latest.tsv"
           python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600' "${LANE2}/config.toml"
 
-          # Verify nested subdirectory switches to matching worktree subdirectory & -C/--cd/--add-dir fails closed.
+          # Verify nested subdirectory switches to matching worktree subdirectory & -C/--cd/--add-dir fails closed
+          # WITHOUT executing fake codex.
           WT_SUB_CWD="$(cd "${REPO_DIR}/src/sub dir" && "${LOCAL_BIN}/codex" pwd-check)"
           case "${WT_SUB_CWD}" in
             *-lane2/src/sub\ dir) ;;
             *) echo "[FAIL] Expected worktree subdir, got ${WT_SUB_CWD}" >&2; exit 1 ;;
           esac
-          if "${LOCAL_BIN}/codex" -C "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
+          rm -f "${EXEC_SENTINEL}"
+          if CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" -C "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
             echo "[FAIL] Unix wrapper failed to block -C targeting primary repo!" >&2; exit 1
           fi
-          if "${LOCAL_BIN}/codex" --cd="${REPO_DIR}/src/sub dir" pwd-check >/dev/null 2>&1; then
+          if CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" --cd="${REPO_DIR}/src/sub dir" pwd-check >/dev/null 2>&1; then
             echo "[FAIL] Unix wrapper failed to block --cd= targeting primary subdir!" >&2; exit 1
           fi
+          if CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" --add-dir "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
+            echo "[FAIL] Unix wrapper failed to block --add-dir targeting primary repo!" >&2; exit 1
+          fi
+          if CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" "-C${REPO_DIR}" pwd-check >/dev/null 2>&1; then
+            echo "[FAIL] Unix wrapper failed to block attached -C<primary> targeting primary repo!" >&2; exit 1
+          fi
+          [ ! -e "${EXEC_SENTINEL}" ] || { echo "[FAIL] Blocked -C/--cd/--add-dir still executed fake codex!" >&2; exit 1; }
 
-          # Regression: CODEX_NO_AUTO_WORKTREE_CD=1 leaves cwd in primary repo but argument check still blocks -C.
+          # Regression: CODEX_NO_AUTO_WORKTREE_CD=1 skips auto-cd, STILL blocks -C/--cd/--add-dir fail-closed.
           NO_AUTO_CWD="$(cd "${REPO_DIR}/src/sub dir" && CODEX_NO_AUTO_WORKTREE_CD=1 "${LOCAL_BIN}/codex" pwd-check)"
           case "${NO_AUTO_CWD}" in
             */my\ repo/src/sub\ dir) ;;
             *) echo "[FAIL] Expected primary repo subdir with CODEX_NO_AUTO_WORKTREE_CD=1, got ${NO_AUTO_CWD}" >&2; exit 1 ;;
           esac
-          if CODEX_NO_AUTO_WORKTREE_CD=1 "${LOCAL_BIN}/codex" -C "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
+          rm -f "${EXEC_SENTINEL}"
+          if CODEX_NO_AUTO_WORKTREE_CD=1 CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" -C "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
             echo "[FAIL] CODEX_NO_AUTO_WORKTREE_CD=1 must NOT bypass -C argument block!" >&2; exit 1
           fi
-
-          # Regression: Missing/deleted worktree directory leaves cwd in primary repo but argument check still blocks -C.
-          mv "${REPO_DIR}-lane2" "${REPO_DIR}-lane2-bak"
-          MISSING_WT_CWD="$(cd "${REPO_DIR}/src/sub dir" && "${LOCAL_BIN}/codex" pwd-check)"
-          case "${MISSING_WT_CWD}" in
-            */my\ repo/src/sub\ dir) ;;
-            *) echo "[FAIL] Expected primary repo subdir with deleted worktree, got ${MISSING_WT_CWD}" >&2; exit 1 ;;
-          esac
-          if "${LOCAL_BIN}/codex" -C "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
-            echo "[FAIL] Missing worktree directory must NOT bypass -C argument block!" >&2; exit 1
+          if CODEX_NO_AUTO_WORKTREE_CD=1 CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" --cd="${REPO_DIR}/src/sub dir" pwd-check >/dev/null 2>&1; then
+            echo "[FAIL] CODEX_NO_AUTO_WORKTREE_CD=1 must NOT bypass --cd= argument block!" >&2; exit 1
           fi
+          if CODEX_NO_AUTO_WORKTREE_CD=1 CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" --add-dir "${REPO_DIR}" pwd-check >/dev/null 2>&1; then
+            echo "[FAIL] CODEX_NO_AUTO_WORKTREE_CD=1 must NOT bypass --add-dir argument block!" >&2; exit 1
+          fi
+          [ ! -e "${EXEC_SENTINEL}" ] || { echo "[FAIL] CODEX_NO_AUTO_WORKTREE_CD=1 executed fake codex on blocked arg!" >&2; exit 1; }
+
+          # Hard Fail-Closed Worktree Regression A: Missing/deleted worktree (WITHOUT CODEX_NO_AUTO_WORKTREE_CD)
+          # MUST FAIL CLOSED (rc != 0, error explains refusal to fall back to primary repo, fake codex NOT executed!).
+          mv "${REPO_DIR}-lane2" "${REPO_DIR}-lane2-bak"
+          rm -f "${EXEC_SENTINEL}"
+          set +e
+          MISSING_WT_ERR="$(cd "${REPO_DIR}/src/sub dir" && CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" pwd-check 2>&1)"
+          MISSING_WT_RC=$?
+          set -e
+          if [ "${MISSING_WT_RC}" -eq 0 ]; then
+            echo "[FAIL] Deleted worktree MUST fail closed (expected non-zero exit, got 0): ${MISSING_WT_ERR}" >&2; exit 1
+          fi
+          printf '%s\n' "${MISSING_WT_ERR}" | grep -Eq 'refusing to fall back to primary repo'
+          [ ! -e "${EXEC_SENTINEL}" ] || { echo "[FAIL] Deleted worktree still executed fake codex!" >&2; exit 1; }
+
+          # Hard Fail-Closed Worktree Regression B: Worktree path replaced by a regular file -> MUST FAIL CLOSED!
+          printf 'not-a-directory\n' > "${REPO_DIR}-lane2"
+          rm -f "${EXEC_SENTINEL}"
+          set +e
+          FILE_WT_ERR="$(cd "${REPO_DIR}/src/sub dir" && CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" pwd-check 2>&1)"
+          FILE_WT_RC=$?
+          set -e
+          rm -f "${REPO_DIR}-lane2"
           mv "${REPO_DIR}-lane2-bak" "${REPO_DIR}-lane2"
+          if [ "${FILE_WT_RC}" -eq 0 ]; then
+            echo "[FAIL] Regular-file worktree path MUST fail closed (expected non-zero exit, got 0): ${FILE_WT_ERR}" >&2; exit 1
+          fi
+          printf '%s\n' "${FILE_WT_ERR}" | grep -Eq 'refusing to fall back to primary repo'
+          [ ! -e "${EXEC_SENTINEL}" ] || { echo "[FAIL] Regular-file worktree still executed fake codex!" >&2; exit 1; }
+
+          # Hard Fail-Closed Worktree Regression C: Unreadable worktree dir / subdir where `cd` fails -> MUST FAIL CLOSED!
+          if [ "$(id -u)" -ne 0 ] && ! uname -s | grep -Eqi 'mingw|msys|cygwin'; then
+            chmod 000 "${REPO_DIR}-lane2"
+            rm -f "${EXEC_SENTINEL}"
+            set +e
+            CDFAIL_ROOT_ERR="$(cd "${REPO_DIR}/src/sub dir" && CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" pwd-check 2>&1)"
+            CDFAIL_ROOT_RC=$?
+            set -e
+            chmod 755 "${REPO_DIR}-lane2"
+            if [ "${CDFAIL_ROOT_RC}" -eq 0 ]; then
+              echo "[FAIL] Unreadable worktree root (cd failed) MUST fail closed: ${CDFAIL_ROOT_ERR}" >&2; exit 1
+            fi
+            printf '%s\n' "${CDFAIL_ROOT_ERR}" | grep -Eq 'cd failed|refusing to fall back'
+            [ ! -e "${EXEC_SENTINEL}" ] || { echo "[FAIL] Unreadable worktree root still executed fake codex!" >&2; exit 1; }
+
+            chmod 000 "${REPO_DIR}-lane2/src/sub dir"
+            rm -f "${EXEC_SENTINEL}"
+            set +e
+            CDFAIL_SUB_ERR="$(cd "${REPO_DIR}/src/sub dir" && CODEX_TEST_SENTINEL="${EXEC_SENTINEL}" "${LOCAL_BIN}/codex" pwd-check 2>&1)"
+            CDFAIL_SUB_RC=$?
+            set -e
+            chmod 755 "${REPO_DIR}-lane2/src/sub dir"
+            if [ "${CDFAIL_SUB_RC}" -eq 0 ]; then
+              echo "[FAIL] Unreadable worktree subdir (cd failed) MUST fail closed: ${CDFAIL_SUB_ERR}" >&2; exit 1
+            fi
+            printf '%s\n' "${CDFAIL_SUB_ERR}" | grep -Eq 'cd failed|refusing to remain in primary repo'
+            [ ! -e "${EXEC_SENTINEL}" ] || { echo "[FAIL] Unreadable worktree subdir still executed fake codex!" >&2; exit 1; }
+          fi
 
           # 3) doctor.sh passes and never echoes auth secret canary.
           DOC_OUT="$(
@@ -439,4 +520,115 @@ jobs:
           python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o755' "${LOCAL_BIN}/codex-t3"
           [ -f "${LANE1}/sessions/keep.jsonl" ]
           [ "$(sha256_of "${LANE1}/sessions/keep.jsonl")" = "${SESSION_HASH}" ]
-          echo "[PASS] Unix smoke, worktree routing, traversal/mode defense, and exact SHA-256 + POSIX mode rollback passed!"
+
+          # 7) Interrupted Mid-Install Rollback Recovery (Unix):
+          #    7a) Mid-Step-5 interruption with partial symlinks (3/6 symlinks created before abort)
+          #    7b) Mid-Step-8 interruption with partial files + 6/6 symlinks + backed-up pre-existing codex
+          #        + untouched pre-existing codex-t3
+          INT_DIR="${TMP_ROOT}/interrupted workspace"
+          INT_REPO="${INT_DIR}/repo"
+          INT_L1="${INT_DIR}/lane1"
+          INT_L2="${INT_DIR}/lane2"
+          INT_BIN="${INT_DIR}/local bin"
+          mkdir -p "${INT_REPO}" "${INT_L1}/sessions" "${INT_L2}" "${INT_BIN}"
+          echo '{"id":"int-keep"}' > "${INT_L1}/sessions/keep.jsonl"
+          INT_SESS_HASH="$(sha256_of "${INT_L1}/sessions/keep.jsonl")"
+          printf 'model = "int-orig-model"\n' > "${INT_L2}/config.toml"
+          chmod 644 "${INT_L2}/config.toml"
+          INT_CFG_HASH="$(sha256_of "${INT_L2}/config.toml")"
+          printf '#!/usr/bin/env bash\necho PRE_EXISTING_CODEX\n' > "${INT_BIN}/codex"
+          chmod 755 "${INT_BIN}/codex"
+          INT_CODEX_HASH="$(sha256_of "${INT_BIN}/codex")"
+          printf '#!/usr/bin/env bash\necho PRE_EXISTING_T3\n' > "${INT_BIN}/codex-t3"
+          chmod 755 "${INT_BIN}/codex-t3"
+          INT_T3_HASH="$(sha256_of "${INT_BIN}/codex-t3")"
+
+          # 7a) Plant a regular file at INT_L1/archived_sessions so Step 5 aborts after 3/6 symlinks.
+          printf 'blocker-file\n' > "${INT_L1}/archived_sessions"
+          set +e
+          PATH="${FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${INT_L1}" CODEX_LANE2_HOME="${INT_L2}" CODEX_LOCAL_BIN="${INT_BIN}" \
+            ./scripts/setup-dual-lane.sh --repo "${INT_REPO}" >/dev/null 2>&1
+          INT5_RC=$?
+          set -e
+          [ "${INT5_RC}" -ne 0 ] || { echo "[FAIL] Step 5 interruption did not abort!" >&2; exit 1; }
+          [ -f "${INT_L2}/.rollback/latest.tsv" ]
+          grep -q '^# status=in-progress$' "${INT_L2}/.rollback/latest.tsv"
+          [ -L "${INT_L2}/sessions" ]
+          [ ! -L "${INT_L2}/plugins" ]
+          rm -f "${INT_L1}/archived_sessions"
+          CODEX_LANE1_HOME="${INT_L1}" CODEX_LANE2_HOME="${INT_L2}" CODEX_LOCAL_BIN="${INT_BIN}" \
+            ./scripts/restore-original.sh
+          for d in memories memories_v2 sessions archived_sessions skills plugins; do
+            [ ! -L "${INT_L2}/${d}" ] || { echo "[FAIL] Orphaned symlink ${d} after Step 5 rollback!" >&2; exit 1; }
+          done
+          [ "$(sha256_of "${INT_L1}/sessions/keep.jsonl")" = "${INT_SESS_HASH}" ]
+          [ "$(sha256_of "${INT_L2}/config.toml")" = "${INT_CFG_HASH}" ]
+          [ "$(sha256_of "${INT_BIN}/codex")" = "${INT_CODEX_HASH}" ]
+          [ "$(sha256_of "${INT_BIN}/codex-t3")" = "${INT_T3_HASH}" ]
+
+          # 7b) Plant a blocker directory at INT_BIN/codex-official so Step 8 aborts AFTER backing up
+          #     & overwriting pre-existing codex, config.toml, rules, AGENTS.md, and all 6 symlinks,
+          #     while leaving pre-existing codex-t3 untouched.
+          mkdir -p "${INT_BIN}/codex-official"
+          set +e
+          PATH="${FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${INT_L1}" CODEX_LANE2_HOME="${INT_L2}" CODEX_LOCAL_BIN="${INT_BIN}" \
+            ./scripts/setup-dual-lane.sh --repo "${INT_REPO}" >/dev/null 2>&1
+          INT8_RC=$?
+          set -e
+          [ "${INT8_RC}" -ne 0 ] || { echo "[FAIL] Step 8 interruption did not abort!" >&2; exit 1; }
+          rmdir "${INT_BIN}/codex-official"
+          [ -f "${INT_L2}/.rollback/latest.tsv" ]
+          grep -q '^# status=in-progress$' "${INT_L2}/.rollback/latest.tsv"
+          CODEX_LANE1_HOME="${INT_L1}" CODEX_LANE2_HOME="${INT_L2}" CODEX_LOCAL_BIN="${INT_BIN}" \
+            ./scripts/restore-original.sh
+          [ "$(sha256_of "${INT_L2}/config.toml")" = "${INT_CFG_HASH}" ]
+          python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o644' "${INT_L2}/config.toml"
+          [ "$(sha256_of "${INT_BIN}/codex")" = "${INT_CODEX_HASH}" ]
+          python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o755' "${INT_BIN}/codex"
+          [ "$(sha256_of "${INT_BIN}/codex-t3")" = "${INT_T3_HASH}" ]
+          python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o755' "${INT_BIN}/codex-t3"
+          [ ! -e "${INT_L2}/AGENTS.md" ]
+          [ ! -e "${INT_L2}/rules/default.rules" ]
+          for d in memories memories_v2 sessions archived_sessions skills plugins; do
+            [ ! -L "${INT_L2}/${d}" ] || { echo "[FAIL] Orphaned symlink ${d} after Step 8 rollback!" >&2; exit 1; }
+          done
+          [ "$(sha256_of "${INT_L1}/sessions/keep.jsonl")" = "${INT_SESS_HASH}" ]
+
+          # 8) Repeated Install + Rollback Loop (3x consecutive cycles on Unix):
+          #    Install -> Verify -> Restore -> Verify byte-exact original state & POSIX modes 3 times.
+          for cycle in 1 2 3; do
+            PATH="${FAKE_BIN}:${PATH}" \
+            CODEX_LANE1_HOME="${LANE1}" \
+            CODEX_LANE2_HOME="${LANE2}" \
+            CODEX_LOCAL_BIN="${LOCAL_BIN}" \
+            ./scripts/setup-dual-lane.sh --repo "${REPO_DIR}" --use-git-worktree --install-bridge
+            grep -q 'approval_policy = "on-request"' "${LANE2}/config.toml"
+            grep -q 'model = "custom-ci-model"' "${LANE2}/config.toml"
+            grep -q '^# status=complete$' "${LANE2}/.rollback/latest.tsv"
+            python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600' "${LANE2}/config.toml"
+            for d in memories memories_v2 sessions archived_sessions skills plugins; do
+              [ -L "${LANE2}/${d}" ] || { echo "[FAIL] Cycle ${cycle}: missing symlink ${d}!" >&2; exit 1; }
+            done
+
+            CODEX_LANE1_HOME="${LANE1}" \
+            CODEX_LANE2_HOME="${LANE2}" \
+            CODEX_LOCAL_BIN="${LOCAL_BIN}" \
+            ./scripts/restore-original.sh
+            [ "$(sha256_of "${LANE2}/config.toml")" = "${ORIG_HASH}" ]
+            python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o644' "${LANE2}/config.toml"
+            [ "$(sha256_of "${LOCAL_BIN}/codex-t3")" = "${ORIG_LAUNCHER_HASH}" ]
+            python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o755' "${LOCAL_BIN}/codex-t3"
+            [ ! -e "${LOCAL_BIN}/codex" ]
+            [ ! -e "${LOCAL_BIN}/codex-official" ]
+            [ ! -e "${LANE2}/AGENTS.md" ]
+            [ ! -e "${LANE2}/rules/default.rules" ]
+            for d in memories memories_v2 sessions archived_sessions skills plugins; do
+              [ ! -L "${LANE2}/${d}" ] || { echo "[FAIL] Cycle ${cycle}: orphaned symlink ${d}!" >&2; exit 1; }
+            done
+            [ -z "$(find "${LANE1}" "${LANE2}" "${LOCAL_BIN}" -maxdepth 2 -name '*.backup-*' 2>/dev/null)" ] || {
+              echo "[FAIL] Cycle ${cycle}: stray .backup-* file left behind after rollback!" >&2; exit 1
+            }
+            [ "$(sha256_of "${LANE1}/sessions/keep.jsonl")" = "${SESSION_HASH}" ]
+          done
+
+          echo "[PASS] Unix smoke, fail-closed worktree, traversal/SUID defense, interrupted rollback, and 3x install/rollback loop passed!"

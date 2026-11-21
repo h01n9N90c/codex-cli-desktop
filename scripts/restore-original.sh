@@ -41,7 +41,15 @@ cleanup_temp_artifacts() {
     rm -rf -- "${TEMP_ARTIFACTS[@]}" 2>/dev/null || true
   fi
 }
-trap cleanup_temp_artifacts EXIT INT TERM
+handle_signal_exit() {
+  local sig="$1"
+  cleanup_temp_artifacts
+  trap - "${sig}" EXIT
+  kill -"${sig}" "$$" 2>/dev/null || exit 130
+}
+trap cleanup_temp_artifacts EXIT
+trap 'handle_signal_exit INT' INT
+trap 'handle_signal_exit TERM' TERM
 
 # ------------------------------------------------------------------------------
 # Helper Functions
@@ -319,6 +327,14 @@ atomic_restore_verified_file() {
   assert_safe_contained_path "restore target" "${target}"
 
   if [ ! -f "${bkp}" ] || [ -L "${bkp}" ]; then
+    if [ -n "${expected_sha}" ] && [ -f "${target}" ] && [ ! -L "${target}" ]; then
+      local cur_sha
+      cur_sha="$(sha256_file "${target}")"
+      if [ "${cur_sha}" = "${expected_sha}" ]; then
+        echo "    Already at original state (SHA-256 verified): ${target} (SHA256=${expected_sha:0:12}...)"
+        return 0
+      fi
+    fi
     echo "[WARN] Backup file missing or not a regular file: ${bkp} (cannot restore ${target})" >&2
     return 0
   fi
@@ -337,11 +353,15 @@ atomic_restore_verified_file() {
 
   local restore_mode="600"
   local norm_expected_mode=""
-  if norm_expected_mode="$(normalize_restore_mode "${expected_mode}" 2>/dev/null)" && [ -n "${norm_expected_mode}" ]; then
+  if [ -n "${expected_mode}" ] && [ "${expected_mode}" != "-" ]; then
+    if ! norm_expected_mode="$(normalize_restore_mode "${expected_mode}" 2>/dev/null)" || [ -z "${norm_expected_mode}" ]; then
+      echo "[FAIL] Security violation: unsafe/invalid restore mode '${expected_mode}' for ${target}." >&2
+      exit 1
+    fi
     restore_mode="${norm_expected_mode}"
   else
     local target_dir_only bkp_mode
-    target_dir_only="$(dirname "${target}")"
+    target_dir_only="$(dirname -- "${target}")"
     bkp_mode="$(get_octal_mode "${bkp}")"
     if [ "${target_dir_only}" = "${LOCAL_BIN}" ] || [ -x "${bkp}" ]; then
       if [ -n "${bkp_mode}" ]; then
@@ -354,7 +374,7 @@ atomic_restore_verified_file() {
 
   if [ "${DRY_RUN}" -eq 0 ]; then
     local target_dir tmp staged_sha restored_sha post_mode
-    target_dir="$(dirname "${target}")"
+    target_dir="$(dirname -- "${target}")"
     mkdir -p -- "${target_dir}"
     tmp="$(mktemp "${target_dir}/.codex-restore.XXXXXX")"
     TEMP_ARTIFACTS+=("${tmp}")
@@ -655,6 +675,9 @@ is_handled_target() {
 
 if [ -n "${MANIFEST_FILE}" ]; then
   echo "    Loaded rollback manifest: ${MANIFEST_FILE}"
+  if grep -Fq '# status=in-progress' "${MANIFEST_FILE}" 2>/dev/null; then
+    echo "    Detected partial/interrupted install manifest (status=in-progress); recovering tracked mutations safely."
+  fi
   line_num=0
   while IFS= read -r line || [ -n "${line}" ]; do
     line_num=$((line_num + 1))
@@ -728,6 +751,23 @@ fi
 # ------------------------------------------------------------------------------
 # Step 3: Restore Pre-Existing Launchers or Remove Newly Created Wrappers
 # ------------------------------------------------------------------------------
+# Return 0 only if the regular file carries the Dual-Lane Kit wrapper header.
+# Protects untouched pre-existing user launchers when rolling back an
+# interrupted mid-install manifest that never reached Step 8.
+is_dual_lane_wrapper() {
+  local f="$1"
+  [ -f "${f}" ] && [ ! -L "${f}" ] || return 1
+  local line_count=0 line=""
+  while IFS= read -r -n 256 line || [ -n "${line}" ]; do
+    line_count=$((line_count + 1))
+    case "${line}" in
+      *"# Codex Dual-Lane wrapper:"*) return 0 ;;
+    esac
+    [ "${line_count}" -ge 5 ] && break
+  done < "${f}"
+  return 1
+}
+
 echo "[+] Step 3: Reconciling CLI wrappers in ${LOCAL_BIN}..."
 for w in codex codex-official codex-t3; do
   wp="${LOCAL_BIN}/${w}"
@@ -740,11 +780,15 @@ for w in codex codex-official codex-t3; do
   elif [ -L "${wp}" ]; then
     echo "[WARN] Leaving unexpected symlink untouched in ${LOCAL_BIN}: ${wp}" >&2
   elif [ -f "${wp}" ]; then
-    if [ "${DRY_RUN}" -eq 0 ]; then
-      rm -f -- "${wp}"
-      echo "    Removed wrapper: ${wp}"
+    if is_dual_lane_wrapper "${wp}"; then
+      if [ "${DRY_RUN}" -eq 0 ]; then
+        rm -f -- "${wp}"
+        echo "    Removed wrapper: ${wp}"
+      else
+        echo "    [DRY-RUN] Would remove wrapper: ${wp}"
+      fi
     else
-      echo "    [DRY-RUN] Would remove wrapper: ${wp}"
+      echo "    Preserved untouched pre-existing launcher: ${wp}"
     fi
   fi
 done

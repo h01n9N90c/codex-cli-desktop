@@ -96,14 +96,14 @@ ls -la ~/.codex/config.toml ~/.codex/auth.json ~/.codex-official/config.toml ~/.
 
 ---
 
-## 5. Kiểm chứng Merge `config.toml` Không phá hủy & Khôi phục SHA-256
+## 5. Kiểm chứng Merge `config.toml`, Đường dẫn 8.3, Worktree Fail-Closed, Khôi phục Ngắt Giữa Chừng & Vòng lặp 3x
 
-Chạy bộ test tích hợp trên Windows (không đụng tới `~/.codex*` thật của bạn, dùng thư mục tạm cô lập):
+Chạy bộ test tích hợp 10 pha trên Windows (không đụng tới `~/.codex*` thật của bạn, dùng thư mục tạm cô lập):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1
 ```
-* **Kỳ vọng:** Tất cả kiểm tra cú pháp AST, `-DryRun`, TOML merge giữ nguyên `[mcp_servers.*]`/`[tui]`/`[projects.*]`, cô lập `env_key`, UTF-8 không BOM, chống path-traversal và khôi phục khớp mã băm SHA-256 đều báo `[PASS]`.
+* **Kỳ vọng:** Cả 10 pha kiểm tra đều báo `[PASS]`: cú pháp AST & CRLF, unit test Python, Starlark `default.rules`, `-DryRun`/`-WhatIf`, TOML merge giữ nguyên `[mcp_servers.*]`/`[tui]`/`[projects.*]`, cô lập `env_key`, UTF-8 không BOM, khóa ACL 2 bước & `-ReapplyAclOnly`, chuẩn hóa đường dẫn ngắn 8.3 (`RUNNER~1`/`PROGRA~1` qua `GetLongPathNameW` + `%%~fs`), worktree fail-closed cứng (từ chối chạy khi worktree bị xóa/thay bằng tệp thường/lỗi `cd`, chỉ tắt auto-cd với `CODEX_NO_AUTO_WORKTREE_CD=1` trong khi vẫn chặn `-C`/`-C<path>`/`--cd`/`--add-dir`), `doctor.ps1`, chống path-traversal, khôi phục SHA-256, phục hồi cài đặt bị ngắt giữa chừng (`.rollback/latest.json` `Completed=false`) và vòng lặp cài đặt + khôi phục 3 lần liên tiếp (0 tệp backup rác, 0 mất dữ liệu Luồng 1).
 
 ---
 
@@ -135,4 +135,51 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.p
 | Chế độ | Cách kích hoạt | Bản chất kỹ thuật | Khi nào nên dùng |
 | :--- | :--- | :--- | :--- |
 | **Chế độ A: Chung 1 Worktree** *(Mặc định)* | Chạy `setup-dual-lane.ps1 -RepoPath "C:\Projects\my-app"` | **Ranh giới mềm (Soft Prompt Boundary):** Hai luồng phân chia thư mục qua `AGENTS.md` và `DUAL_LANE_BRIDGE.md`, nhưng cùng chia sẻ quyền ghi OS trong thư mục làm việc. | Khi muốn 2 luồng thấy ngay tệp mới của nhau trên cùng 1 cây thư mục mà không cần merge nhánh. |
-| **Chế độ B: Tách Git Worktree riêng** *(Cưỡng chế cấp OS)* | Thêm cờ **`-UseGitWorktree`** (Windows) hoặc **`--use-git-worktree`** (macOS/Linux/WSL) | **Ranh giới cứng (Hard OS Sandbox Boundary):** Tạo worktree riêng `<repo>-lane2` trên nhánh `dual-lane-2`. Vì `sandbox_mode = "workspace-write"` chỉ cho phép ghi trong `cwd` hiện tại, OS Sandbox của Luồng 2 **vật lý không thể ghi vào thư mục làm việc của Luồng 1**. | Khi cần cưỡng chế phân quyền ghi tuyệt đối ở cấp hệ điều hành giữa 2 agent. |
+| **Chế độ B: Tách Git Worktree riêng** *(Cưỡng chế cấp OS — Hard Fail-Closed)* | Thêm cờ **`-UseGitWorktree`** (Windows) hoặc **`--use-git-worktree`** (macOS/Linux/WSL) | **Ranh giới cứng fail-closed (Hard OS Sandbox Boundary):** Tạo worktree riêng `<repo>-lane2` trên nhánh `dual-lane-2`. Wrapper Luồng 2 tự chuyển `cwd` sang worktree (kể cả thư mục con & chuẩn hóa đường dẫn 8.3 ngắn), **từ chối chạy (`exit 1`)** nếu worktree bị xóa/thiếu/lỗi `cd` (không fallback về repo chính), và luôn chặn `-C`/`-C=`/`-C<path>`/`-C"<path>"`/`--cd`/`--add-dir` trỏ vào repo chính (ngay cả khi đặt `CODEX_NO_AUTO_WORKTREE_CD=1`). Ở tầng OS, `sandbox_mode = "workspace-write"` chặn ghi vật lý vào cây thư mục của Luồng 1. | Khi cần cưỡng chế phân quyền ghi tuyệt đối ở cấp hệ điều hành giữa 2 agent. |
+
+---
+
+## 8. Bằng chứng Kiểm chứng Thực tế trên Codex CLI Thật (`codex-cli 0.171.0-alpha.13` — Windows)
+
+Toàn bộ kết quả dưới đây được đo trực tiếp trên binary **OpenAI Codex CLI thật (`codex-cli 0.171.0-alpha.13`)** trong thư mục tạm cô lập hoàn toàn (không đụng tới `~/.codex*`, `~/.local/bin` hay User `PATH` thật, sử dụng token canary giả lập):
+
+### 8.1. Cài đặt thật, Wrapper, Worktree Fail-Closed & 13/13 Starlark `execpolicy` Probes
+* **Cài đặt & Wrapper:** `setup-dual-lane.ps1` với `-UseGitWorktree -ConfigureGateway -GatewayApiKeyEnv CANARY_GW_ENV_PROBE -SkipPathUpdate` và binary `codex.exe` thật $\rightarrow$ `EXIT=0`. *(Lưu ý thực tế: khi đặt `CODEX_HOME` trong `%TEMP%`, `codex.exe` in cảnh báo không gây lỗi `Refusing to create helper binaries under temporary dir`).*
+  * `codex.cmd --version` và `codex-t3.cmd --version` $\rightarrow$ `EXIT=0` (`codex-cli 0.171.0-alpha.13` đúng theo từng `CODEX_HOME`).
+  * `codex.cmd features list` $\rightarrow$ `EXIT=0` (liệt kê `224` feature flags thật).
+  * `codex.cmd debug prompt-input` $\rightarrow$ `EXIT=0`, xác nhận đồng thời cả `Network access is restricted` và `Static-Analysis-Only` đang hiệu lực ở Luồng 2.
+* **Starlark `execpolicy check` sống (`13/13` PASS, `EXIT=0`):**
+  * **9 lệnh `forbidden`:** `php -r "echo 1;"`, `mshta http://example.invalid`, `vssadmin delete shadows /all`, `vssadmin.exe delete shadows /all`, `icacls.exe <lane1>\auth.json`, `Start-Process calc.exe`, `start-process calc.exe`, `iex dir`, `git push --force` *(khớp cả `forbidden` & `prompt`, quyết định hiệu lực=`forbidden`)*.
+  * **3 lệnh `prompt`:** `git push`, `git reset --hard`, `git clean -fd`.
+  * **1 lệnh cho phép (`{"matchedRules":[]}`):** `git status`.
+* **Worktree Fail-Closed trên `codex.cmd` thật:**
+  * Chạy từ `<primaryRepo>` tự chuyển vào worktree (`EXIT=0`).
+  * Guard 2 chặn **5/5 dạng cờ** trỏ vào `<primaryRepo>`: `-C <primaryRepo>`, `-C"<primaryRepo>"`, `-C<primaryRepo>`, `--cd=<primaryRepo>\src`, `--add-dir <primaryRepo>` $\rightarrow$ tất cả `EXIT=1` (`codex.exe` không chạy).
+  * Sau khi xóa worktree (`git worktree remove --force`): `codex.cmd --version` từ `<primaryRepo>` $\rightarrow$ **`EXIT=1`** (`Refusing to fall back to primary repo`, `codex.exe` không chạy).
+  * Khi đặt `CODEX_NO_AUTO_WORKTREE_CD=1` với worktree đã xóa: `codex.cmd --version` $\rightarrow$ `EXIT=0`, nhưng `codex.cmd -C <primaryRepo> --version` vẫn bị chặn **`EXIT=1`**.
+
+### 8.2. Chu trình Thực tế: Codex Atomic Config Rewrite $\rightarrow$ Reset DACL $\rightarrow$ `-ReapplyAclOnly`
+Trên thư mục tạm mô phỏng đúng ACL Windows thực tế (`CodexSandboxUsers:(OI)(CI)(RX)` kế thừa từ thư mục cha):
+1. **Sau khi cài (`Protect-SensitiveFileAcl`):** Cả `auth.json` và `config.toml` ở 2 luồng đều có `AreAccessRulesProtected=True`, `CodexSandboxUsers AllowCount=0`; Win32 `AuthzAccessCheck(CodexSandboxOffline, <lane2>\config.toml)` trả về `GrantedMask=0x00000000`, `Error=5 [ERROR_ACCESS_DENIED]`, `ReadAllowed=False`; `doctor.ps1` báo `[PASS] ... kernel_acl=locked (protected=6/6)`.
+2. **Chạy lệnh Codex thật ghi lại `config.toml`:** `codex.exe features enable suppress_model_change_announcements` (và `features disable ...`) $\rightarrow$ `EXIT=0`.
+   * **Quan sát thực tế:** `config.toml` bị Windows reset DACL về kế thừa (`AreAccessRulesProtected=False`, `CodexSandboxUsers AllowCount=1`, `Inherited=True`), `AuthzAccessCheck` đổi thành `GrantedMask=0x00120089`, `Error=0`, `ReadAllowed=True`, và `doctor.ps1` phát hiện ngay `[WARN] ... kernel_acl=EXPOSED(1 Allow ACEs on Lane2/config.toml)`.
+3. **Khắc phục bằng `setup-dual-lane.ps1 -ReapplyAclOnly`:** `EXIT=0` (~`1.2s`), khóa lại toàn bộ `7` tệp nhạy cảm (`auth.json`, `config.toml`, `config.backup.toml`, `.rollback/latest.json`, `.rollback/snapshot-*.json`), **giữ nguyên 100% SHA-256** (`SHA_MATCH=True`), `AuthzAccessCheck` trở lại `Error=5 (ReadAllowed=False)` và `doctor.ps1` trở lại `[PASS] kernel_acl=locked (protected=6/6)`.
+
+### 8.3. Kiểm chứng Thực tế Sandbox Đọc/Ghi & Giới hạn Trung thực theo Backend
+* **Cú pháp CLI (`codex-cli 0.171.0-alpha.13`):** `codex.exe sandbox --help` (`EXIT=0`) cung cấp `Usage: codex sandbox [OPTIONS] [COMMAND]...` (chỉ có subcommand `uninstall`, `help` — **không có** subcommand `windows`).
+* **Kiểm chứng sống trong Windows Sandbox không nâng quyền (`codex.exe sandbox -P lane2_ws -C <worktree>` với `network.enabled = false`):**
+  * Tiến trình con chạy dưới restricted token (`IsTokenRestricted=True`, `TokenIntegrityLevel=Medium`, SID của user hiện tại kèm restricted capability SIDs).
+  * **Chứng minh sống ranh giới ghi cứng cấp OS:**
+    * `<repo>-lane2\src\app.txt`: `READ_OK`, **`WRITE_OK`**.
+    * `<repo>\src\app.txt` (repo chính của Luồng 1): `READ_OK`, **`WRITE_DENIED` (`PermissionError` errno 13)**.
+    * `<lane2>\canary_exposed.txt`, `canary_locked.txt`, `auth.json`: tất cả **`WRITE_DENIED` (`PermissionError` errno 13)**.
+  * **Giới hạn đọc trung thực ở chế độ unelevated:** Do token hạn chế ghi không nâng quyền vẫn chạy dưới SID của user hiện tại, tiến trình con vẫn đọc được tệp mà user hiện tại có quyền `(F)`; khi thử cấu hình chặn đọc tường minh trên chế độ unelevated, Codex trả về `EXIT=1`: `windows sandbox failed: Restricted read-only access requires the elevated Windows sandbox backend`.
+* **Danh tính Windows Sandbox nâng quyền (`CodexSandboxOffline` thuộc `CodexSandboxUsers`):**
+  * **Giới hạn khởi chạy tự động không tương tác:** Chạy `codex.exe sandbox -c windows.sandbox="elevated"` trên một `CODEX_HOME` tạm chưa cấp phát sẽ chờ thiết lập nâng quyền/UAC tương tác (không thể hoàn tất không tương tác nếu không bấm UAC).
+  * **Kiểm chứng quyền hiệu lực tầng nhân NTFS (`authz.dll` `AuthzAccessCheck`, `FILE_GENERIC_READ=0x00120089`) cho tài khoản cục bộ `CodexSandboxOffline`:**
+    * Tệp canary có ACE kế thừa `CodexSandboxUsers:(I)(RX)`: `GrantedMask=0x00120089`, `Error=0`, **`ReadAllowed=True`**.
+    * Tệp canary đã khóa bằng `Protect-SensitiveFileAcl` (2 bước `icacls`) và `<lane2>\auth.json`: `GrantedMask=0x00000000`, `Error=5 [ERROR_ACCESS_DENIED]`, **`ReadAllowed=False`**.
+  * **Kết luận phòng thủ đa tầng:** `Protect-SensitiveFileAcl` + `-ReapplyAclOnly` chặn đọc hiệu quả trước danh tính elevated `CodexSandboxOffline`, nhưng không thể chặn đọc dưới backend unelevated cùng user SID — khẳng định tầm quan trọng bắt buộc của **`env_key`** (0 plaintext API key trong `config.toml`) và **`cli_auth_credentials_store = "keyring"`** (0 token nằm trên đĩa trong `auth.json`).
+
+### 8.4. Kiểm toán 0 Rò rỉ Bí mật & Khôi phục Sạch
+* Quét toàn bộ `75` tệp sinh ra/sao lưu trong `<lane1>`, `<lane2>`, `<localBin>` (cấu hình, bản backup, manifest rollback, wrapper, rules, `AGENTS.md`) và toàn bộ đầu ra `doctor.ps1` (`EXIT=0`, `11 PASS | 0 FAIL`, `engine_probe=7/7 forbidden` cả 2 luồng, `Rollback Journal: Healthy & complete`) $\rightarrow$ **`0` rò rỉ** đối với cả token canary lẫn `experimental_bearer_token`; xác nhận `env_key` hiện diện đúng trong `config.toml` Luồng 1 và `restore-original.ps1 -SkipPathUpdate` dọn sạch về trạng thái gốc (`EXIT=0`).

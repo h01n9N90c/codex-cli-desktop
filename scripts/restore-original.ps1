@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Deterministic, SHA-256 verified rollback & recovery tool for Codex Dual-Lane & Security Kit on Windows.
 
@@ -10,12 +10,16 @@
          Directory.Delete(path, $false) (never touching Lane 1's target directories and avoiding
          cmd.exe metacharacter parsing issues on paths containing spaces, '&', '%', or Unicode),
          then restores any pre-install Lane 2 directory backups and verifies Lane 1 data is intact.
-      2. Enforces strict caller-authorized path containment and symlink/reparse-point rejection
-         so a tampered snapshot manifest can NEVER read, overwrite, or delete files outside the
-         caller's authorized Lane1Home, Lane2Home, and LocalBin directories.
-      3. Verifies every backup file's SHA-256 checksum BEFORE overwriting, performs an atomic
-         staged restore with transient-lock retries, re-verifies SHA-256 after writing, and only
-         removes the backup once integrity is proven (preserving backups if a target file is locked).
+      2. Enforces strict caller-authorized path containment (canonicalized via Win32
+         GetLongPathNameW so 8.3 short names such as RUNNER~1 / PROGRA~1 match their long forms
+         consistently) and symlink/reparse-point rejection so a tampered snapshot manifest can
+         NEVER read, overwrite, or delete files outside the caller's authorized Lane1Home,
+         Lane2Home, and LocalBin directories.
+      3. Supports both complete and partial/interrupted incremental manifests written mid-install:
+         verifies every backup file's SHA-256 checksum BEFORE overwriting, performs an atomic
+         staged restore with transient-lock retries, re-verifies SHA-256 after writing, only
+         removes backups once integrity is proven, and never deletes untouched pre-existing user
+         launchers when an install was interrupted before reaching wrapper installation.
       4. Removes CLI wrappers (codex.cmd, codex-official.cmd, codex-t3.cmd) from LocalBin and
          cleans LocalBin from User PATH (unless -SkipPathUpdate is passed).
       5. Optionally removes Lane2Home (-RemoveLane2Home) ONLY after proving zero restore errors
@@ -111,10 +115,145 @@ function Get-JsonProp {
     return $prop.Value
 }
 
+function Resolve-CanonicalLongPath {
+    <#
+    .SYNOPSIS
+        Canonicalizes a Windows filesystem path to its full long-name form (expanding 8.3 short
+        segments such as RUNNER~1 or PROGRA~1) without dereferencing NTFS Junctions or symlinks.
+        WHY:
+          Ensures caller-authorized roots and manifest TargetPath/BackupPath entries compare
+          consistently even when one side contains an 8.3 short path segment and the other uses
+          the long name (e.g. Windows CI runners on PowerShell 7+ where GetFullPath does not
+          expand 8.3 names), while preserving reparse points so symlink/junction guards remain intact.
+    #>
+    param(
+        [AllowEmptyString()][string]$PathValue
+    )
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return '' }
+
+    $inputPath = $PathValue
+    if (-not [System.IO.Path]::IsPathRooted($inputPath)) {
+        try {
+            $psCwd = (Get-Location -PSProvider FileSystem).ProviderPath
+            if (-not [string]::IsNullOrEmpty($psCwd)) {
+                $inputPath = [System.IO.Path]::Combine($psCwd, $inputPath)
+            }
+        } catch {}
+    }
+
+    $full = [System.IO.Path]::GetFullPath($inputPath)
+    $root = [System.IO.Path]::GetPathRoot($full)
+    $normalized = if ($full.Length -gt $root.Length) { $full.TrimEnd('\', '/') } else { $full }
+
+    $useWin32 = $false
+    try {
+        if (-not ('CodexDualLane.NativePathApi' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace CodexDualLane {
+    public static class NativePathApi {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetLongPathNameW(
+            string lpszShortPath,
+            StringBuilder lpszLongPath,
+            uint cchBuffer
+        );
+
+        public static string TryGetLongPath(string path) {
+            if (string.IsNullOrEmpty(path)) return null;
+            StringBuilder sb = new StringBuilder(Math.Max(260, path.Length + 64));
+            uint required = GetLongPathNameW(path, sb, (uint)sb.Capacity);
+            if (required == 0) return null;
+            if (required > sb.Capacity) {
+                sb = new StringBuilder((int)required + 1);
+                required = GetLongPathNameW(path, sb, (uint)sb.Capacity);
+                if (required == 0 || required > sb.Capacity) return null;
+            }
+            return sb.ToString();
+        }
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $useWin32 = $true
+    } catch {
+        $useWin32 = $false
+    }
+
+    $tailSegments = New-Object 'System.Collections.Generic.Stack[string]'
+    $probe = $normalized
+    $resolvedBase = $null
+
+    while (-not [string]::IsNullOrEmpty($probe)) {
+        if ($useWin32) {
+            $candidate = [CodexDualLane.NativePathApi]::TryGetLongPath($probe)
+            if (-not [string]::IsNullOrEmpty($candidate)) {
+                $resolvedBase = $candidate
+                break
+            }
+        } else {
+            if ([System.IO.File]::Exists($probe) -or [System.IO.Directory]::Exists($probe)) {
+                $resolvedBase = $probe
+                break
+            }
+        }
+
+        $parent = [System.IO.Path]::GetDirectoryName($probe)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $probe) {
+            $resolvedBase = $probe
+            break
+        }
+        $leaf = [System.IO.Path]::GetFileName($probe)
+        $tailSegments.Push($leaf)
+        $probe = $parent
+    }
+
+    if ([string]::IsNullOrEmpty($resolvedBase)) {
+        $resolvedBase = $normalized
+    }
+
+    if (-not $useWin32) {
+        $baseRoot = [System.IO.Path]::GetPathRoot($resolvedBase)
+        if (-not [string]::IsNullOrEmpty($baseRoot) -and $resolvedBase.Length -gt $baseRoot.Length) {
+            $relParts = $resolvedBase.Substring($baseRoot.Length).Split([char[]]@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)
+            $acc = $baseRoot
+            foreach ($part in $relParts) {
+                $nextAcc = $null
+                try {
+                    $di = New-Object System.IO.DirectoryInfo($acc)
+                    $entries = @($di.GetFileSystemInfos($part))
+                    if ($entries.Count -eq 1) {
+                        $nextAcc = $entries[0].FullName
+                    }
+                } catch {}
+                $acc = if ($nextAcc) { $nextAcc } else { [System.IO.Path]::Combine($acc, $part) }
+            }
+            $resolvedBase = $acc
+        }
+    }
+
+    $result = $resolvedBase
+    while ($tailSegments.Count -gt 0) {
+        $result = [System.IO.Path]::Combine($result, $tailSegments.Pop())
+    }
+
+    if ($result.Length -ge 2 -and $result[1] -eq ':') {
+        $result = [char]::ToUpperInvariant($result[0]) + $result.Substring(1)
+    }
+    $resRoot = [System.IO.Path]::GetPathRoot($result)
+    if ($result.Length -gt $resRoot.Length) {
+        $result = $result.TrimEnd('\', '/')
+    }
+    return $result
+}
+
 function Get-NormalizedRoot([string]$PathValue, [string]$ParamName) {
     <#
     .SYNOPSIS
-        Validates and canonicalizes a caller-provided root directory parameter.
+        Validates and canonicalizes a caller-provided root directory parameter (including 8.3 expansion).
         WHY: Ensures allowed-root prefix comparisons are unambiguous and free of control chars,
         Win32 device prefixes, or NTFS Alternate Data Stream syntax.
     #>
@@ -131,36 +270,33 @@ function Get-NormalizedRoot([string]$PathValue, [string]$ParamName) {
     if ($afterDrive.IndexOf(':') -ge 0) {
         throw "Invalid value for -${ParamName}: NTFS alternate data stream syntax (':') is not permitted."
     }
-    $full = [System.IO.Path]::GetFullPath($PathValue)
-    $root = [System.IO.Path]::GetPathRoot($full)
-    if ($full.Length -gt $root.Length) {
-        return $full.TrimEnd('\', '/')
-    }
-    return $full
+    return (Resolve-CanonicalLongPath -PathValue $PathValue)
 }
 
 function Test-IsDangerousDeleteRoot([string]$DirPath, [string]$ProtectedLane1Home) {
     <#
     .SYNOPSIS
         Returns $true if deleting DirPath recursively would endanger OS, profile, or Lane 1 data.
-        WHY: Defense-in-depth guard for -RemoveLane2Home so misconfigured paths can never delete
-        a drive root, %USERPROFILE%, C:\Windows, %TEMP%, or Lane1Home (or any ancestor of Lane1Home).
+        WHY: Defense-in-depth guard for -RemoveLane2Home so misconfigured paths (including 8.3
+        short aliases) can never delete a drive root, %USERPROFILE%, C:\Windows, %TEMP%, or
+        Lane1Home (or any ancestor of Lane1Home).
     #>
-    $norm = [System.IO.Path]::GetFullPath($DirPath).TrimEnd('\').ToLowerInvariant()
-    $root = [System.IO.Path]::GetPathRoot($DirPath).TrimEnd('\').ToLowerInvariant()
+    $canon = Resolve-CanonicalLongPath -PathValue $DirPath
+    $norm  = $canon.TrimEnd('\').ToLowerInvariant()
+    $root  = [System.IO.Path]::GetPathRoot($canon).TrimEnd('\').ToLowerInvariant()
     if ($norm -eq $root) { return $true }
 
     foreach ($envDir in @($env:USERPROFILE, $env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:TEMP)) {
         if (-not [string]::IsNullOrWhiteSpace($envDir)) {
             try {
-                $blocked = [System.IO.Path]::GetFullPath($envDir).TrimEnd('\').ToLowerInvariant()
+                $blocked = (Resolve-CanonicalLongPath -PathValue $envDir).TrimEnd('\').ToLowerInvariant()
                 if ($norm -eq $blocked) { return $true }
             } catch {}
         }
     }
 
     # Never allow deleting Lane1Home or an ancestor directory containing Lane1Home!
-    $l1Norm = [System.IO.Path]::GetFullPath($ProtectedLane1Home).TrimEnd('\').ToLowerInvariant()
+    $l1Norm = (Resolve-CanonicalLongPath -PathValue $ProtectedLane1Home).TrimEnd('\').ToLowerInvariant()
     if ($norm -eq $l1Norm -or $l1Norm.StartsWith("$norm\")) {
         return $true
     }
@@ -211,7 +347,7 @@ function Test-PathInsideAllowedRoots {
     if ($afterDrive.IndexOf(':') -ge 0) { return $false }
 
     try {
-        $full = [System.IO.Path]::GetFullPath($CandidatePath).TrimEnd('\').ToLowerInvariant()
+        $full = (Resolve-CanonicalLongPath -PathValue $CandidatePath).TrimEnd('\').ToLowerInvariant()
     } catch {
         return $false
     }
@@ -219,7 +355,7 @@ function Test-PathInsideAllowedRoots {
     foreach ($root in $AllowedRoots) {
         if ([string]::IsNullOrWhiteSpace($root)) { continue }
         try {
-            $rFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\').ToLowerInvariant()
+            $rFull = (Resolve-CanonicalLongPath -PathValue $root).TrimEnd('\').ToLowerInvariant()
         } catch {
             continue
         }
@@ -245,11 +381,11 @@ function Assert-NoReparsePointInPath {
         [Parameter(Mandatory = $true)][string]$CandidatePath,
         [Parameter(Mandatory = $true)][string[]]$AllowedRoots
     )
-    $full = [System.IO.Path]::GetFullPath($CandidatePath).TrimEnd('\')
+    $full = (Resolve-CanonicalLongPath -PathValue $CandidatePath).TrimEnd('\')
     $matchedRoot = $null
     foreach ($root in $AllowedRoots) {
         if ([string]::IsNullOrWhiteSpace($root)) { continue }
-        $rFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\')
+        $rFull = (Resolve-CanonicalLongPath -PathValue $root).TrimEnd('\')
         if ($full.StartsWith("$rFull\", [System.StringComparison]::OrdinalIgnoreCase)) {
             $matchedRoot = $rFull
             break
@@ -468,7 +604,10 @@ if (Test-Path -LiteralPath $manifestFile -PathType Leaf) {
         throw "Failed to parse snapshot manifest JSON at '$manifestFile': $($_.Exception.Message)"
     }
     $mTimestamp = Get-JsonProp -Obj $manifest -Name 'Timestamp'
-    Write-Host "    Loaded snapshot manifest: $manifestFile (timestamp=$mTimestamp)"
+    $mCompleted = Get-JsonProp -Obj $manifest -Name 'Completed'
+    $mLastStage = Get-JsonProp -Obj $manifest -Name 'LastStage'
+    $statusNote = if ($null -ne $mCompleted) { ", completed=$mCompleted, stage=$mLastStage" } else { '' }
+    Write-Host "    Loaded snapshot manifest: $manifestFile (timestamp=$mTimestamp$statusNote)"
 
     # Verify any root directories declared inside the manifest stay strictly within caller-authorized roots.
     foreach ($rootKey in @('Lane1Home', 'Lane2Home', 'LocalBin')) {
@@ -485,6 +624,21 @@ if (Test-Path -LiteralPath $manifestFile -PathType Leaf) {
 } else {
     $script:WarningCount++
     Write-Warning "No snapshot manifest found at $manifestFile; falling back to latest timestamped .backup-* files."
+}
+
+# Collect canonicalized wrapper paths recorded in the manifest (if any) so Step 3 never deletes
+# an untouched pre-existing user launcher when rolling back a partial/interrupted install.
+$manifestWrappers = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+if ($manifest) {
+    foreach ($mw in @(Get-JsonProp -Obj $manifest -Name 'Wrappers')) {
+        $mwStr = [string]$mw
+        if (-not [string]::IsNullOrWhiteSpace($mwStr)) {
+            if (-not (Test-PathInsideAllowedRoots -CandidatePath $mwStr -AllowedRoots $allowedRestoreRoots)) {
+                throw "Security violation: Snapshot wrapper path '$mwStr' is outside allowed Codex directories!"
+            }
+            [void]$manifestWrappers.Add((Resolve-CanonicalLongPath -PathValue $mwStr))
+        }
+    }
 }
 
 # ============================================================================
@@ -595,23 +749,28 @@ $manifestFiles = if ($manifest) { @(Get-JsonProp -Obj $manifest -Name 'Files') }
 $manifestFiles = @($manifestFiles | Where-Object { $null -ne $_ })
 $handledManifestTargets = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
-if ($manifest -and $manifestFiles.Count -gt 0) {
+if ($manifest) {
+    if ($manifestFiles.Count -eq 0) {
+        Write-Host "    Manifest records 0 modified files (interrupted before file writes); nothing to restore in Step 2." -ForegroundColor DarkGray
+    }
     foreach ($entry in $manifestFiles) {
-        $target = [string](Get-JsonProp -Obj $entry -Name 'TargetPath')
-        if (-not (Test-PathInsideAllowedRoots -CandidatePath $target -AllowedRoots $allowedRestoreRoots)) {
-            throw "Security violation: Snapshot target path '$target' is outside allowed Codex directories!"
+        $rawTarget = [string](Get-JsonProp -Obj $entry -Name 'TargetPath')
+        if (-not (Test-PathInsideAllowedRoots -CandidatePath $rawTarget -AllowedRoots $allowedRestoreRoots)) {
+            throw "Security violation: Snapshot target path '$rawTarget' is outside allowed Codex directories!"
         }
+        $target = Resolve-CanonicalLongPath -PathValue $rawTarget
         Assert-NoReparsePointInPath -CandidatePath $target -AllowedRoots $allowedRestoreRoots
-        [void]$handledManifestTargets.Add([System.IO.Path]::GetFullPath($target))
+        [void]$handledManifestTargets.Add($target)
 
         $existedPrior = [bool](Get-JsonProp -Obj $entry -Name 'ExistedPrior')
         if ($existedPrior) {
-            $bkp = [string](Get-JsonProp -Obj $entry -Name 'BackupPath')
+            $rawBkp = [string](Get-JsonProp -Obj $entry -Name 'BackupPath')
             $expectedSha = [string](Get-JsonProp -Obj $entry -Name 'OriginalSha256')
 
-            if (-not (Test-PathInsideAllowedRoots -CandidatePath $bkp -AllowedRoots $allowedRestoreRoots)) {
-                throw "Security violation: Snapshot backup path '$bkp' is outside allowed Codex directories!"
+            if (-not (Test-PathInsideAllowedRoots -CandidatePath $rawBkp -AllowedRoots $allowedRestoreRoots)) {
+                throw "Security violation: Snapshot backup path '$rawBkp' is outside allowed Codex directories!"
             }
+            $bkp = Resolve-CanonicalLongPath -PathValue $rawBkp
             Assert-NoReparsePointInPath -CandidatePath $bkp -AllowedRoots $allowedRestoreRoots
 
             # Require a valid 64-character hex SHA-256 digest so a tampered manifest cannot omit verification.
@@ -620,6 +779,15 @@ if ($manifest -and $manifestFiles.Count -gt 0) {
             }
 
             if (-not (Test-Path -LiteralPath $bkp -PathType Leaf)) {
+                # Idempotent re-run check: if a prior rollback already restored the exact original
+                # bytes and cleaned up the backup, verify SHA-256 and report cleanly without warning.
+                if (Test-Path -LiteralPath $target -PathType Leaf) {
+                    $curTargetHash = Get-FileSha256 $target
+                    if ($curTargetHash.Equals($expectedSha, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        Write-Host "    Already at original state (SHA-256 verified): $target (SHA256=$($curTargetHash.Substring(0, 12))...)" -ForegroundColor DarkGray
+                        continue
+                    }
+                }
                 $script:WarningCount++
                 Write-Warning "Backup file missing: $bkp (cannot restore $target; original file left untouched)"
                 continue
@@ -701,7 +869,7 @@ if ($manifest -and $manifestFiles.Count -gt 0) {
 # ============================================================================
 Write-Step "Step 3: Reconciling CLI wrappers in $LocalBin..."
 foreach ($w in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd')) {
-    $wp = [System.IO.Path]::GetFullPath((Join-Path $LocalBin $w))
+    $wp = Resolve-CanonicalLongPath -PathValue (Join-Path $LocalBin $w)
     # If Step 2 already restored (ExistedPrior=$true) or removed (ExistedPrior=$false) this wrapper
     # from the rollback manifest, do not touch it again in Step 3.
     if ($handledManifestTargets.Contains($wp)) {
@@ -732,6 +900,12 @@ foreach ($w in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd')) {
             Write-Host "    [DRY-RUN] Would restore pre-existing wrapper: $latestWrapperBkp -> $wp (SHA256=$($bkpHash.Substring(0, 12))...)" -ForegroundColor Green
         }
     } elseif (Test-Path -LiteralPath $wp -PathType Leaf) {
+        # Crash-safe interrupted-install guard: when a manifest is loaded and does NOT record this
+        # wrapper in either Files or Wrappers, the interrupted install never touched it—preserve it!
+        if ($manifest -and (-not $manifestWrappers.Contains($wp))) {
+            Write-Host "    Preserved untouched launcher (not modified by interrupted install): $wp" -ForegroundColor DarkGray
+            continue
+        }
         if (-not $script:IsDryRun) {
             $rmRes = Remove-FileGracefully -TargetPath $wp
             if (-not $rmRes.Success) {
@@ -750,9 +924,21 @@ if (-not $SkipPathUpdate) {
     $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
     if ($userPath) {
         $normBin = $LocalBin.TrimEnd('\').ToLowerInvariant()
-        $remaining = @($userPath -split ';' | Where-Object { $_ -and ($_.TrimEnd('\').ToLowerInvariant() -ne $normBin) })
-        $cleanedPath = $remaining -join ';'
-        if ($cleanedPath -ne $userPath) {
+        $remaining = New-Object 'System.Collections.Generic.List[string]'
+        $removedAny = $false
+        foreach ($entry in ($userPath -split ';')) {
+            if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+            $entryCanon = try { (Resolve-CanonicalLongPath -PathValue $entry).TrimEnd('\').ToLowerInvariant() } catch { $entry.TrimEnd('\').ToLowerInvariant() }
+            if ($entryCanon -eq $normBin) {
+                $removedAny = $true
+                continue
+            }
+            $remaining.Add($entry)
+        }
+        # Only rewrite User PATH when LocalBin actually matched and was removed; never rewrite
+        # merely because User PATH contained a trailing or empty ';' separator.
+        if ($removedAny) {
+            $cleanedPath = $remaining -join ';'
             if (-not $script:IsDryRun) {
                 [System.Environment]::SetEnvironmentVariable('Path', $cleanedPath, 'User')
                 Write-Host "    Removed $LocalBin from User PATH."

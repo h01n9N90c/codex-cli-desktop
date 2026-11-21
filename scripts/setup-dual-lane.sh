@@ -42,11 +42,27 @@ cleanup_temp_artifacts() {
     rm -rf -- "${TEMP_ARTIFACTS[@]}" 2>/dev/null || true
   fi
 }
-trap cleanup_temp_artifacts EXIT INT TERM
+handle_signal_exit() {
+  local sig="$1"
+  cleanup_temp_artifacts
+  trap - "${sig}" EXIT
+  kill -"${sig}" "$$" 2>/dev/null || exit 130
+}
+trap cleanup_temp_artifacts EXIT
+trap 'handle_signal_exit INT' INT
+trap 'handle_signal_exit TERM' TERM
 
-# Track every managed file written so we can emit a deterministic SHA-256
-# rollback manifest for `./scripts/restore-original.sh`.
+# Track every managed file written so we can flush a crash-safe, deterministic
+# SHA-256 rollback manifest incrementally for `./scripts/restore-original.sh`.
 MANIFEST_ROWS=()
+LINKED_SHARED_DIRS=()
+ROLLBACK_READY=0
+ROLLBACK_STATUS="in-progress"
+ROLLBACK_DIR=""
+SNAP_FILE=""
+LATEST_FILE=""
+UTC_NOW=""
+stamp=""
 
 # ------------------------------------------------------------------------------
 # Helper Functions
@@ -249,7 +265,7 @@ atomic_write_from_stdin() {
     exit 1
   fi
   local parent tmp
-  parent="$(dirname "${dst}")"
+  parent="$(dirname -- "${dst}")"
   tmp="$(mktemp "${parent}/.codex-tmp.XXXXXX")"
   TEMP_ARTIFACTS+=("${tmp}")
   cat > "${tmp}"
@@ -257,10 +273,55 @@ atomic_write_from_stdin() {
   mv -f -- "${tmp}" "${dst}"
 }
 
+# Emit the current rollback manifest (5-column TSV with metadata headers).
+# Comment lines record schema_version, completion status (`in-progress` during
+# incremental checkpoints vs `complete` at finish), timestamp, and linked shared
+# directories while remaining 100% compatible with restore-original.sh.
+emit_manifest() {
+  printf '# schema_version=1\n'
+  printf '# status=%s\n' "${ROLLBACK_STATUS}"
+  printf '# timestamp=%s\n' "${stamp}"
+  printf '# created_at_utc=%s\n' "${UTC_NOW}"
+  if [ "${#LINKED_SHARED_DIRS[@]}" -gt 0 ]; then
+    local joined_links="" d_item
+    for d_item in "${LINKED_SHARED_DIRS[@]}"; do
+      if [ -n "${joined_links}" ]; then
+        joined_links="${joined_links},${d_item}"
+      else
+        joined_links="${d_item}"
+      fi
+    done
+    printf '# shared_links=%s\n' "${joined_links}"
+  fi
+  printf '# columns: existed_prior<TAB>original_sha256<TAB>target_path<TAB>backup_path<TAB>original_mode\n'
+  if [ "${#MANIFEST_ROWS[@]}" -gt 0 ]; then
+    local row
+    for row in "${MANIFEST_ROWS[@]}"; do
+      printf '%s\n' "${row}"
+    done
+  fi
+}
+
+# Atomically persist both the timestamped rollback snapshot and latest.tsv
+# (mode 0600) incrementally after every tracked backup/mutation when DRY_RUN=0.
+# Uses process substitution so atomic_write_from_stdin runs in the main shell
+# and registers staging files in TEMP_ARTIFACTS for signal-safe cleanup.
+flush_rollback_manifest() {
+  if [ "${DRY_RUN}" -ne 0 ] || [ "${ROLLBACK_READY}" -ne 1 ]; then
+    return 0
+  fi
+  if [ -L "${ROLLBACK_DIR}" ]; then
+    echo "[FAIL] Security refusal: rollback directory '${ROLLBACK_DIR}' is a symlink." >&2
+    exit 1
+  fi
+  atomic_write_from_stdin "${SNAP_FILE}" 600 < <(emit_manifest)
+  atomic_write_from_stdin "${LATEST_FILE}" 600 < <(emit_manifest)
+}
+
 # Back up a pre-existing target file (such as a CLI launcher in LOCAL_BIN)
 # before overwriting it, recording its SHA-256, backup path, and original POSIX
-# mode (column 5) in MANIFEST_ROWS so restore-original.sh restores both content
-# and permissions (e.g. 755) instead of forcing 700 or deleting the launcher.
+# mode (column 5) in MANIFEST_ROWS and flushing the manifest incrementally so
+# interrupted installs remain fully recoverable with exact mode restoration.
 record_target_for_rollback() {
   local dst="$1"
   local bkp_mode="${2:-600}"
@@ -301,10 +362,12 @@ record_target_for_rollback() {
   else
     MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${dst}")")
   fi
+  flush_rollback_manifest
 }
 
-# Back up an existing file with SHA-256 verification and atomically install a
-# replacement template, recording the transition and original mode in MANIFEST_ROWS.
+# Back up an existing file with SHA-256 verification, flush the rollback
+# manifest BEFORE overwriting the live target (write-ahead journal), and
+# atomically install the replacement template.
 backup_and_copy() {
   local src="$1"
   local dst="$2"
@@ -338,6 +401,7 @@ backup_and_copy() {
   else
     MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${dst}")")
   fi
+  flush_rollback_manifest
   if [ "${DRY_RUN}" -eq 0 ]; then
     atomic_write_from_stdin "${dst}" "${mode}" < "${src}"
     echo "    Installed: ${dst}"
@@ -586,8 +650,12 @@ if [ "${USE_GIT_WORKTREE}" -eq 1 ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 4. Prepare Directories & Harden Owner-Only Permissions (0700)
+# 4. Prepare Directories, Rollback Journal & Harden Owner-Only Permissions (0700)
 # ------------------------------------------------------------------------------
+base_stamp="$(date +%Y%m%d-%H%M%S)"
+stamp="${base_stamp}"
+UTC_NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%dT%H:%M:%S)"
+ROLLBACK_DIR="${LANE2_HOME}/.rollback"
 if [ "${DRY_RUN}" -eq 0 ]; then
   for home_root in "${LANE1_HOME}" "${LANE2_HOME}"; do
     if [ -L "${home_root}" ]; then
@@ -595,16 +663,38 @@ if [ "${DRY_RUN}" -eq 0 ]; then
       exit 1
     fi
   done
-  mkdir -p -- "${LANE1_HOME}/rules" "${LANE2_HOME}/rules" "${LOCAL_BIN}"
-  # Enforce 0700 on both CODEX_HOME roots and rules dirs even if pre-existing.
+  if [ -L "${ROLLBACK_DIR}" ]; then
+    echo "[FAIL] Security refusal: rollback directory '${ROLLBACK_DIR}' is a symlink." >&2
+    exit 1
+  fi
+  mkdir -p -- "${LANE1_HOME}/rules" "${LANE2_HOME}/rules" "${LOCAL_BIN}" "${ROLLBACK_DIR}"
+  # Enforce 0700 on both CODEX_HOME roots, rules dirs, and rollback dir even if pre-existing.
   # Note: omit `--` on chmod for BSD/macOS compatibility (paths are validated absolute).
-  chmod 700 "${LANE1_HOME}" "${LANE1_HOME}/rules" "${LANE2_HOME}" "${LANE2_HOME}/rules" 2>/dev/null || true
+  chmod 700 "${LANE1_HOME}" "${LANE1_HOME}/rules" "${LANE2_HOME}" "${LANE2_HOME}/rules" "${ROLLBACK_DIR}" 2>/dev/null || true
+
+  # Prevent same-second snapshot/backup collisions across rapid repeated install/rollback
+  # cycles while keeping lexicographic timestamp ordering strictly chronological.
+  if [ -e "${ROLLBACK_DIR}/snapshot-${stamp}.tsv" ] || [ -L "${ROLLBACK_DIR}/snapshot-${stamp}.tsv" ]; then
+    seq_idx=1
+    while :; do
+      cand_stamp="$(printf '%s-%02d' "${base_stamp}" "${seq_idx}")"
+      if [ ! -e "${ROLLBACK_DIR}/snapshot-${cand_stamp}.tsv" ] && [ ! -L "${ROLLBACK_DIR}/snapshot-${cand_stamp}.tsv" ]; then
+        stamp="${cand_stamp}"
+        break
+      fi
+      seq_idx=$((seq_idx + 1))
+    done
+  fi
+  SNAP_FILE="${ROLLBACK_DIR}/snapshot-${stamp}.tsv"
+  LATEST_FILE="${ROLLBACK_DIR}/latest.tsv"
+  ROLLBACK_READY=1
+  ROLLBACK_STATUS="in-progress"
+  flush_rollback_manifest
 fi
 
 # ------------------------------------------------------------------------------
 # 5. Share Memories, Sessions, Skills & Plugins via Symlinks (Non-Destructive)
 # ------------------------------------------------------------------------------
-stamp="$(date +%Y%m%d-%H%M%S)"
 SHARED_DIRS=(memories memories_v2 sessions archived_sessions skills plugins)
 for d in "${SHARED_DIRS[@]}"; do
   src_dir="${LANE1_HOME}/${d}"
@@ -617,6 +707,8 @@ for d in "${SHARED_DIRS[@]}"; do
     existing_target="$(readlink "${dst_link}" 2>/dev/null || true)"
     if [ "${existing_target}" = "${src_dir}" ]; then
       echo "    Already linked: ${dst_link} -> ${src_dir}"
+      LINKED_SHARED_DIRS+=("${d}")
+      flush_rollback_manifest
     else
       echo "[WARN] Existing symlink ${dst_link} points to '${existing_target}' (expected '${src_dir}'); leaving untouched." >&2
     fi
@@ -625,6 +717,7 @@ for d in "${SHARED_DIRS[@]}"; do
     if [ "${DRY_RUN}" -eq 0 ]; then
       mv -- "${dst_link}" "${dst_link}.backup-${stamp}"
       echo "    Backed up existing directory: ${dst_link}.backup-${stamp}"
+      flush_rollback_manifest
     else
       echo "    [DRY-RUN] Would back up existing directory: ${dst_link}.backup-${stamp}"
     fi
@@ -632,6 +725,8 @@ for d in "${SHARED_DIRS[@]}"; do
   if [ "${DRY_RUN}" -eq 0 ]; then
     ln -s -- "${src_dir}" "${dst_link}"
     echo "    Linked: ${dst_link} -> ${src_dir}"
+    LINKED_SHARED_DIRS+=("${d}")
+    flush_rollback_manifest
   else
     echo "    [DRY-RUN] Would link: ${dst_link} -> ${src_dir}"
   fi
@@ -680,6 +775,7 @@ if [ -f "${CFG2}" ]; then
     echo "    [DRY-RUN] Would save backup: ${CFG2_BKP} (SHA256=${CFG2_ORIG_HASH:0:12}...)"
   fi
   MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s\t%s' "${CFG2_ORIG_HASH}" "${CFG2}" "${CFG2_BKP}" "${CFG2_ORIG_MODE}")")
+  flush_rollback_manifest
 
   # Preserve custom user top-level keys (e.g. model, service_tier,
   # cli_auth_credentials_store) except installer-managed sandbox/approval keys.
@@ -766,6 +862,7 @@ if [ -f "${CFG2}" ]; then
   ' "${CFG2}" || true)"
 else
   MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${CFG2}")")
+  flush_rollback_manifest
 fi
 
 ESC_REPO="$(escape_toml "${REPO_PATH}")"
@@ -781,43 +878,45 @@ has_project_section() {
     || printf '%s\n' "${PRESERVED_USER_SECTIONS}" | grep -Fq -e "[projects.'${raw_p}']"
 }
 
+render_lane2_config() {
+  printf '# Official OpenAI / ChatGPT Codex CLI configuration (LANE 2)\n'
+  printf '# Zero plaintext secrets: authenticate via `codex login` (OAuth/keyring).\n'
+  printf 'sandbox_mode = "workspace-write"\n'
+  printf 'approval_policy = "%s"\n' "${APPROVAL_POLICY}"
+  if [ -n "${PRESERVED_TOP_KEYS}" ]; then
+    printf '%s\n' "${PRESERVED_TOP_KEYS}"
+  fi
+  printf '\n'
+  if ! has_project_section "${REPO_PATH}" "${ESC_REPO}"; then
+    printf '[projects."%s"]\n' "${ESC_REPO}"
+    printf 'trust_level = "trusted"\n\n'
+  fi
+  if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section "${EFFECTIVE_LANE2_REPO}" "${ESC_LANE2_REPO}"; then
+    printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
+    printf 'trust_level = "trusted"\n\n'
+  fi
+  printf '[features]\n'
+  [ "${HAS_DAEMON_FLAG}" -eq 1 ] && printf 'daemon_auto_start = false\n'
+  printf 'memories = true\n'
+  printf 'js_repl = false\n'
+  [ "${HAS_GOALS_FLAG}" -eq 1 ] && printf 'goals = true\n'
+  printf '\n[memories]\n'
+  printf 'generate_memories = true\n'
+  printf 'use_memories = true\n\n'
+  printf '[sandbox_workspace_write]\n'
+  printf 'network_access = %s\n\n' "${SANDBOX_NETWORK}"
+  printf '[shell_environment_policy]\n'
+  printf 'exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]\n\n'
+  printf '[shell_environment_policy.set]\n'
+  printf 'CODEX_ACTIVE_LANE = "LANE_2"\n'
+  printf 'CARGO_TARGET_DIR = "%s"\n' "${ESC_CARGO}"
+  if [ -n "${PRESERVED_USER_SECTIONS}" ]; then
+    printf '\n# Preserved existing sections\n%s\n' "${PRESERVED_USER_SECTIONS}"
+  fi
+}
+
 if [ "${DRY_RUN}" -eq 0 ]; then
-  {
-    printf '# Official OpenAI / ChatGPT Codex CLI configuration (LANE 2)\n'
-    printf '# Zero plaintext secrets: authenticate via `codex login` (OAuth/keyring).\n'
-    printf 'sandbox_mode = "workspace-write"\n'
-    printf 'approval_policy = "%s"\n' "${APPROVAL_POLICY}"
-    if [ -n "${PRESERVED_TOP_KEYS}" ]; then
-      printf '%s\n' "${PRESERVED_TOP_KEYS}"
-    fi
-    printf '\n'
-    if ! has_project_section "${REPO_PATH}" "${ESC_REPO}"; then
-      printf '[projects."%s"]\n' "${ESC_REPO}"
-      printf 'trust_level = "trusted"\n\n'
-    fi
-    if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section "${EFFECTIVE_LANE2_REPO}" "${ESC_LANE2_REPO}"; then
-      printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
-      printf 'trust_level = "trusted"\n\n'
-    fi
-    printf '[features]\n'
-    [ "${HAS_DAEMON_FLAG}" -eq 1 ] && printf 'daemon_auto_start = false\n'
-    printf 'memories = true\n'
-    printf 'js_repl = false\n'
-    [ "${HAS_GOALS_FLAG}" -eq 1 ] && printf 'goals = true\n'
-    printf '\n[memories]\n'
-    printf 'generate_memories = true\n'
-    printf 'use_memories = true\n\n'
-    printf '[sandbox_workspace_write]\n'
-    printf 'network_access = %s\n\n' "${SANDBOX_NETWORK}"
-    printf '[shell_environment_policy]\n'
-    printf 'exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]\n\n'
-    printf '[shell_environment_policy.set]\n'
-    printf 'CODEX_ACTIVE_LANE = "LANE_2"\n'
-    printf 'CARGO_TARGET_DIR = "%s"\n' "${ESC_CARGO}"
-    if [ -n "${PRESERVED_USER_SECTIONS}" ]; then
-      printf '\n# Preserved existing sections\n%s\n' "${PRESERVED_USER_SECTIONS}"
-    fi
-  } | atomic_write_from_stdin "${CFG2}" 600
+  atomic_write_from_stdin "${CFG2}" 600 < <(render_lane2_config)
 
   # Tighten permissions on sensitive auth/config files in both lanes (regular
   # files only; never traverse symlinks with chmod; omit `--` for BSD/macOS chmod).
@@ -849,92 +948,166 @@ Q_CODEX_BIN="$(shell_quote "${CODEX_BIN}")"
 Q_PRIMARY_REPO="$(shell_quote "${REPO_PATH}")"
 Q_LANE2_REPO="$(shell_quote "${EFFECTIVE_LANE2_REPO}")"
 
-for name in codex codex-official codex-t3; do
+render_lane2_wrapper() {
+  printf '#!/usr/bin/env bash\n'
+  printf '# Codex Dual-Lane wrapper: launches Lane 2 (Official OpenAI/ChatGPT CODEX_HOME)\n'
+  printf 'export CODEX_HOME=%s\n' "${Q_LANE2_HOME}"
+  printf 'export CODEX_ACTIVE_LANE=%s\n' "'LANE_2'"
+  printf 'export CARGO_TARGET_DIR=%s\n' "${Q_CARGO_TARGET}"
+  if [ "${USE_GIT_WORKTREE}" -eq 1 ] && [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ]; then
+    printf 'export CODEX_PRIMARY_REPO=%s\n' "${Q_PRIMARY_REPO}"
+    printf 'export CODEX_LANE2_WORKTREE=%s\n' "${Q_LANE2_REPO}"
+    cat <<'WRAPPER_WT_EOF'
+_dl_prim="$(cd -P -- "${CODEX_PRIMARY_REPO}" 2>/dev/null && pwd -P || printf '%s' "${CODEX_PRIMARY_REPO}")"
+_dl_prim="${_dl_prim%/}"
+# 1. Hard fail-closed worktree boundary & auto cwd switch (opt-out auto-cd ONLY via CODEX_NO_AUTO_WORKTREE_CD)
+if [ -z "${CODEX_NO_AUTO_WORKTREE_CD:-}" ]; then
+  if [ -L "${CODEX_LANE2_WORKTREE}" ]; then
+    printf '%s\n' "[FAIL] Security refusal: Lane 2 worktree '${CODEX_LANE2_WORKTREE}' is a symlink; refusing to fall back to primary repo '${CODEX_PRIMARY_REPO}'." >&2
+    exit 1
+  fi
+  if [ ! -d "${CODEX_LANE2_WORKTREE}" ]; then
+    printf '%s\n' "[FAIL] Lane 2 worktree '${CODEX_LANE2_WORKTREE}' is missing; refusing to fall back to primary repo '${CODEX_PRIMARY_REPO}'. Recreate the worktree or set CODEX_NO_AUTO_WORKTREE_CD=1 to opt out." >&2
+    exit 1
+  fi
+  if ! _dl_wt="$(cd -P -- "${CODEX_LANE2_WORKTREE}" 2>/dev/null && pwd -P)" || [ -z "${_dl_wt}" ]; then
+    printf '%s\n' "[FAIL] Lane 2 worktree '${CODEX_LANE2_WORKTREE}' is inaccessible (cd failed); refusing to fall back to primary repo '${CODEX_PRIMARY_REPO}'." >&2
+    exit 1
+  fi
+  _dl_wt="${_dl_wt%/}"
+  if [ -z "${_dl_wt}" ]; then
+    printf '%s\n' "[FAIL] Security refusal: Lane 2 worktree '${CODEX_LANE2_WORKTREE}' resolved to filesystem root '/'; refusing to run." >&2
+    exit 1
+  fi
+  case "${_dl_wt}/" in
+    "${_dl_prim}/"*)
+      printf '%s\n' "[FAIL] Security refusal: Lane 2 worktree '${_dl_wt}' resolves inside primary repo '${_dl_prim}'; refusing to run." >&2
+      exit 1
+      ;;
+  esac
+  _dl_cur="$(pwd -P 2>/dev/null || pwd)"
+  _dl_cur="${_dl_cur%/}"
+  case "${_dl_cur}/" in
+    "${_dl_prim}/"*)
+      _dl_rel="${_dl_cur#"${_dl_prim}"}"
+      _dl_rel="${_dl_rel#/}"
+      if [ -n "${_dl_rel}" ] && [ -d "${_dl_wt}/${_dl_rel}" ]; then
+        _dl_target="${_dl_wt}/${_dl_rel}"
+      else
+        _dl_target="${_dl_wt}"
+      fi
+      if ! cd -P -- "${_dl_target}" 2>/dev/null; then
+        printf '%s\n' "[FAIL] Failed to switch cwd into Lane 2 worktree '${_dl_target}' (cd failed); refusing to remain in primary repo '${CODEX_PRIMARY_REPO}'." >&2
+        exit 1
+      fi
+      _dl_after="$(pwd -P 2>/dev/null || printf '')"
+      _dl_after="${_dl_after%/}"
+      case "${_dl_after}/" in
+        "${_dl_wt}/"*) ;;
+        *)
+          printf '%s\n' "[FAIL] Post-cd verification failed: cwd '${_dl_after}' is outside canonical Lane 2 worktree '${_dl_wt}'; refusing to run." >&2
+          exit 1
+          ;;
+      esac
+      ;;
+  esac
+fi
+# 2. Argument scan & primary repo blocking (ALWAYS executes fail-closed, even when CODEX_NO_AUTO_WORKTREE_CD is set)
+_dl_canon_path() {
+  local p="$1" suffix="" cur parent base resolved=""
+  if [ -d "${p}" ]; then
+    if resolved="$(cd -P -- "${p}" 2>/dev/null && pwd -P)" && [ -n "${resolved}" ]; then
+      printf '%s' "${resolved}"
+      return 0
+    fi
+  fi
+  case "${p}" in
+    /*) cur="${p}" ;;
+    *)  resolved="$(pwd -P 2>/dev/null || pwd)"; cur="${resolved%/}/${p}" ;;
+  esac
+  while [ "${#cur}" -gt 1 ] && [ "${cur%/}" != "${cur}" ]; do
+    cur="${cur%/}"
+  done
+  while [ ! -d "${cur}" ]; do
+    parent="$(dirname -- "${cur}")"
+    base="$(basename -- "${cur}")"
+    [ "${parent}" = "${cur}" ] && break
+    if [ -n "${suffix}" ]; then suffix="${base}/${suffix}"; else suffix="${base}"; fi
+    cur="${parent}"
+  done
+  if [ -d "${cur}" ]; then
+    if ! resolved="$(cd -P -- "${cur}" 2>/dev/null && pwd -P)" || [ -z "${resolved}" ]; then
+      parent="$(dirname -- "${cur}")"
+      base="$(basename -- "${cur}")"
+      if [ "${parent}" != "${cur}" ] && [ -d "${parent}" ]; then
+        resolved="$(cd -P -- "${parent}" 2>/dev/null && pwd -P || printf '%s' "${parent}")"
+        resolved="${resolved%/}/${base}"
+      else
+        resolved="${cur}"
+      fi
+    fi
+  else
+    resolved="${cur}"
+  fi
+  if [ -n "${suffix}" ]; then
+    if [ "${resolved}" = "/" ]; then printf '/%s' "${suffix}"; else printf '%s/%s' "${resolved%/}" "${suffix}"; fi
+  else
+    printf '%s' "${resolved}"
+  fi
+}
+_dl_check_target_arg() {
+  local cand="$1" abs=""
+  [ -z "${cand}" ] && return 0
+  abs="$(_dl_canon_path "${cand}")"
+  abs="${abs%/}"
+  case "${abs}/" in
+    "${_dl_prim}/"*)
+      printf '%s\n' "[FAIL] Lane 2 worktree isolation blocked -C/--cd/--add-dir targeting primary repo '${CODEX_PRIMARY_REPO}'. Use '${CODEX_LANE2_WORKTREE}' instead." >&2
+      exit 1
+      ;;
+  esac
+}
+_dl_expect_val=0
+for _dl_arg in "$@"; do
+  if [ "${_dl_expect_val}" -eq 1 ]; then
+    _dl_check_target_arg "${_dl_arg}"
+    _dl_expect_val=0
+    continue
+  fi
+  case "${_dl_arg}" in
+    --) break ;;
+    -C|--cd|--add-dir) _dl_expect_val=1 ;;
+    -C=*) _dl_check_target_arg "${_dl_arg#-C=}" ;;
+    -C?*) _dl_check_target_arg "${_dl_arg#-C}" ;;
+    --cd=*) _dl_check_target_arg "${_dl_arg#--cd=}" ;;
+    --add-dir=*) _dl_check_target_arg "${_dl_arg#--add-dir=}" ;;
+  esac
+done
+WRAPPER_WT_EOF
+  fi
+  printf 'exec %s "$@"\n' "${Q_CODEX_BIN}"
+}
+
+render_lane1_wrapper() {
+  printf '#!/usr/bin/env bash\n'
+  printf '# Codex Dual-Lane wrapper: launches Lane 1 (Primary CODEX_HOME)\n'
+  printf 'export CODEX_HOME=%s\n' "${Q_LANE1_HOME}"
+  printf 'export CODEX_ACTIVE_LANE=%s\n' "'LANE_1'"
+  printf 'exec %s "$@"\n' "${Q_CODEX_BIN}"
+}
+
+for name in codex codex-official; do
   record_target_for_rollback "${LOCAL_BIN}/${name}" preserve
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    atomic_write_from_stdin "${LOCAL_BIN}/${name}" 700 < <(render_lane2_wrapper)
+    flush_rollback_manifest
+  fi
 done
 
+record_target_for_rollback "${LOCAL_BIN}/codex-t3" preserve
 if [ "${DRY_RUN}" -eq 0 ]; then
-  for name in codex codex-official; do
-    {
-      printf '#!/usr/bin/env bash\n'
-      printf '# Codex Dual-Lane wrapper: launches Lane 2 (Official OpenAI/ChatGPT CODEX_HOME)\n'
-      printf 'export CODEX_HOME=%s\n' "${Q_LANE2_HOME}"
-      printf 'export CODEX_ACTIVE_LANE=%s\n' "'LANE_2'"
-      printf 'export CARGO_TARGET_DIR=%s\n' "${Q_CARGO_TARGET}"
-      if [ "${USE_GIT_WORKTREE}" -eq 1 ] && [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ]; then
-        printf 'export CODEX_PRIMARY_REPO=%s\n' "${Q_PRIMARY_REPO}"
-        printf 'export CODEX_LANE2_WORKTREE=%s\n' "${Q_LANE2_REPO}"
-        printf '_dl_prim="$(cd -P -- "${CODEX_PRIMARY_REPO}" 2>/dev/null && pwd -P || printf '\''%%s'\'' "${CODEX_PRIMARY_REPO}")"\n'
-        printf '_dl_prim="${_dl_prim%%%%/}"\n'
-        printf '# 1. Auto worktree cwd switch (disabled when CODEX_NO_AUTO_WORKTREE_CD is set or worktree missing)\n'
-        printf 'if [ -z "${CODEX_NO_AUTO_WORKTREE_CD:-}" ] && [ -d "${CODEX_LANE2_WORKTREE}" ]; then\n'
-        printf '  _dl_cur="$(pwd -P 2>/dev/null || pwd)"\n'
-        printf '  _dl_cur="${_dl_cur%%%%/}"\n'
-        printf '  case "${_dl_cur}/" in\n'
-        printf '    "${_dl_prim}/"*)\n'
-        printf '      _dl_rel="${_dl_cur#"${_dl_prim}"}"\n'
-        printf '      _dl_rel="${_dl_rel#/}"\n'
-        printf '      if [ -n "${_dl_rel}" ] && [ -d "${CODEX_LANE2_WORKTREE}/${_dl_rel}" ]; then\n'
-        printf '        cd "${CODEX_LANE2_WORKTREE}/${_dl_rel}" || exit 1\n'
-        printf '      else\n'
-        printf '        cd "${CODEX_LANE2_WORKTREE}" || exit 1\n'
-        printf '      fi\n'
-        printf '      ;;\n'
-        printf '  esac\n'
-        printf 'fi\n'
-        printf '# 2. Argument scan & primary repo blocking (ALWAYS executes, even if auto-cd is disabled or worktree missing)\n'
-        printf '_dl_check_target_arg() {\n'
-        printf '  local cand="$1" abs="" cdir cbase cpar\n'
-        printf '  [ -z "${cand}" ] && return 0\n'
-        printf '  if [ -d "${cand}" ]; then\n'
-        printf '    abs="$(cd -P -- "${cand}" 2>/dev/null && pwd -P || printf '\''%%s'\'' "${cand}")"\n'
-        printf '  else\n'
-        printf '    cdir="$(dirname -- "${cand}")"\n'
-        printf '    cbase="$(basename -- "${cand}")"\n'
-        printf '    if [ -d "${cdir}" ]; then\n'
-        printf '      cpar="$(cd -P -- "${cdir}" 2>/dev/null && pwd -P || printf '\''%%s'\'' "${cdir}")"\n'
-        printf '      abs="${cpar%%%%/}/${cbase}"\n'
-        printf '    else\n'
-        printf '      case "${cand}" in\n'
-        printf '        /*) abs="${cand}" ;;\n'
-        printf '        *)  cpar="$(pwd -P 2>/dev/null || pwd)"; abs="${cpar%%%%/}/${cand}" ;;\n'
-        printf '      esac\n'
-        printf '    fi\n'
-        printf '  fi\n'
-        printf '  abs="${abs%%%%/}"\n'
-        printf '  case "${abs}/" in\n'
-        printf '    "${_dl_prim}/"*)\n'
-        printf '      printf '\''%%s\\n'\'' "[FAIL] Lane 2 worktree isolation blocked -C/--cd/--add-dir targeting primary repo '\''${CODEX_PRIMARY_REPO}'\''. Use '\''${CODEX_LANE2_WORKTREE}'\'' instead." >&2\n'
-        printf '      exit 1\n'
-        printf '      ;;\n'
-        printf '  esac\n'
-        printf '}\n'
-        printf '_dl_expect_val=0\n'
-        printf 'for _dl_arg in "$@"; do\n'
-        printf '  if [ "${_dl_expect_val}" -eq 1 ]; then\n'
-        printf '    _dl_check_target_arg "${_dl_arg}"\n'
-        printf '    _dl_expect_val=0\n'
-        printf '    continue\n'
-        printf '  fi\n'
-        printf '  case "${_dl_arg}" in\n'
-        printf '    --) break ;;\n'
-        printf '    -C|--cd|--add-dir) _dl_expect_val=1 ;;\n'
-        printf '    --cd=*) _dl_check_target_arg "${_dl_arg#--cd=}" ;;\n'
-        printf '    --add-dir=*) _dl_check_target_arg "${_dl_arg#--add-dir=}" ;;\n'
-        printf '  esac\n'
-        printf 'done\n'
-      fi
-      printf 'exec %s "$@"\n' "${Q_CODEX_BIN}"
-    } | atomic_write_from_stdin "${LOCAL_BIN}/${name}" 700
-  done
-
-  {
-    printf '#!/usr/bin/env bash\n'
-    printf '# Codex Dual-Lane wrapper: launches Lane 1 (Primary CODEX_HOME)\n'
-    printf 'export CODEX_HOME=%s\n' "${Q_LANE1_HOME}"
-    printf 'export CODEX_ACTIVE_LANE=%s\n' "'LANE_1'"
-    printf 'exec %s "$@"\n' "${Q_CODEX_BIN}"
-  } | atomic_write_from_stdin "${LOCAL_BIN}/codex-t3" 700
+  atomic_write_from_stdin "${LOCAL_BIN}/codex-t3" 700 < <(render_lane1_wrapper)
+  flush_rollback_manifest
   echo "    Installed wrappers in: ${LOCAL_BIN}"
 else
   echo "    [DRY-RUN] Would install wrappers in: ${LOCAL_BIN}"
@@ -994,36 +1167,11 @@ if [ "${SYNC_SESSIONS}" -eq 1 ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 11. Persist Deterministic SHA-256 Rollback Manifest (Skipped in --dry-run)
+# 11. Finalize Deterministic SHA-256 Rollback Manifest (Skipped in --dry-run)
 # ------------------------------------------------------------------------------
 if [ "${DRY_RUN}" -eq 0 ]; then
-  ROLLBACK_DIR="${LANE2_HOME}/.rollback"
-  if [ -L "${ROLLBACK_DIR}" ]; then
-    echo "[FAIL] Security refusal: rollback directory '${ROLLBACK_DIR}' is a symlink." >&2
-    exit 1
-  fi
-  mkdir -p -- "${ROLLBACK_DIR}"
-  chmod 700 "${ROLLBACK_DIR}" 2>/dev/null || true
-
-  UTC_NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%dT%H:%M:%S)"
-  SNAP_FILE="${ROLLBACK_DIR}/snapshot-${stamp}.tsv"
-  LATEST_FILE="${ROLLBACK_DIR}/latest.tsv"
-
-  emit_manifest() {
-    printf '# schema_version=1\n'
-    printf '# timestamp=%s\n' "${stamp}"
-    printf '# created_at_utc=%s\n' "${UTC_NOW}"
-    printf '# columns: existed_prior<TAB>original_sha256<TAB>target_path<TAB>backup_path<TAB>original_mode\n'
-    if [ "${#MANIFEST_ROWS[@]}" -gt 0 ]; then
-      local row
-      for row in "${MANIFEST_ROWS[@]}"; do
-        printf '%s\n' "${row}"
-      done
-    fi
-  }
-
-  emit_manifest | atomic_write_from_stdin "${SNAP_FILE}" 600
-  emit_manifest | atomic_write_from_stdin "${LATEST_FILE}" 600
+  ROLLBACK_STATUS="complete"
+  flush_rollback_manifest
   echo "    Rollback snapshot saved: ${LATEST_FILE}"
 fi
 

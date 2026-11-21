@@ -1,4 +1,4 @@
-# Cẩm nang Xử lý Nhanh 9 Lỗi Thực Chiến (Troubleshooting)
+# Cẩm nang Xử lý Nhanh 10 Lỗi Thực Chiến (Troubleshooting)
 
 > **Tác giả:** Lê Hoàng Ngọc Tươi | **Dự án:** Codex Dual-Lane & Security Kit (Apache License 2.0)
 
@@ -88,7 +88,11 @@
   1. Thư mục `~/.codex` / `~/.codex-official` có thể mang quyền kế thừa **`CodexSandboxUsers:(OI)(CI)(RX)`** do sandbox Windows của Codex tạo ra.
   2. Mỗi khi Codex CLI hoặc Codex Desktop cập nhật `config.toml` (vd sau `codex features enable ...`, tin cậy dự án mới, hoặc sửa Settings trong App) hay làm mới `auth.json` bằng cơ chế **atomic replace** (tạo tệp tạm rồi đổi tên đè lên tệp cũ), Windows cấp lại DACL kế thừa từ thư mục cha — làm mất khóa `icacls` cũ trên tệp đó.
 * **Cách khắc phục & Phòng ngừa bền vững:**
-  1. **Khóa lại ngay bằng quy trình `icacls.exe` 2 bước** (hoặc chạy lại `.\scripts\setup-dual-lane.ps1`):
+  1. **Khóa nhanh lại ngay trong ~1 giây bằng `-ReapplyAclOnly`** (khuyên dùng — giữ nguyên bit-identical SHA-256 của `config.toml` & `auth.json`):
+     ```powershell
+     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -ReapplyAclOnly
+     ```
+     Hoặc chạy thủ công quy trình `icacls.exe` 2 bước tuần tự (`/inheritance:d` trước để chuyển ACE kế thừa thành tường minh, rồi `/remove:g "CodexSandboxUsers"`):
      ```powershell
      foreach ($f in @("$env:USERPROFILE\.codex\auth.json","$env:USERPROFILE\.codex\config.toml","$env:USERPROFILE\.codex-official\auth.json","$env:USERPROFILE\.codex-official\config.toml")) {
          if (Test-Path -LiteralPath $f) {
@@ -97,13 +101,13 @@
          }
      }
      ```
-     *(Lưu ý: Bắt buộc chạy 2 lệnh tuần tự — `/inheritance:d` trước để chuyển ACE kế thừa thành tường minh, rồi `/remove:g "CodexSandboxUsers"` mới gỡ được quyền đọc của sandbox).*
   2. **Khuyến nghị vệ sinh bí mật bền vững nhất:** Thêm `cli_auth_credentials_store = "keyring"` vào `config.toml` (nếu phiên bản Codex của bạn hỗ trợ) để lưu token đăng nhập trong OS Keyring thay vì `auth.json`, và luôn dùng `env_key` thay cho plaintext API key.
 
 ---
 
-### Lỗi 9: Cách khôi phục / gỡ bỏ hoàn toàn mà không làm mất lịch sử phiên trong `~/.codex`
+### Lỗi 9: Cách khôi phục / gỡ bỏ hoàn toàn (hoặc phục hồi sau khi cài đặt bị ngắt giữa chừng) mà không làm mất lịch sử phiên trong `~/.codex`
 * **Cảnh báo quan trọng:** Các thư mục `memories`, `memories_v2`, `sessions`, `archived_sessions`, `skills`, `plugins` bên trong `~/.codex-official` là **NTFS Directory Junction** (Windows) hoặc **symlink** (macOS/Linux/WSL) trỏ về `~/.codex`. **Tuyệt đối không dùng công cụ xóa đệ quy bừa bãi lên `~/.codex-official` trước khi tháo các liên kết này!**
+* **Phục hồi khi cài đặt bị ngắt giữa chừng (`Ctrl+C` / lỗi đột ngột):** Bộ cài ghi nhật ký rollback tăng dần sau từng thao tác (`.rollback/latest.json` với `Completed: false` trên Windows / `.rollback/latest.tsv` với `# status=in-progress` trên Unix). Nếu `doctor.ps1` / `doctor.sh` báo `[WARN] Rollback Journal`, hãy chạy ngay `restore-original.*` bên dưới để hoàn nguyên sạch toàn bộ thay đổi bán phần rồi cài lại.
 * **Cách gỡ chuẩn và an toàn nhất (tự động kiểm chứng SHA-256 & tháo liên kết trước):**
   * **Windows:**
     ```powershell
@@ -115,3 +119,13 @@
     ./scripts/restore-original.sh --dry-run
     ./scripts/restore-original.sh --remove-lane2-home
     ```
+
+---
+
+### Lỗi 10: Wrapper `codex` báo `[FAIL] Lane 2 worktree ... is missing or inaccessible` (hoặc `cd failed`) và từ chối chạy
+* **Khi nào gặp:** Bạn đã cài với cờ `-UseGitWorktree` / `--use-git-worktree`, sau đó thư mục worktree `<repo>-lane2` bị xóa, di chuyển, bị thay bằng tệp thường/symlink, hoặc không thể truy cập (`cd` thất bại).
+* **Tại sao lại từ chối chạy thay vì chạy ở repo chính?** Đây là **tính năng bảo vệ Hard Fail-Closed**: wrapper Luồng 2 cố ý dừng với mã thoát `1` và không khởi chạy `codex` để ngăn agent Luồng 2 âm thầm fallback về ghi đè lên cây làm việc của Luồng 1 trong repo chính.
+* **Cách xử lý chuẩn:**
+  1. **Tạo lại worktree Luồng 2 (khuyên dùng):** Chạy lại bộ cài với `-UseGitWorktree` (Windows) hoặc `--use-git-worktree` (Unix) để dựng lại worktree chuẩn và cập nhật wrapper.
+  2. **Tạm tắt tự động đổi thư mục (chỉ khi thực sự cần):** Đặt `CODEX_NO_AUTO_WORKTREE_CD=1` trong shell hiện tại (lưu ý: cơ chế chặn đối số `-C`/`--cd`/`--add-dir` trỏ vào repo chính vẫn luôn bật fail-closed).
+  3. **Gỡ chế độ worktree:** Chạy lại `setup-dual-lane.*` **không kèm** cờ `-UseGitWorktree` / `--use-git-worktree`.
