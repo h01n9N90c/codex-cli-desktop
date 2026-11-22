@@ -88,7 +88,7 @@ Options:
   --gateway-model SLUG        Optional default model and review_model slug for the gateway lane
   --gateway-api-key-env VAR   Environment variable referenced by env_key (default: CODEX_GATEWAY_API_KEY)
   --cli-api-key-env VAR       Alias for --gateway-api-key-env
-  --share-auth-to-lane2       Read-only copy Lane 1 Desktop auth.json to Lane 2 CLI with 0600 perms & rollback tracking (alias: --share-official-auth)
+  --share-auth-to-lane2       Opt-in: read-only copy Lane 1 Desktop auth.json to Lane 2 CLI (0600, tracked; avoid mixing with third-party gateways) (alias: --share-official-auth)
   --install-bridge            Copy templates/DUAL_LANE_BRIDGE.md into <repo>/artifacts/dual-lane/
   --sync-sessions             Run scripts/sync-sessions.py after install (requires python3)
   --pinned-only               With --sync-sessions, only sync pinned threads
@@ -900,7 +900,7 @@ backup_and_copy "${KIT_ROOT}/templates/default.rules" "${LANE2_HOME}/rules/defau
 backup_and_copy "${KIT_ROOT}/templates/AGENTS.lane1.md" "${LANE1_HOME}/AGENTS.md" 600
 backup_and_copy "${KIT_ROOT}/templates/AGENTS.lane2.md" "${LANE2_HOME}/AGENTS.md" 600
 
-# Optional: Share / Harvest OAuth Login (`auth.json`) from Lane 1 (Desktop) to Lane 2 (CLI)
+# Optional (strictly opt-in, default off): Share / Harvest OAuth Login (`auth.json`) from Lane 1 (Desktop) to Lane 2 (CLI)
 # Read-only on Lane 1: safely backs up any pre-existing Lane 2 auth.json into MANIFEST_ROWS,
 # atomically copies Lane 1 auth.json to Lane 2 auth.json with chmod 600, and records
 # Lane 2 auth.json in MANIFEST_ROWS so restore-original.sh restores/removes it deterministically
@@ -908,6 +908,10 @@ backup_and_copy "${KIT_ROOT}/templates/AGENTS.lane2.md" "${LANE2_HOME}/AGENTS.md
 if [ "${SHARE_AUTH_TO_LANE2}" -eq 1 ]; then
   LANE1_AUTH="${LANE1_HOME}/auth.json"
   LANE2_AUTH="${LANE2_HOME}/auth.json"
+  echo "[WARN] --share-auth-to-lane2 is strictly opt-in: copying '${LANE1_AUTH}' creates a second copy of your OAuth credentials in Lane 2 ('${LANE2_AUTH}', mode 0600)." >&2
+  if [ "${GATEWAY_ON_LANE2}" -eq 1 ]; then
+    echo "[WARN] SECURITY WARNING: --share-auth-to-lane2 is combined with a third-party API gateway targeting Lane 2 (${GATEWAY_BASE_URL}). Avoid mixing copied official OAuth tokens (auth.json) with a third-party API gateway; prefer dedicated env_key (${GATEWAY_API_KEY_ENV}) without --share-auth-to-lane2 unless you explicitly trust the endpoint." >&2
+  fi
   if [ -L "${LANE1_AUTH}" ]; then
     echo "[FAIL] Security refusal: '${LANE1_AUTH}' is a symlink; refusing to harvest auth.json." >&2
     exit 1
@@ -1089,19 +1093,135 @@ extract_preserved_user_sections() {
   ' "${cfg_file}" || true
 }
 
-# Helper to test if a project table already exists in preserved sections using
-# either double-quoted or single-quoted TOML syntax.
+# Helper to test if a `[projects.*]` table for a given path already exists in
+# preserved TOML sections (comment-aware; normalizes double/single quotes,
+# TOML basic-string escapes, optional spaces around '.', and trailing slashes).
 has_project_section_in() {
   local preserved_sections="$1"
   local raw_p="$2"
-  local esc_p="$3"
-  printf '%s\n' "${preserved_sections}" | grep -Fq -e "[projects.\"${esc_p}\"]" \
-    || printf '%s\n' "${preserved_sections}" | grep -Fq -e "[projects.'${raw_p}']"
+  printf '%s\n' "${preserved_sections}" | AWK_TARGET_PATH="${raw_p}" awk '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    function unescape_toml_basic(s,    i, c, n, out) {
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" && i < n) {
+          i++
+          c = substr(s, i, 1)
+          if (c == "\"" || c == "\\") out = out c
+          else if (c == "t") out = out "\t"
+          else if (c == "n") out = out "\n"
+          else if (c == "r") out = out "\r"
+          else if (c == "b") out = out "\b"
+          else if (c == "f") out = out "\f"
+          else out = out "\\" c
+        } else {
+          out = out c
+        }
+      }
+      return out
+    }
+    function norm_path(p,    k) {
+      k = p
+      if (substr(k, 1, 2) != "//") {
+        gsub(/\/+/, "/", k)
+      }
+      while (length(k) > 1 && substr(k, length(k), 1) == "/") {
+        k = substr(k, 1, length(k) - 1)
+      }
+      return k
+    }
+    function extract_sec_header(line,    clean, sec) {
+      sub(/\r$/, "", line)
+      clean = strip_comment(line)
+      if (clean !~ /^[[:space:]]*\[.*\][[:space:]]*$/) {
+        return ""
+      }
+      sec = clean
+      sub(/^[[:space:]]*\[/, "", sec)
+      sub(/\][[:space:]]*$/, "", sec)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
+      return sec
+    }
+    function parse_proj_section_key(sec,    k, q, i, c, n, esc, end_pos, raw) {
+      if (sec !~ /^(projects|"projects"|\047projects\047)[[:space:]]*\./) return ""
+      k = sec
+      sub(/^(projects|"projects"|\047projects\047)[[:space:]]*\.[[:space:]]*/, "", k)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k == "") return ""
+      q = substr(k, 1, 1)
+      if (q == "\"") {
+        n = length(k)
+        esc = 0
+        end_pos = 0
+        for (i = 2; i <= n; i++) {
+          c = substr(k, i, 1)
+          if (esc) { esc = 0; continue }
+          if (c == "\\") { esc = 1; continue }
+          if (c == "\"") { end_pos = i; break }
+        }
+        if (end_pos != n) return ""
+        raw = unescape_toml_basic(substr(k, 2, n - 2))
+      } else if (q == "\047") {
+        n = length(k)
+        end_pos = index(substr(k, 2), "\047")
+        if (end_pos == 0 || (end_pos + 1) != n) return ""
+        raw = substr(k, 2, n - 2)
+      } else {
+        if (k !~ /^[A-Za-z0-9_-]+$/) return ""
+        raw = k
+      }
+      if (raw == "" || raw ~ /[[:cntrl:]]/) return ""
+      return norm_path(raw)
+    }
+    BEGIN {
+      target = norm_path(ENVIRON["AWK_TARGET_PATH"])
+      found = 0
+    }
+    {
+      if (!found) {
+        sec = extract_sec_header($0)
+        if (sec != "") {
+          pk = parse_proj_section_key(sec)
+          if (pk != "" && pk == target) {
+            found = 1
+          }
+        }
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  '
 }
 
-# Read-only harvest of trusted [projects."..."] tables from Lane 1 (Codex Desktop)
-# into Lane 2 (Codex CLI), excluding any project table already present in Lane 2
-# (REPO_PATH, EFFECTIVE_LANE2_REPO, or PRESERVED_USER_SECTIONS).
+# Read-only harvest of `[projects."..."]` tables from Lane 1 (Codex Desktop)
+# into Lane 2 (Codex CLI), strictly preserving trust boundaries:
+#   - Only harvests sections with an explicit `trust_level = "trusted"` or
+#     `trust_level = "untrusted"`, faithfully preserving each project's exact
+#     `trust_level` (NEVER promoting `untrusted`, missing, or invalid values).
+#   - Deduplicates against REPO_PATH, EFFECTIVE_LANE2_REPO, and all pre-existing
+#     Lane 2 `[projects.*]` sections across quoting and trailing-slash variants
+#     so an existing Lane 2 `untrusted` entry is never overwritten or duplicated.
 extract_harvested_lane1_projects() {
   local lane1_cfg="$1"
   local existing_sections="$2"
@@ -1110,9 +1230,7 @@ extract_harvested_lane1_projects() {
   fi
   AWK_EXISTING_SECTIONS="${existing_sections}" \
   AWK_REPO_RAW="${REPO_PATH}" \
-  AWK_REPO_ESC="${ESC_REPO}" \
   AWK_WT_RAW="${EFFECTIVE_LANE2_REPO}" \
-  AWK_WT_ESC="${ESC_LANE2_REPO}" \
   awk '
     function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
       in_dq = 0; in_sq = 0; esc = 0; out = ""
@@ -1135,6 +1253,49 @@ extract_harvested_lane1_projects() {
       }
       return out
     }
+    function unescape_toml_basic(s,    i, c, n, out) {
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" && i < n) {
+          i++
+          c = substr(s, i, 1)
+          if (c == "\"" || c == "\\") out = out c
+          else if (c == "t") out = out "\t"
+          else if (c == "n") out = out "\n"
+          else if (c == "r") out = out "\r"
+          else if (c == "b") out = out "\b"
+          else if (c == "f") out = out "\f"
+          else out = out "\\" c
+        } else {
+          out = out c
+        }
+      }
+      return out
+    }
+    function escape_toml_basic(s,    i, c, out) {
+      out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else out = out c
+      }
+      return out
+    }
+    function norm_path(p,    k) {
+      k = p
+      if (substr(k, 1, 2) != "//") {
+        gsub(/\/+/, "/", k)
+      }
+      while (length(k) > 1 && substr(k, length(k), 1) == "/") {
+        k = substr(k, 1, length(k) - 1)
+      }
+      return k
+    }
+    # Note: `[[array_of_tables]]` intentionally returns a non-empty, non-`projects.`
+    # header so it cleanly terminates any preceding `[projects.*]` section.
     function extract_sec_header(line,    clean, sec) {
       sub(/\r$/, "", line)
       clean = strip_comment(line)
@@ -1147,59 +1308,137 @@ extract_harvested_lane1_projects() {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
       return sec
     }
-    function norm_proj_key(sec,    k, q) {
+    function parse_proj_section_key(sec,    k, q, i, c, n, esc, end_pos, raw) {
+      if (sec !~ /^(projects|"projects"|\047projects\047)[[:space:]]*\./) return ""
       k = sec
-      sub(/^projects\.[[:space:]]*/, "", k)
+      sub(/^(projects|"projects"|\047projects\047)[[:space:]]*\.[[:space:]]*/, "", k)
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k == "") return ""
       q = substr(k, 1, 1)
-      if ((q == "\"" || q == "\047") && substr(k, length(k), 1) == q && length(k) >= 2) {
-        k = substr(k, 2, length(k) - 2)
-        if (q == "\"") {
-          gsub(/\\"/, "\"", k)
-          gsub(/\\\\/, "\\", k)
+      if (q == "\"") {
+        n = length(k)
+        esc = 0
+        end_pos = 0
+        for (i = 2; i <= n; i++) {
+          c = substr(k, i, 1)
+          if (esc) { esc = 0; continue }
+          if (c == "\\") { esc = 1; continue }
+          if (c == "\"") { end_pos = i; break }
+        }
+        if (end_pos != n) return ""
+        raw = unescape_toml_basic(substr(k, 2, n - 2))
+      } else if (q == "\047") {
+        n = length(k)
+        end_pos = index(substr(k, 2), "\047")
+        if (end_pos == 0 || (end_pos + 1) != n) return ""
+        raw = substr(k, 2, n - 2)
+      } else {
+        if (k !~ /^[A-Za-z0-9_-]+$/) return ""
+        raw = k
+      }
+      if (raw == "" || raw ~ /[[:cntrl:]]/) return ""
+      return norm_path(raw)
+    }
+    function extract_trust_level_assignment(clean,    val) {
+      if (clean !~ /^[[:space:]]*(trust_level|"trust_level"|\047trust_level\047)[[:space:]]*=/) {
+        return ""
+      }
+      val = clean
+      sub(/^[[:space:]]*(trust_level|"trust_level"|\047trust_level\047)[[:space:]]*=[[:space:]]*/, "", val)
+      gsub(/[[:space:]]+$/, "", val)
+      if (val == "\"trusted\"" || val == "\047trusted\047") {
+        return "trusted"
+      }
+      if (val == "\"untrusted\"" || val == "\047untrusted\047") {
+        return "untrusted"
+      }
+      return "__INVALID__"
+    }
+    function flush_proj(    j) {
+      if (!in_proj) return
+      if (!(cur_pk in seen_proj)) {
+        if (cur_trust == "untrusted" || (cur_trust == "trusted" && !cur_trust_invalid)) {
+          if (emitted > 0) {
+            printf "\n"
+          }
+          printf "[projects.\"%s\"]\n", escape_toml_basic(cur_pk)
+          printf "trust_level = \"%s\"\n", cur_trust
+          for (j = 1; j <= extra_count; j++) {
+            printf "%s\n", extra_lines[j]
+          }
+          seen_proj[cur_pk] = 1
+          emitted++
         }
       }
-      return k
+      in_proj = 0
+      cur_pk = ""
+      cur_trust = ""
+      cur_trust_invalid = 0
+      extra_count = 0
     }
     BEGIN {
-      if (ENVIRON["AWK_REPO_RAW"] != "") seen_proj[ENVIRON["AWK_REPO_RAW"]] = 1
-      if (ENVIRON["AWK_REPO_ESC"] != "") seen_proj[ENVIRON["AWK_REPO_ESC"]] = 1
-      if (ENVIRON["AWK_WT_RAW"] != "")   seen_proj[ENVIRON["AWK_WT_RAW"]] = 1
-      if (ENVIRON["AWK_WT_ESC"] != "")   seen_proj[ENVIRON["AWK_WT_ESC"]] = 1
+      if (ENVIRON["AWK_REPO_RAW"] != "") seen_proj[norm_path(ENVIRON["AWK_REPO_RAW"])] = 1
+      if (ENVIRON["AWK_WT_RAW"] != "")   seen_proj[norm_path(ENVIRON["AWK_WT_RAW"])] = 1
       n = split(ENVIRON["AWK_EXISTING_SECTIONS"], lines, "\n")
       for (i = 1; i <= n; i++) {
         s = extract_sec_header(lines[i])
-        if (s ~ /^projects\./) {
-          seen_proj[norm_proj_key(s)] = 1
-          seen_sec[s] = 1
+        if (s != "") {
+          epk = parse_proj_section_key(s)
+          if (epk != "") {
+            seen_proj[epk] = 1
+          }
         }
       }
-      keep = 0
+      in_proj = 0
+      cur_pk = ""
+      cur_trust = ""
+      cur_trust_invalid = 0
+      extra_count = 0
+      emitted = 0
     }
     {
       sub(/\r$/, "", $0)
       clean = strip_comment($0)
       sec = extract_sec_header($0)
       if (sec != "") {
-        if (sec ~ /^projects\./) {
-          pk = norm_proj_key(sec)
-          if (!(pk in seen_proj) && !(sec in seen_sec)) {
-            keep = 1
-            seen_proj[pk] = 1
-            seen_sec[sec] = 1
-          } else {
-            keep = 0
-          }
-        } else {
-          keep = 0
+        flush_proj()
+        pk = parse_proj_section_key(sec)
+        if (pk != "" && !(pk in seen_proj)) {
+          in_proj = 1
+          cur_pk = pk
+          cur_trust = ""
+          cur_trust_invalid = 0
+          extra_count = 0
         }
+        next
       }
-    }
-    keep == 1 {
+      if (!in_proj) {
+        next
+      }
+      if (clean ~ /^[[:space:]]*$/) {
+        next
+      }
       if (clean ~ /^[[:space:]]*(experimental_bearer_token|api_key)[[:space:]]*=/) {
         next
       }
-      print $0
+      tl = extract_trust_level_assignment(clean)
+      if (tl != "") {
+        if (tl == "untrusted") {
+          cur_trust = "untrusted"
+        } else if (tl == "trusted") {
+          if (cur_trust == "") {
+            cur_trust = "trusted"
+          }
+        } else {
+          cur_trust_invalid = 1
+        }
+        next
+      }
+      extra_count++
+      extra_lines[extra_count] = $0
+    }
+    END {
+      flush_proj()
     }
   ' "${lane1_cfg}" || true
 }
@@ -1269,11 +1508,11 @@ render_lane2_config() {
     printf 'wire_api = "responses"\n'
     printf 'env_key = "%s"\n\n' "${ESC_GW_ENV}"
   fi
-  if ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${REPO_PATH}" "${ESC_REPO}"; then
+  if ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${REPO_PATH}"; then
     printf '[projects."%s"]\n' "${ESC_REPO}"
     printf 'trust_level = "trusted"\n\n'
   fi
-  if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}" "${ESC_LANE2_REPO}"; then
+  if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}"; then
     printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
     printf 'trust_level = "trusted"\n\n'
   fi
@@ -1281,7 +1520,7 @@ render_lane2_config() {
     local harvested_l1_projects=""
     harvested_l1_projects="$(extract_harvested_lane1_projects "${LANE1_HOME}/config.toml" "${PRESERVED_USER_SECTIONS}")"
     if [ -n "${harvested_l1_projects}" ]; then
-      printf '# Inherited trusted projects from Lane 1 (Codex Desktop)\n%s\n\n' "${harvested_l1_projects}"
+      printf '# Inherited projects from Lane 1 (Codex Desktop; original trust_level preserved)\n%s\n\n' "${harvested_l1_projects}"
     fi
   fi
   printf '[features]\n'
@@ -1397,11 +1636,11 @@ if [ "${GATEWAY_ON_LANE1}" -eq 1 ]; then
     printf 'model_catalog_url = "%s"\n' "${ESC_GW_MODELS_URL}"
     printf 'wire_api = "responses"\n'
     printf 'env_key = "%s"\n\n' "${ESC_GW_ENV}"
-    if ! has_project_section_in "${CFG1_USER_SECTIONS}" "${REPO_PATH}" "${ESC_REPO}"; then
+    if ! has_project_section_in "${CFG1_USER_SECTIONS}" "${REPO_PATH}"; then
       printf '[projects."%s"]\n' "${ESC_REPO}"
       printf 'trust_level = "trusted"\n\n'
     fi
-    if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${CFG1_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}" "${ESC_LANE2_REPO}"; then
+    if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${CFG1_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}"; then
       printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
       printf 'trust_level = "trusted"\n\n'
     fi

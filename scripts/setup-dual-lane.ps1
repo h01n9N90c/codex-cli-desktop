@@ -21,8 +21,9 @@
            as RUNNER~1 / PROGRA~1 without dereferencing NTFS Junctions or symlinks) so containment,
            trusted projects, and generated wrappers remain consistent on every Windows host.
          - Preserves custom top-level keys (including multi-line values), custom sections
-           ([mcp_servers.*], [tui], [plugins.*], [[array_of_tables]]), and all existing [projects.*]
-           trust entries.
+           ([mcp_servers.*], [tui], [plugins.*], [[array_of_tables]]), and existing [projects.*]
+           trust boundaries (`trusted` stays `trusted`, `untrusted` stays `untrusted`, and entries
+           missing/unrecognized `trust_level` are never promoted to `trusted`).
          - Writes UTF-8 without BOM atomically via a same-directory temp file + File.Replace/Move so
            interrupted writes cannot corrupt config.toml.
          - Persists SHA-256 hashes, Junctions, and launchers incrementally into an ACL-locked
@@ -140,9 +141,11 @@
     variable -GatewayApiKeyEnv (never echoed, never written to config.toml).
 
 .PARAMETER ShareAuthToLane2
-    Copies Lane 1's authenticated `auth.json` (if present) into Lane 2 (`~/.codex-official\auth.json`),
-    tracks it in the rollback journal, and locks its NTFS DACL via `Protect-SensitiveFileAcl` so Lane 2 CLI
-    can immediately use your primary login alongside or without an `env_key` API key.
+    Opt-in (off by default): copies Lane 1's authenticated `auth.json` (if present) into Lane 2
+    (`~/.codex-official\auth.json`), tracks it in the rollback journal, and locks its NTFS DACL via
+    `Protect-SensitiveFileAcl`. SECURITY NOTE: Creates a second copy of your OAuth credentials on
+    disk; avoid combining with a third-party API gateway (`-ConfigureCliGateway` / `-ConfigureGateway`
+    targeting Lane 2 or Both) unless you intentionally want official OAuth tokens alongside gateway routing.
 
 .PARAMETER SyncSessions
     Invokes scripts\sync-sessions.py (if Python 3 is installed) to UPSERT session index, pinned
@@ -1021,40 +1024,68 @@ function Get-SupportedCodexFeatures([string]$ExePath, [string]$ProbeHome) {
     return $supported
 }
 
-function Get-ExistingTrustedProjects([string[]]$ConfigPaths) {
+function Unescape-TomlBasicString([AllowEmptyString()][string]$Escaped) {
     <#
     .SYNOPSIS
-        Strictly read-only harvest of all existing [projects."..."] and [projects.'...'] trust
-        entries across prior Lane 2 and Lane 1 (Codex Desktop) config.toml files so upgrading or
-        installing never loses trusted repos and Codex CLI automatically trusts projects already
-        trusted in Codex Desktop without modifying a single byte of Lane 1's config.toml.
+        Unescapes a TOML 1.0 basic string (double-quoted) in a single pass.
+        WHY: Avoids chained `.Replace()` ordering bugs when paths contain escaped backslashes or quotes.
     #>
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $list = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($cfg in $ConfigPaths) {
-        if ([string]::IsNullOrWhiteSpace($cfg)) { continue }
-        Assert-NotReparsePoint -PathValue $cfg -Label 'config.toml trusted project harvest'
-        if (-not (Test-Path -LiteralPath $cfg -PathType Leaf)) { continue }
-        # Explicit UTF-8 read avoids PowerShell 5.1 ANSI/Windows-1252 mojibake on UTF-8 no-BOM files with Unicode paths.
-        $content = Get-Content -LiteralPath $cfg -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-        if (-not $content) { continue }
-        $matches = [regex]::Matches($content, '(?m)^\s*\[projects\.''([^'']+)''\]|^\s*\[projects\."((?:[^"\\]|\\.)+)"\]')
-        foreach ($m in $matches) {
-            $raw = if ($m.Groups[1].Success) {
-                $m.Groups[1].Value
-            } else {
-                # Unescape TOML basic-string escapes back to a native Windows path before re-escaping on write.
-                $m.Groups[2].Value.Replace('\"', '"').Replace('\\', '\')
+    if ([string]::IsNullOrEmpty($Escaped)) { return '' }
+    $sb = New-Object 'System.Text.StringBuilder' $Escaped.Length
+    $i = 0
+    while ($i -lt $Escaped.Length) {
+        $ch = $Escaped[$i]
+        if ($ch -eq '\' -and ($i + 1) -lt $Escaped.Length) {
+            $next = $Escaped[$i + 1]
+            switch ($next) {
+                '\' { [void]$sb.Append('\') }
+                '"' { [void]$sb.Append('"') }
+                'n' { [void]$sb.Append("`n") }
+                'r' { [void]$sb.Append("`r") }
+                't' { [void]$sb.Append("`t") }
+                'b' { [void]$sb.Append("`b") }
+                'f' { [void]$sb.Append("`f") }
+                default { [void]$sb.Append('\').Append($next) }
             }
-            if (-not $raw -or ($raw -match '[\x00-\x1F\x7F]')) { continue }
-            $dedupKey = try { (Resolve-CanonicalLongPath -PathValue $raw).TrimEnd('\', '/') } catch { $raw.TrimEnd('\', '/') }
-            if ([string]::IsNullOrWhiteSpace($dedupKey)) { $dedupKey = $raw }
-            if ($seen.Add($dedupKey)) {
-                $list.Add($raw)
-            }
+            $i += 2
+        } else {
+            [void]$sb.Append($ch)
+            $i++
         }
     }
-    return , $list
+    return $sb.ToString()
+}
+
+function Get-TomlProjectSectionPath([AllowEmptyString()][string]$HeaderInner) {
+    <#
+    .SYNOPSIS
+        Extracts the unescaped project path from a direct `[projects."..."]` or `[projects.'...']`
+        TOML table header inner text, or returns `$null` for non-project or subtable headers.
+    #>
+    if ([string]::IsNullOrWhiteSpace($HeaderInner)) { return $null }
+    $trimmed = $HeaderInner.Trim()
+    $m = [regex]::Match($trimmed, '^projects\s*\.\s*(?:''([^'']+)''|"((?:[^"\\]|\\.)+)")\s*$')
+    if (-not $m.Success) { return $null }
+    $raw = if ($m.Groups[1].Success) {
+        $m.Groups[1].Value
+    } else {
+        Unescape-TomlBasicString $m.Groups[2].Value
+    }
+    if ([string]::IsNullOrWhiteSpace($raw) -or ($raw -match '[\x00-\x1F\x7F]')) {
+        return $null
+    }
+    return $raw
+}
+
+function Get-ProjectDedupKey([AllowEmptyString()][string]$ProjectPath) {
+    <#
+    .SYNOPSIS
+        Produces a canonical, separator-normalized deduplication key for a project path.
+    #>
+    if ([string]::IsNullOrWhiteSpace($ProjectPath)) { return '' }
+    $dedupKey = try { (Resolve-CanonicalLongPath -PathValue $ProjectPath).TrimEnd('\', '/') } catch { $ProjectPath.TrimEnd('\', '/') }
+    if ([string]::IsNullOrWhiteSpace($dedupKey)) { $dedupKey = $ProjectPath }
+    return $dedupKey
 }
 
 function Update-TomlMultilineState {
@@ -1162,19 +1193,366 @@ function Remove-TomlInlineComment([string]$Line) {
     return $Line
 }
 
+function Add-ParsedProjectTrustEntry {
+    <#
+    .SYNOPSIS
+        Records a parsed `[projects.*]` section into a per-file list/map using fail-closed
+        deduplication so a duplicate table header in the same file can never promote `untrusted`,
+        missing, or unrecognized entries to `trusted`.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$ByKey,
+        [Parameter(Mandatory = $true)]$Entries,
+        [Parameter(Mandatory = $true)][string]$ProjectPath,
+        [Parameter(Mandatory = $true)][string]$DedupKey,
+        [Parameter(Mandatory = $true)][string]$TrustLevel,
+        [Parameter(Mandatory = $true)][bool]$HasExtraKeys
+    )
+    if ($ByKey.ContainsKey($DedupKey)) {
+        $existing = $ByKey[$DedupKey]
+        if ($TrustLevel -ceq 'untrusted') {
+            $existing.TrustLevel = 'untrusted'
+        } elseif ($TrustLevel -cne 'trusted' -and $existing.TrustLevel -ceq 'trusted') {
+            $existing.TrustLevel = $TrustLevel
+        }
+        if ($HasExtraKeys) {
+            $existing.HasExtraKeys = $true
+        }
+    } else {
+        $obj = [PSCustomObject]@{
+            Path         = $ProjectPath
+            DedupKey     = $DedupKey
+            TrustLevel   = $TrustLevel
+            HasExtraKeys = $HasExtraKeys
+        }
+        $ByKey[$DedupKey] = $obj
+        $Entries.Add($obj)
+    }
+}
+
+function Get-TomlProjectTrustEntries([string]$ConfigPath) {
+    <#
+    .SYNOPSIS
+        Strictly read-only parser for `[projects."..."]` and `[projects.'...']` tables in a single
+        config.toml file, capturing each project's real `trust_level` value (`trusted`, `untrusted`,
+        `missing`, or `unrecognized`) while safely handling single/double quotes, comments, and
+        multi-line TOML values.
+        WHY: Replaces header-only project harvesting so `untrusted`, missing, or unrecognized
+        `trust_level` entries are NEVER silently promoted to `trusted`.
+    #>
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) { return , $entries }
+    Assert-NotReparsePoint -PathValue $ConfigPath -Label 'config.toml project trust parse'
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return , $entries }
+
+    # Explicit UTF-8 read avoids PowerShell 5.1 ANSI/Windows-1252 mojibake on UTF-8 no-BOM files with Unicode paths.
+    $content = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+    if (-not $content) { return , $entries }
+
+    $byKey = New-Object 'System.Collections.Generic.Dictionary[string, object]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    $inProjectSection = $false
+    $currentPath = ''
+    $currentDedupKey = ''
+    $currentTrust = 'missing'
+    $currentHasExtraKeys = $false
+
+    $inMultiline = $false
+    $bracketDepth = 0
+    $multilineQuote = ''
+
+    foreach ($line in ($content -split "\r?\n")) {
+        if ($inMultiline) {
+            Update-TomlMultilineState -Text $line -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
+            if ($bracketDepth -eq 0 -and $multilineQuote -eq '') {
+                $inMultiline = $false
+            }
+            continue
+        }
+
+        $noComment = (Remove-TomlInlineComment $line).Trim()
+        if ([string]::IsNullOrWhiteSpace($noComment)) { continue }
+
+        # Array of tables: [[section]] closes any open [projects.*] section.
+        if ($noComment -match '^\[\[(.+)\]\]$') {
+            if ($inProjectSection) {
+                Add-ParsedProjectTrustEntry -ByKey $byKey -Entries $entries -ProjectPath $currentPath -DedupKey $currentDedupKey -TrustLevel $currentTrust -HasExtraKeys $currentHasExtraKeys
+                $inProjectSection = $false
+            }
+            continue
+        }
+
+        # Standard table header: [section] (inline `#` comments already stripped outside quotes).
+        $hdrMatch = [regex]::Match($noComment, '^\[(.+)\]$')
+        if ($hdrMatch.Success) {
+            if ($inProjectSection) {
+                Add-ParsedProjectTrustEntry -ByKey $byKey -Entries $entries -ProjectPath $currentPath -DedupKey $currentDedupKey -TrustLevel $currentTrust -HasExtraKeys $currentHasExtraKeys
+                $inProjectSection = $false
+            }
+            $projPath = Get-TomlProjectSectionPath $hdrMatch.Groups[1].Value
+            if ($null -ne $projPath) {
+                $inProjectSection = $true
+                $currentPath = $projPath
+                $currentDedupKey = Get-ProjectDedupKey $projPath
+                $currentTrust = 'missing'
+                $currentHasExtraKeys = $false
+            }
+            continue
+        }
+
+        # Key-value assignment (top-level or inside a section).
+        $kvMatch = [regex]::Match($line, '^\s*(?:([A-Za-z0-9_-]+)|"((?:[^"\\]|\\.)+)"|''([^'']+)'')\s*=(.*)$')
+        if ($kvMatch.Success) {
+            $rawKey = if ($kvMatch.Groups[1].Success) {
+                $kvMatch.Groups[1].Value
+            } elseif ($kvMatch.Groups[2].Success) {
+                Unescape-TomlBasicString $kvMatch.Groups[2].Value
+            } else {
+                $kvMatch.Groups[3].Value
+            }
+            $rawRhs = $kvMatch.Groups[4].Value
+
+            $bracketDepth = 0
+            $multilineQuote = ''
+            Update-TomlMultilineState -Text $rawRhs -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
+            $startsMultiline = ($bracketDepth -gt 0 -or $multilineQuote -ne '')
+            if ($startsMultiline) {
+                $inMultiline = $true
+            }
+
+            if ($inProjectSection) {
+                if ($rawKey -ceq 'trust_level') {
+                    $parsedTrust = 'unrecognized'
+                    if (-not $startsMultiline) {
+                        $rhsClean = (Remove-TomlInlineComment $rawRhs).Trim()
+                        $valMatch = [regex]::Match($rhsClean, '^(?:"((?:[^"\\]|\\.)*)"|''([^'']*)'')\s*$')
+                        if ($valMatch.Success) {
+                            $valStr = if ($valMatch.Groups[1].Success) {
+                                Unescape-TomlBasicString $valMatch.Groups[1].Value
+                            } else {
+                                $valMatch.Groups[2].Value
+                            }
+                            if ($valStr -ceq 'trusted') {
+                                $parsedTrust = 'trusted'
+                            } elseif ($valStr -ceq 'untrusted') {
+                                $parsedTrust = 'untrusted'
+                            } else {
+                                $parsedTrust = 'unrecognized'
+                            }
+                        }
+                    }
+                    # Fail-closed if trust_level appears more than once in the same section.
+                    if ($parsedTrust -ceq 'untrusted') {
+                        $currentTrust = 'untrusted'
+                    } elseif ($parsedTrust -ceq 'trusted') {
+                        if ($currentTrust -ceq 'missing') { $currentTrust = 'trusted' }
+                    } else {
+                        if ($currentTrust -cne 'untrusted') { $currentTrust = 'unrecognized' }
+                    }
+                } else {
+                    $currentHasExtraKeys = $true
+                }
+            }
+        } else {
+            # Dotted key or other non-blank TOML assignment line: track multiline state and mark extra keys.
+            $eqIdx = $line.IndexOf('=')
+            if ($eqIdx -ge 0) {
+                $fallbackRhs = $line.Substring($eqIdx + 1)
+                $bracketDepth = 0
+                $multilineQuote = ''
+                Update-TomlMultilineState -Text $fallbackRhs -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
+                if ($bracketDepth -gt 0 -or $multilineQuote -ne '') {
+                    $inMultiline = $true
+                }
+            }
+            if ($inProjectSection) {
+                $currentHasExtraKeys = $true
+            }
+        }
+    }
+
+    if ($inProjectSection) {
+        Add-ParsedProjectTrustEntry -ByKey $byKey -Entries $entries -ProjectPath $currentPath -DedupKey $currentDedupKey -TrustLevel $currentTrust -HasExtraKeys $currentHasExtraKeys
+    }
+    return , $entries
+}
+
+function Get-ExistingTrustedProjects([string[]]$ConfigPaths) {
+    <#
+    .SYNOPSIS
+        Strictly read-only harvest of `[projects."..."]` and `[projects.'...']` entries across
+        prior Lane 2 and Lane 1 (Codex Desktop) config.toml files, recording each project's real
+        `trust_level` (`trusted`, `untrusted`, `missing`, or `unrecognized`) while deduplicating
+        with earlier config paths taking precedence.
+        WHY: Inspecting real `trust_level` values guarantees `untrusted`, missing, or unrecognized
+        entries are NEVER silently promoted to `trusted`.
+    #>
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $list = New-Object 'System.Collections.Generic.List[object]'
+    $srcIndex = 0
+    foreach ($cfg in $ConfigPaths) {
+        if (-not [string]::IsNullOrWhiteSpace($cfg)) {
+            $entries = Get-TomlProjectTrustEntries -ConfigPath $cfg
+            foreach ($entry in $entries) {
+                if ($seen.Add($entry.DedupKey)) {
+                    $list.Add([PSCustomObject]@{
+                        Path         = $entry.Path
+                        DedupKey     = $entry.DedupKey
+                        TrustLevel   = $entry.TrustLevel
+                        HasExtraKeys = $entry.HasExtraKeys
+                        SourceIndex  = $srcIndex
+                    })
+                }
+            }
+        }
+        $srcIndex++
+    }
+    return , $list
+}
+
+function Resolve-MergedProjectTrustState {
+    <#
+    .SYNOPSIS
+        Merges `[projects.*]` trust entries for a target lane config.toml from:
+          1. Existing entries in PrimaryConfigPath (the config file being updated),
+          2. Strictly read-only harvested entries from SecondaryConfigPath (the peer lane),
+          3. Explicitly targeted setup repositories (EnsureTrustedPaths, e.g. -RepoPath / worktree).
+        SECURITY INVARIANT:
+          - `trusted` stays `trusted`; `untrusted` stays `untrusted` (never promoted to `trusted`).
+          - Entries with missing or unrecognized `trust_level` are NEVER promoted to `trusted`
+            (skipped when harvesting from SecondaryConfigPath; preserved verbatim on PrimaryConfigPath).
+          - Only explicitly targeted EnsureTrustedPaths (-RepoPath and optional worktree) are
+            ensured `trust_level = "trusted"` by setup.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$PrimaryConfigPath,
+        [AllowEmptyString()][string]$SecondaryConfigPath = '',
+        [string[]]$EnsureTrustedPaths = @()
+    )
+    $managedProjects = New-Object 'System.Collections.Generic.List[object]'
+    $managedByKey = New-Object 'System.Collections.Generic.Dictionary[string, object]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $managedProjectKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $preservedByKey = New-Object 'System.Collections.Generic.Dictionary[string, object]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    $harvestPaths = if ([string]::IsNullOrWhiteSpace($SecondaryConfigPath)) {
+        @($PrimaryConfigPath)
+    } else {
+        @($PrimaryConfigPath, $SecondaryConfigPath)
+    }
+
+    # 1 & 2. Harvest [projects.*] with real trust_level values (PrimaryConfigPath at SourceIndex=0 takes precedence).
+    $harvested = Get-ExistingTrustedProjects -ConfigPaths $harvestPaths
+    foreach ($entry in $harvested) {
+        if ($entry.SourceIndex -eq 0) {
+            if (($entry.TrustLevel -ceq 'trusted' -or $entry.TrustLevel -ceq 'untrusted') -and (-not $entry.HasExtraKeys)) {
+                $item = [PSCustomObject]@{
+                    Path       = $entry.Path
+                    DedupKey   = $entry.DedupKey
+                    TrustLevel = $entry.TrustLevel
+                }
+                $managedProjects.Add($item)
+                $managedByKey[$entry.DedupKey] = $item
+                [void]$managedProjectKeys.Add($entry.DedupKey)
+            } else {
+                # Preserve original block verbatim in Merge-CodexConfigToml (missing/unrecognized trust_level or extra keys).
+                $preservedByKey[$entry.DedupKey] = $entry
+            }
+        } else {
+            # Secondary lane (read-only harvest): inherit ONLY explicit 'trusted' or 'untrusted'; skip missing/unrecognized.
+            if ($entry.TrustLevel -ceq 'trusted' -or $entry.TrustLevel -ceq 'untrusted') {
+                $item = [PSCustomObject]@{
+                    Path       = $entry.Path
+                    DedupKey   = $entry.DedupKey
+                    TrustLevel = $entry.TrustLevel
+                }
+                $managedProjects.Add($item)
+                $managedByKey[$entry.DedupKey] = $item
+                [void]$managedProjectKeys.Add($entry.DedupKey)
+            }
+        }
+    }
+
+    # 3. Ensure explicitly targeted setup repositories (-RepoPath / optional Lane 2 worktree) are trusted.
+    foreach ($rp in $EnsureTrustedPaths) {
+        if ([string]::IsNullOrWhiteSpace($rp)) { continue }
+        $rpCanon = Resolve-CanonicalLongPath -PathValue $rp
+        $rpKey = Get-ProjectDedupKey $rpCanon
+        if ($managedByKey.ContainsKey($rpKey)) {
+            $managedByKey[$rpKey].TrustLevel = 'trusted'
+            [void]$managedProjectKeys.Add($rpKey)
+        } elseif ($preservedByKey.ContainsKey($rpKey)) {
+            if ($preservedByKey[$rpKey].TrustLevel -ceq 'trusted') {
+                # Already trusted with preserved custom extra keys -> keep intact without duplicating header.
+                continue
+            }
+            # Explicitly targeted repo had untrusted/missing/unrecognized trust_level -> replace with managed trusted block.
+            [void]$preservedByKey.Remove($rpKey)
+            $item = [PSCustomObject]@{
+                Path       = $rpCanon
+                DedupKey   = $rpKey
+                TrustLevel = 'trusted'
+            }
+            $managedProjects.Add($item)
+            $managedByKey[$rpKey] = $item
+            [void]$managedProjectKeys.Add($rpKey)
+        } else {
+            $item = [PSCustomObject]@{
+                Path       = $rpCanon
+                DedupKey   = $rpKey
+                TrustLevel = 'trusted'
+            }
+            $managedProjects.Add($item)
+            $managedByKey[$rpKey] = $item
+            [void]$managedProjectKeys.Add($rpKey)
+        }
+    }
+
+    $blockLines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($mp in $managedProjects) {
+        if ($mp.TrustLevel -cne 'trusted' -and $mp.TrustLevel -cne 'untrusted') {
+            throw "Internal trust invariant violation: refusing to emit unexpected trust_level '$($mp.TrustLevel)' for '$($mp.Path)'."
+        }
+        $blockLines.Add("[projects.`"$(Escape-TomlBasicString $mp.Path)`"]`r`ntrust_level = `"$($mp.TrustLevel)`"")
+    }
+
+    $managedKeyList = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($mk in $managedProjectKeys) { $managedKeyList.Add($mk) }
+
+    $preservedTrusted = 0
+    $preservedUntrusted = 0
+    foreach ($pe in $preservedByKey.Values) {
+        if ($pe.TrustLevel -ceq 'trusted') { $preservedTrusted++ }
+        elseif ($pe.TrustLevel -ceq 'untrusted') { $preservedUntrusted++ }
+    }
+
+    $trustedCount   = @($managedProjects | Where-Object { $_.TrustLevel -ceq 'trusted' }).Count + $preservedTrusted
+    $untrustedCount = @($managedProjects | Where-Object { $_.TrustLevel -ceq 'untrusted' }).Count + $preservedUntrusted
+
+    return [PSCustomObject]@{
+        ManagedProjects     = $managedProjects
+        ManagedProjectKeys  = $managedKeyList.ToArray()
+        ProjectsBlock       = ($blockLines -join "`r`n`r`n")
+        TrustedCount        = $trustedCount
+        UntrustedCount      = $untrustedCount
+        PreservedOtherCount = ($preservedByKey.Count - $preservedTrusted - $preservedUntrusted)
+    }
+}
+
 function Merge-CodexConfigToml {
     <#
     .SYNOPSIS
         Non-destructively merges managed Dual-Lane keys/sections into an existing config.toml.
         WHY: Preserves user customizations ([mcp_servers.*], [tui], [plugins.*], [[array_tables]],
-        and custom top-level settings) while updating only Dual-Lane managed settings cleanly.
+        custom top-level settings, and any unmanaged `[projects.*]` blocks without promoting
+        missing/unrecognized `trust_level` entries) while updating managed settings cleanly.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ExistingPath,
         [Parameter(Mandatory = $true)][string]$ManagedTopBlock,
         [Parameter(Mandatory = $true)][string]$ManagedSectionsBlock,
         [Parameter(Mandatory = $true)][string[]]$ManagedTopKeys,
-        [Parameter(Mandatory = $true)][string[]]$ManagedSectionNames
+        [Parameter(Mandatory = $true)][string[]]$ManagedSectionNames,
+        [string[]]$ManagedProjectKeys = @()
     )
     if (-not (Test-Path -LiteralPath $ExistingPath -PathType Leaf)) {
         return ($ManagedTopBlock.TrimEnd() + "`r`n`r`n" + $ManagedSectionsBlock.TrimEnd() + "`r`n")
@@ -1191,6 +1569,11 @@ function Merge-CodexConfigToml {
     $secSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($s in $ManagedSectionNames) {
         [void]$secSet.Add((Normalize-TomlSectionKey $s))
+    }
+
+    $managedProjSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($pk in $ManagedProjectKeys) {
+        if (-not [string]::IsNullOrWhiteSpace($pk)) { [void]$managedProjSet.Add($pk) }
     }
 
     $preservedTop = New-Object 'System.Collections.Generic.List[string]'
@@ -1231,7 +1614,15 @@ function Merge-CodexConfigToml {
                 $inSection = $true
                 $rawSecName = $Matches[1].Trim()
                 $normSecName = Normalize-TomlSectionKey $rawSecName
-                if ($secSet.Contains($normSecName) -or ($rawSecName -match '^projects\.')) {
+                $isManagedProject = $false
+                $projPath = Get-TomlProjectSectionPath $rawSecName
+                if ($null -ne $projPath) {
+                    $projKey = Get-ProjectDedupKey $projPath
+                    if ($managedProjSet.Contains($projKey)) {
+                        $isManagedProject = $true
+                    }
+                }
+                if ($secSet.Contains($normSecName) -or $isManagedProject) {
                     $keepCurrentSection = $false
                 } else {
                     $keepCurrentSection = $true
@@ -1758,20 +2149,14 @@ if ($configureGatewayLane2) {
 }
 $lane2ConfigPath = Join-Path $Lane2Home 'config.toml'
 Assert-NotReparsePoint -PathValue $lane2ConfigPath -Label 'Lane 2 config.toml'
-# Strictly read-only harvest of trusted [projects."..."] from Lane 2 and Lane 1 (Codex Desktop)
-# so every project already trusted in Codex Desktop is automatically trusted in Codex CLI without
-# modifying a single byte of Lane 1's config.toml.
-$trustedProjects = Get-ExistingTrustedProjects -ConfigPaths @($lane2ConfigPath, (Join-Path $Lane1Home 'config.toml'))
-foreach ($rp in @($RepoPath, $effectiveLane2Repo)) {
-    $rpCanon = Resolve-CanonicalLongPath -PathValue $rp
-    $alreadyTrusted = @($trustedProjects | Where-Object {
-        $existingCanon = try { Resolve-CanonicalLongPath -PathValue $_ } catch { $_ }
-        $existingCanon.Equals($rpCanon, [System.StringComparison]::OrdinalIgnoreCase)
-    }).Count -gt 0
-    if (-not $alreadyTrusted) {
-        $trustedProjects.Add($rpCanon)
-    }
-}
+# Strictly read-only harvest of `[projects.*]` trust boundaries from Lane 2 and Lane 1 (Codex Desktop):
+#   - `trusted` stays `trusted`, `untrusted` stays `untrusted` (never promoted to `trusted`).
+#   - Missing/unrecognized `trust_level` entries are skipped from Lane 1 and preserved verbatim on Lane 2.
+#   - Only explicitly targeted `-RepoPath` (and optional Lane 2 worktree) is ensured `trust_level = "trusted"`.
+$lane2ProjectState = Resolve-MergedProjectTrustState `
+    -PrimaryConfigPath $lane2ConfigPath `
+    -SecondaryConfigPath (Join-Path $Lane1Home 'config.toml') `
+    -EnsureTrustedPaths @($RepoPath, $effectiveLane2Repo)
 
 if ($configureGatewayLane2) {
     $lane2CleanBackup = Join-Path $Lane2Home 'config.backup.toml'
@@ -1844,9 +2229,7 @@ if ($supportedFeatures.ContainsKey('goals')) {
     $featureLines.Add('goals = true')
 }
 
-$projectsBlock = ($trustedProjects | ForEach-Object {
-    "[projects.`"$(Escape-TomlBasicString $_)`"]`r`ntrust_level = `"trusted`""
-}) -join "`r`n`r`n"
+$lane2ProjectsSection = if ($lane2ProjectState.ProjectsBlock) { "`r`n`r`n" + $lane2ProjectState.ProjectsBlock } else { '' }
 
 $sandboxNetworkValue = if ($AllowSandboxNetwork) { 'true' } else { 'false' }
 $lane2TopBlock = $lane2TopLines -join "`r`n"
@@ -1879,9 +2262,7 @@ env_key = "$(Escape-TomlBasicString $GatewayApiKeyEnv)"
 
 $lane2SectionsBlock = $lane2ProviderBlock + @"
 [windows]
-sandbox = "elevated"
-
-$projectsBlock
+sandbox = "elevated"$lane2ProjectsSection
 
 [features]
 $($featureLines -join "`r`n")
@@ -1906,7 +2287,8 @@ $mergedLane2Config = Merge-CodexConfigToml `
     -ManagedTopBlock $lane2TopBlock `
     -ManagedSectionsBlock $lane2SectionsBlock `
     -ManagedTopKeys ($managedTopKeys.ToArray()) `
-    -ManagedSectionNames $lane2ManagedSectionNames
+    -ManagedSectionNames $lane2ManagedSectionNames `
+    -ManagedProjectKeys $lane2ProjectState.ManagedProjectKeys
 
 # Fail-closed secret check before touching disk.
 Assert-NoPlaintextSecretInToml -TomlContent $mergedLane2Config -ContextLabel 'Lane 2 config.toml' -ForbiddenLiteralSecret $suppliedSecretForGuard
@@ -1923,12 +2305,16 @@ if (-not $script:IsDryRun) {
     Protect-SensitiveFileAcl $lane2ConfigPath
     Save-RollbackManifestCheckpoint -Stage 'write:lane2-config.toml'
 }
-Write-Host "    Wrote: $lane2ConfigPath (preserved custom sections & $($trustedProjects.Count) trusted project(s))"
+Write-Host "    Wrote: $lane2ConfigPath (preserved custom sections; $($lane2ProjectState.TrustedCount) trusted, $($lane2ProjectState.UntrustedCount) untrusted project(s))"
 
 if ($ShareAuthToLane2) {
     Write-Step "Sharing authenticated session (auth.json) from Lane 1 to Lane 2 (-ShareAuthToLane2)..."
     $lane1AuthPath = Join-Path $Lane1Home 'auth.json'
     $lane2AuthPath = Join-Path $Lane2Home 'auth.json'
+    Write-Host "    [WARN] -ShareAuthToLane2 (opt-in) duplicates auth.json, placing a second copy of OAuth credentials in Lane 2 ('$lane2AuthPath'). Omit -ShareAuthToLane2 and run 'codex login' separately if you prefer isolated credentials." -ForegroundColor Yellow
+    if ($configureGatewayLane2) {
+        Write-Host "    [WARN] SECURITY CAUTION: Combining -ShareAuthToLane2 with a third-party API gateway on Lane 2 ('$GatewayBaseUrl') mixes copied official OAuth tokens with third-party gateway routing. Prefer using env_key ('$GatewayApiKeyEnv') alone on Lane 2 unless you explicitly intend both." -ForegroundColor Yellow
+    }
     Assert-NotReparsePoint -PathValue $lane1AuthPath -Label 'Lane 1 auth.json'
     Assert-NotReparsePoint -PathValue $lane2AuthPath -Label 'Lane 2 auth.json'
     if (-not (Test-Path -LiteralPath $lane1AuthPath -PathType Leaf)) {
@@ -1995,6 +2381,12 @@ if ($configureGatewayLane1) {
     $provHeader = "model_providers.`"$(Escape-TomlBasicString $GatewayProviderName)`""
     $lane1TopBlock = $lane1TopLines -join "`r`n"
 
+    $lane1ProjectState = Resolve-MergedProjectTrustState `
+        -PrimaryConfigPath $lane1ConfigPath `
+        -SecondaryConfigPath $lane2ConfigPath `
+        -EnsureTrustedPaths @($RepoPath, $effectiveLane2Repo)
+    $lane1ProjectsSection = if ($lane1ProjectState.ProjectsBlock) { "`r`n`r`n" + $lane1ProjectState.ProjectsBlock } else { '' }
+
     $lane1SectionsBlock = @"
 [$provHeader]
 name = "$(Escape-TomlBasicString $GatewayProviderName)"
@@ -2004,9 +2396,7 @@ wire_api = "responses"
 env_key = "$(Escape-TomlBasicString $GatewayApiKeyEnv)"
 
 [windows]
-sandbox = "elevated"
-
-$projectsBlock
+sandbox = "elevated"$lane1ProjectsSection
 
 [features]
 $($gwFeatureLines -join "`r`n")
@@ -2033,7 +2423,8 @@ CODEX_ACTIVE_LANE = "LANE_1"
         -ManagedTopBlock $lane1TopBlock `
         -ManagedSectionsBlock $lane1SectionsBlock `
         -ManagedTopKeys ($gwTopKeys.ToArray()) `
-        -ManagedSectionNames $lane1ManagedSections
+        -ManagedSectionNames $lane1ManagedSections `
+        -ManagedProjectKeys $lane1ProjectState.ManagedProjectKeys
 
     # Fail-closed invariant check: zero plaintext bearer tokens or supplied API key literals in TOML,
     # and env_key MUST be present.

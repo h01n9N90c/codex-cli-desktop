@@ -6,6 +6,21 @@ The format follows semantic versioning (`MAJOR.MINOR.PATCH`).
 
 ---
 
+## [1.3.3] — 2026-11-23 (Strict Project Trust-Level Preservation & Auth-Share Guardrails)
+
+### Fixed
+- **Fixed (Security — Trust Boundary):** Fixed `Get-ExistingTrustedProjects` and Lane 2 config generation in `scripts/setup-dual-lane.ps1` (and hardened parity in `scripts/setup-dual-lane.sh`) so harvesting/preserving `[projects.*]` entries inspects actual `trust_level` values — only projects genuinely marked `trust_level = "trusted"` are written as `"trusted"`, while `trust_level = "untrusted"` entries (in either Lane 1 or Lane 2) are preserved faithfully as `"untrusted"` and entries without an explicit `trust_level` are never promoted to `"trusted"`.
+
+### Added
+- **Added (Guardrails & Regression Tests):** Added explicit opt-in `[WARN]` security warnings when `-ShareAuthToLane2` / `--share-auth-to-lane2` duplicates `auth.json` into Lane 2 (with an elevated warning when combined with third-party API gateways via `-ConfigureGateway` / `-ConfigureCliGateway` / `--configure-gateway` / `--configure-cli-gateway`), and added Windows (`tests/test-kit.ps1` Stage 12) + Unix CI (`.github/workflows/ci.yml` Section 9e) regression tests covering `trusted`, `untrusted`, and missing-`trust_level` project tables alongside auth-share warnings.
+
+### Changed
+- Strengthened security transparency documentation across `README.md`, `SECURITY.md`, `docs/GUIDE_AND_MANIFEST.md`, `docs/SECURITY_MODEL.md`, and `docs/REAL_CODEX_CHECKLIST.md`:
+  - Explicitly documented that `-ShareAuthToLane2` / `--share-auth-to-lane2` is strictly opt-in (off by default), creates a second copy of `auth.json` in Lane 2, and should be avoided or used with caution when Lane 2 is configured with a third-party API gateway.
+  - Reiterated clearly that 4/4 green GitHub Actions CI validates kit scripts and invariants using mock `codex` binaries across OSes and does not replace running `doctor.ps1` / `doctor.sh` or verifying behavior directly against the specific real Codex Desktop/CLI release installed on the user's machine.
+
+---
+
 ## [1.3.2] — 2026-11-23 (Zero-Intrusion Desktop Harvesting & Cross-Shell Compatibility)
 
 ### Added

@@ -1432,32 +1432,78 @@ theme = "light"
     }
 
     # ========================================================================
-    # TEST 12: Desktop Primary Account (Full Authority & Read-Only Trusted Project Harvesting) + CLI Login & API Key (-ConfigureCliGateway / -CliApiKeyEnv) + Relative -RepoPath + Git Bash POSIX Shims + Full Workspace File CRUD
-    # WHAT: Verifies v1.3.2 zero-intrusion Desktop harvesting, cross-shell compatibility, and workspace mastery:
+    # TEST 12: Desktop Primary Account (Full Authority & Strict Project Trust-Boundary Preservation) + CLI Login & API Key (-ConfigureCliGateway / -CliApiKeyEnv / -ShareAuthToLane2 Warnings) + Relative -RepoPath + Git Bash POSIX Shims + Full Workspace File CRUD
+    # WHAT: Verifies v1.3.2/v1.3.3 zero-intrusion Desktop harvesting, strict `[projects.*]` trust-level
+    #       boundaries, opt-in `-ShareAuthToLane2` security warnings, cross-shell compatibility, and workspace mastery:
     #   12a) Lane 1 (~/.codex, Codex Desktop) remains 100% untouched (full native authority,
     #        SHA-256 identical) when -ConfigureCliGateway and -CliApiKeyEnv are used with a relative
-    #        -RepoPath (`.`), while Lane 2 (~/.codex-official, Codex CLI) read-only harvests
-    #        pre-existing `[projects."..."]` trust entries from Lane 1's config.toml, configures
-    #        both OAuth Login (auth.json via -ShareAuthToLane2) and API Key / Gateway (env_key),
-    #        purges legacy plaintext tokens, generates both `.cmd` and extensionless Git Bash POSIX
-    #        shims (`codex`, `codex-official`, `codex-t3` with strict LF line endings), and passes
-    #        doctor.ps1 (including relative -RepoPath `.`) in both combined and env_key-only modes.
+    #        -RepoPath (`.`), while Lane 2 (~/.codex-official, Codex CLI) strictly preserves project
+    #        trust boundaries (Lane 1 `trusted` -> `trusted`, Lane 1 `untrusted` -> `untrusted`,
+    #        Lane 2 pre-existing `untrusted` -> `untrusted` even if Lane 1 trusts it, Lane 1 entry
+    #        missing `trust_level` -> never promoted, Lane 2 entry missing `trust_level` -> preserved
+    #        without injecting `trust_level = "trusted"`), emits opt-in `-ShareAuthToLane2` credential
+    #        duplication + third-party gateway `[WARN]` notices, purges legacy plaintext tokens,
+    #        generates both `.cmd` and extensionless Git Bash POSIX shims (`codex`, `codex-official`,
+    #        `codex-t3` with strict LF line endings), and passes doctor.ps1 in both combined and env_key-only modes.
     #   12b) Full workspace directory tree traversal and file CRUD (create, read, edit, rename,
     #        delete) inside the active workspace via codex.cmd, while primary-repo escapes remain
     #        blocked fail-closed.
     #   12c) Byte-exact rollback of -ConfigureCliGateway + -ShareAuthToLane2 (removing newly created
     #        `.cmd` and extensionless POSIX shims while restoring any pre-existing shim byte-for-byte),
-    #        plus verification of -GatewayTargetLane 'Both'.
+    #        plus verification of -GatewayTargetLane 'Both' (with -ShareAuthToLane2 omitted to prove
+    #        strict opt-in default and trust-boundary preservation on both lanes).
     # ========================================================================
-    Write-Host "`n=== 12. Zero-Intrusion Desktop Harvesting + -ConfigureCliGateway + Relative -RepoPath + Git Bash Shims + Workspace File CRUD ===" -ForegroundColor Cyan
+    Write-Host "`n=== 12. Strict Project Trust Boundaries + -ShareAuthToLane2 Guardrails + -ConfigureCliGateway + Relative -RepoPath + Git Bash Shims + Workspace File CRUD ===" -ForegroundColor Cyan
     $p12L1   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 lane 1 desktop')
     $p12L2   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 lane 2 cli')
     $p12Bin  = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 local bin')
     $p12Repo = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 repo workspace')
     New-Item -ItemType Directory -Path (Join-Path $p12L1 'sessions'), $p12L2, $p12Bin, $p12Repo -Force | Out-Null
     try {
+        # Helper: parses all [projects."..."] / [projects.'...'] sections in a TOML string into a case-insensitive
+        # dictionary of { projectPath -> @{ Count; Body } } for strict section-scoped trust assertions.
+        $parseProjectSections = {
+            param([string]$TomlText)
+            $map = New-Object 'System.Collections.Generic.Dictionary[string, object]' ([System.StringComparer]::OrdinalIgnoreCase)
+            $curPath = $null
+            $curBody = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($ln in ($TomlText -split "\r?\n")) {
+                $t = $ln.Trim()
+                if ($t -match '^\[') {
+                    if ($null -ne $curPath) {
+                        if ($map.ContainsKey($curPath)) {
+                            $map[$curPath].Count++
+                            $map[$curPath].Body += ("`n" + ($curBody -join "`n"))
+                        } else {
+                            $map[$curPath] = [PSCustomObject]@{ Count = 1; Body = ($curBody -join "`n") }
+                        }
+                        $curPath = $null
+                        $curBody.Clear()
+                    }
+                    $pm = [regex]::Match($t, '^\[projects\s*\.\s*(?:''([^'']+)''|"((?:[^"\\]|\\.)+)")\s*\](?:\s*#.*)?$')
+                    if ($pm.Success) {
+                        $curPath = if ($pm.Groups[1].Success) { $pm.Groups[1].Value } else { $pm.Groups[2].Value.Replace('\"', '"').Replace('\\', '\') }
+                    }
+                    continue
+                }
+                if ($null -ne $curPath) {
+                    $curBody.Add($ln)
+                }
+            }
+            if ($null -ne $curPath) {
+                if ($map.ContainsKey($curPath)) {
+                    $map[$curPath].Count++
+                    $map[$curPath].Body += ("`n" + ($curBody -join "`n"))
+                } else {
+                    $map[$curPath] = [PSCustomObject]@{ Count = 1; Body = ($curBody -join "`n") }
+                }
+            }
+            return $map
+        }
+
         # Seed Lane 1 (Codex Desktop = Primary Account / acc chính) with user's custom Desktop config,
-        # pre-existing trusted Desktop project `[projects."c:\\desktop\\trusted-from-lane1"]`, & login.
+        # trusted project, explicitly untrusted project, project missing trust_level (with commented trust_level),
+        # conflicting single-quoted trusted entry for a path already untrusted in Lane 2, & login.
         $p12Cfg1 = Join-Path $p12L1 'config.toml'
         $p12DesktopSeed = @"
 # User Primary Account Desktop Config (must remain 100% untouched by default / -ConfigureCliGateway)
@@ -1465,6 +1511,15 @@ model = "gpt-5.4"
 
 [projects."c:\\desktop\\trusted-from-lane1"]
 trust_level = "trusted"
+
+[projects."c:\\desktop\\untrusted-from-lane1"]
+trust_level = "untrusted"
+
+[projects."c:\\desktop\\missing-trust-from-lane1"]
+# trust_level = "trusted"
+
+[projects.'c:\lane2\untrusted-preexisting'] # must NOT override Lane 2 untrusted
+trust_level = 'trusted'
 
 [tui]
 theme = "solarized"
@@ -1481,7 +1536,8 @@ theme = "solarized"
         [System.IO.File]::WriteAllText($p12PrePosixT3, "#!/usr/bin/env sh`necho PRE_EXISTING_POSIX_T3`n", (New-Object System.Text.UTF8Encoding($false)))
         $p12PrePosixT3OrigHash = (Get-FileHash -LiteralPath $p12PrePosixT3 -Algorithm SHA256).Hash
 
-        # Seed Lane 2 (Codex CLI) with a legacy bearer token canary + custom MCP section.
+        # Seed Lane 2 (Codex CLI) with a legacy bearer token canary, a pre-existing untrusted project,
+        # a pre-existing project missing trust_level, and a custom MCP section.
         $p12Cfg2 = Join-Path $p12L2 'config.toml'
         $p12CliLegacyCanary = 'sk-CLI-LEGACY-BEARER-MUST-BE-PURGED-998811'
         $p12CliSeed = @"
@@ -1491,6 +1547,12 @@ model_provider = "OpenAI"
 name = "OpenAI"
 base_url = "https://old-cli.example.invalid/v1"
 experimental_bearer_token = "$p12CliLegacyCanary"
+
+[projects."c:\\lane2\\untrusted-preexisting"]
+trust_level = "untrusted"
+
+[projects."c:\\lane2\\missing-trust-preexisting"]
+custom_note = "preserve-without-trust-promotion"
 
 [mcp_servers.cli_helper]
 command = "node"
@@ -1577,11 +1639,15 @@ Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
         }
         Assert-True ($resP12Inst.ExitCode -eq 0) "Test 12a install (-ConfigureCliGateway -RepoPath .) failed (exit=$($resP12Inst.ExitCode)):`n$($resP12Inst.Output)"
 
+        # Verify -ShareAuthToLane2 + -ConfigureCliGateway emitted BOTH credential-duplication and third-party gateway [WARN] messages.
+        Assert-True ($resP12Inst.Output -match '\[WARN\].*-ShareAuthToLane2.*auth\.json') "Expected [WARN] about -ShareAuthToLane2 duplicating auth.json in stdout:`n$($resP12Inst.Output)"
+        Assert-True ($resP12Inst.Output -match '\[WARN\].*third-party API gateway') "Expected high-visibility [WARN] cautioning against mixing -ShareAuthToLane2 OAuth tokens with a third-party API gateway:`n$($resP12Inst.Output)"
+
         # Verify Lane 1 (Codex Desktop Primary Account) config.toml was 100% UNTOUCHED!
         Assert-True ((Get-FileHash -LiteralPath $p12Cfg1 -Algorithm SHA256).Hash -eq $p12Cfg1OrigHash) 'CRITICAL: Lane 1 Desktop config.toml must remain 100% untouched when -ConfigureCliGateway is used!'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12L1 'config.backup.toml'))) 'Lane 1 config.backup.toml must not be created when -ConfigureCliGateway is used!'
 
-        # Verify Lane 2 (Codex CLI) config.toml has BOTH gateway env_key, read-only harvested [projects."..."] from Lane 1 Desktop,
+        # Verify Lane 2 (Codex CLI) config.toml has BOTH gateway env_key, strict trust-boundary preservation for [projects.*],
         # canonicalized relative -RepoPath, preserved custom sections, zero plaintext secrets, and workspace-write sandbox.
         $p12Merged2 = Get-Content -LiteralPath $p12Cfg2 -Raw -Encoding UTF8
         Assert-True ($p12Merged2 -match 'model_provider = "OpenAI"') 'Lane 2 config.toml missing model_provider'
@@ -1589,9 +1655,40 @@ Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
         Assert-True ($p12Merged2 -match 'env_key = "CODEX_CLI_API_KEY"') 'Lane 2 config.toml missing env_key = "CODEX_CLI_API_KEY"'
         Assert-True ($p12Merged2 -match 'sandbox_mode = "workspace-write"') 'Lane 2 config.toml missing sandbox_mode = "workspace-write"'
         Assert-True ($p12Merged2 -match 'CODEX_ACTIVE_LANE = "LANE_2"') 'Lane 2 config.toml missing CODEX_ACTIVE_LANE = "LANE_2"'
-        Assert-True ($p12Merged2 -match 'c:\\\\desktop\\\\trusted-from-lane1') 'Lane 2 config.toml did not read-only harvest trusted [projects."c:\\desktop\\trusted-from-lane1"] from Lane 1 Desktop config.toml!'
-        $p12RepoEscapedForRegex = [regex]::Escape(($p12Repo.Replace('\', '\\')))
-        Assert-True ($p12Merged2 -match $p12RepoEscapedForRegex) "Lane 2 config.toml did not record canonicalized path for relative -RepoPath '.' ($p12Repo)!"
+
+        $p12ProjMapL2 = & $parseProjectSections $p12Merged2
+        # 1) Lane 1 genuinely trusted project IS inherited into Lane 2 as trust_level = "trusted".
+        Assert-True ($p12ProjMapL2.ContainsKey('c:\desktop\trusted-from-lane1') -and $p12ProjMapL2['c:\desktop\trusted-from-lane1'].Count -eq 1) 'Lane 2 config.toml did not read-only harvest trusted [projects."c:\\desktop\\trusted-from-lane1"] (or duplicated it)!'
+        Assert-True ($p12ProjMapL2['c:\desktop\trusted-from-lane1'].Body -match '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') 'Lane 1 trusted project must have trust_level = "trusted" in Lane 2!'
+        # 2) Lane 1 explicitly untrusted project is NOT promoted to "trusted" and preserves trust_level = "untrusted".
+        Assert-True ($p12ProjMapL2.ContainsKey('c:\desktop\untrusted-from-lane1') -and $p12ProjMapL2['c:\desktop\untrusted-from-lane1'].Count -eq 1) 'Lane 2 config.toml did not preserve Lane 1 untrusted project [projects."c:\\desktop\\untrusted-from-lane1"]!'
+        Assert-True ($p12ProjMapL2['c:\desktop\untrusted-from-lane1'].Body -match '(?m)^\s*trust_level\s*=\s*"untrusted"\s*$') 'SECURITY REGRESSION: Lane 1 untrusted project must retain trust_level = "untrusted" in Lane 2!'
+        Assert-True ($p12ProjMapL2['c:\desktop\untrusted-from-lane1'].Body -notmatch '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') 'SECURITY REGRESSION: Lane 1 untrusted project was promoted to "trusted"!'
+        # 3) Lane 2 pre-existing untrusted project retains trust_level = "untrusted" (even though Lane 1 trusted it!).
+        Assert-True ($p12ProjMapL2.ContainsKey('c:\lane2\untrusted-preexisting') -and $p12ProjMapL2['c:\lane2\untrusted-preexisting'].Count -eq 1) 'Lane 2 pre-existing untrusted project was lost or duplicated!'
+        Assert-True ($p12ProjMapL2['c:\lane2\untrusted-preexisting'].Body -match '(?m)^\s*trust_level\s*=\s*"untrusted"\s*$') 'SECURITY REGRESSION: Lane 2 pre-existing untrusted project must retain trust_level = "untrusted"!'
+        Assert-True ($p12ProjMapL2['c:\lane2\untrusted-preexisting'].Body -notmatch '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') 'SECURITY REGRESSION: Lane 2 pre-existing untrusted project was promoted to "trusted"!'
+        # 4) Lane 1 project missing trust_level (only commented `# trust_level = "trusted"`) is NOT harvested/promoted.
+        Assert-True (-not $p12ProjMapL2.ContainsKey('c:\desktop\missing-trust-from-lane1')) 'SECURITY REGRESSION: Lane 1 project missing trust_level must NOT be harvested/promoted into Lane 2!'
+        # 5) Lane 2 pre-existing project missing trust_level preserves its original block WITHOUT injecting trust_level = "trusted".
+        Assert-True ($p12ProjMapL2.ContainsKey('c:\lane2\missing-trust-preexisting') -and $p12ProjMapL2['c:\lane2\missing-trust-preexisting'].Count -eq 1) 'Lane 2 pre-existing project missing trust_level was lost or duplicated!'
+        Assert-True ($p12ProjMapL2['c:\lane2\missing-trust-preexisting'].Body -match 'custom_note = "preserve-without-trust-promotion"') 'Lane 2 pre-existing project missing trust_level lost its original body!'
+        Assert-True ($p12ProjMapL2['c:\lane2\missing-trust-preexisting'].Body -notmatch 'trust_level\s*=') 'SECURITY REGRESSION: Lane 2 project missing trust_level had trust_level injected!'
+        # 6) Explicitly targeted relative -RepoPath '.' (canonicalized) and Lane 2 worktree ARE trusted.
+        Assert-True ($p12ProjMapL2.ContainsKey($p12Repo) -and $p12ProjMapL2[$p12Repo].Count -eq 1 -and $p12ProjMapL2[$p12Repo].Body -match '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') "Lane 2 config.toml did not record canonicalized trusted path for relative -RepoPath '.' ($p12Repo)!"
+        $p12ExpectedWt = Get-CanonicalLongPath -Path "$p12Repo-lane2"
+        Assert-True ($p12ProjMapL2.ContainsKey($p12ExpectedWt) -and $p12ProjMapL2[$p12ExpectedWt].Count -eq 1 -and $p12ProjMapL2[$p12ExpectedWt].Body -match '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') "Lane 2 config.toml did not trust Lane 2 worktree ($p12ExpectedWt)!"
+        # Validate generated Lane 2 config.toml parses cleanly as valid TOML (catches duplicate headers/syntax bugs on Python 3.11+).
+        $tomlCheckPy = @'
+import pathlib, sys
+if sys.version_info >= (3, 11):
+    import tomllib
+    data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    assert isinstance(data.get("projects"), dict), "Missing [projects] table"
+'@
+        $tomlCheckPy | & $py -B - $p12Cfg2
+        Assert-True ($LASTEXITCODE -eq 0) "Generated Lane 2 config.toml failed strict TOML parse validation!"
+
         Assert-True ($p12Merged2 -match '\[mcp_servers\.cli_helper\]') 'Lane 2 custom [mcp_servers.cli_helper] section was lost!'
         Assert-True ($p12Merged2 -notmatch 'experimental_bearer_token') 'Lane 2 config.toml must purge experimental_bearer_token!'
         Assert-True ($p12Merged2 -notmatch [regex]::Escape($p12CliLegacyCanary)) 'Legacy CLI bearer token leaked into Lane 2 config.toml!'
@@ -1690,7 +1787,10 @@ Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
         Assert-True (Test-Path -LiteralPath $p12PrePosixT3 -PathType Leaf) 'Pre-existing extensionless POSIX shim codex-t3 MUST be restored on rollback!'
         Assert-True ((Get-FileHash -LiteralPath $p12PrePosixT3 -Algorithm SHA256).Hash -eq $p12PrePosixT3OrigHash) 'Pre-existing extensionless POSIX shim codex-t3 SHA-256 mismatch after rollback!'
 
-        # Also verify -GatewayTargetLane 'Both' configures both lanes while keeping Lane 1 Desktop free of sandbox_mode/network_access restrictions!
+        # Also verify -GatewayTargetLane 'Both' configures both lanes while:
+        #   - Keeping Lane 1 Desktop free of sandbox_mode/network_access restrictions,
+        #   - Confirming -ShareAuthToLane2 remains strictly opt-in (off by default: no auth.json copy, no [WARN]),
+        #   - Preserving strict project trust boundaries across BOTH Lane 1 and Lane 2!
         $resP12Both = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
             '-RepoPath', $p12Repo, '-CodexPath', $p12CrudExe,
             '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin,
@@ -1699,17 +1799,24 @@ Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
             '-CliApiKeyEnv', 'CODEX_BOTH_API_KEY', '-SkipPathUpdate'
         )
         Assert-True ($resP12Both.ExitCode -eq 0) "Test 12c (-GatewayTargetLane Both) failed (exit=$($resP12Both.ExitCode)):`n$($resP12Both.Output)"
+        Assert-True (-not (Test-Path -LiteralPath $p12Auth2)) 'SECURITY REGRESSION: auth.json must NOT be copied to Lane 2 unless -ShareAuthToLane2 is explicitly passed!'
+        Assert-True ($resP12Both.Output -notmatch '\[WARN\].*-ShareAuthToLane2') 'Unexpected -ShareAuthToLane2 warning when flag was omitted!'
         $p12BothCfg1 = Get-Content -LiteralPath $p12Cfg1 -Raw -Encoding UTF8
         $p12BothCfg2 = Get-Content -LiteralPath $p12Cfg2 -Raw -Encoding UTF8
         Assert-True ($p12BothCfg1 -match 'env_key = "CODEX_BOTH_API_KEY"' -and $p12BothCfg2 -match 'env_key = "CODEX_BOTH_API_KEY"') '-GatewayTargetLane Both must configure env_key in both Lane 1 and Lane 2!'
         Assert-True ($p12BothCfg1 -notmatch '(?m)^\s*sandbox_mode\s*=' -and $p12BothCfg1 -notmatch '(?m)^\s*network_access\s*=\s*false') 'Lane 1 Desktop must NEVER have restrictive sandbox_mode or network_access = false injected even under -GatewayTargetLane Both!'
-        Write-Host "    [OK] Zero-Intrusion Desktop Harvesting + -ConfigureCliGateway/-CliApiKeyEnv + Relative -RepoPath + Git Bash POSIX Shims + Full Workspace File CRUD verified" -ForegroundColor Green
+        $p12BothMapL1 = & $parseProjectSections $p12BothCfg1
+        Assert-True ($p12BothMapL1.ContainsKey('c:\desktop\untrusted-from-lane1') -and $p12BothMapL1['c:\desktop\untrusted-from-lane1'].Body -match '(?m)^\s*trust_level\s*=\s*"untrusted"\s*$') 'Lane 1 untrusted project must remain untrusted under -GatewayTargetLane Both!'
+        Assert-True ($p12BothMapL1.ContainsKey('c:\desktop\missing-trust-from-lane1') -and $p12BothMapL1['c:\desktop\missing-trust-from-lane1'].Body -notmatch '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') 'Lane 1 missing-trust project must NOT be promoted to trusted under -GatewayTargetLane Both!'
+        $tomlCheckPy | & $py -B - $p12Cfg1
+        Assert-True ($LASTEXITCODE -eq 0) "Generated Lane 1 config.toml (-GatewayTargetLane Both) failed strict TOML parse validation!"
+        Write-Host "    [OK] Strict Project Trust Boundaries + -ShareAuthToLane2 Guardrails + -ConfigureCliGateway/-CliApiKeyEnv + Relative -RepoPath + Git Bash POSIX Shims + Full Workspace File CRUD verified" -ForegroundColor Green
     } finally {
         Remove-TempTreeSafely -RootDir $null -Lane2Dir $p12L2
         try { git -C $p12Repo worktree remove -f "$p12Repo-lane2" 2>$null } catch {}
     }
 
-    Write-Host "`n[PASS] All 12 Windows test stages passed cleanly (AST, Python, default.rules, DryRun/WhatIf, TOML/env_key/ACL/8.3/fail-closed worktree, doctor, traversal defense, SHA-256 rollback, interrupted recovery, 3x loop, pre-existing link/exact backup/missing-backup preflight, and Zero-Intrusion Desktop Harvesting + CLI Login/API-Key + Relative RepoPath + Git Bash Shims + Workspace File CRUD)!" -ForegroundColor Green
+    Write-Host "`n[PASS] All 12 Windows test stages passed cleanly (AST, Python, default.rules, DryRun/WhatIf, TOML/env_key/ACL/8.3/fail-closed worktree, doctor, traversal defense, SHA-256 rollback, interrupted recovery, 3x loop, pre-existing link/exact backup/missing-backup preflight, and Strict Project Trust Boundaries + -ShareAuthToLane2 Guardrails + CLI Login/API-Key + Relative RepoPath + Git Bash Shims + Workspace File CRUD)!" -ForegroundColor Green
 } finally {
     Remove-TempTreeSafely -RootDir $tmpRoot -Lane2Dir $l2
 }

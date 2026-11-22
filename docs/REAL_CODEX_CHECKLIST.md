@@ -2,12 +2,14 @@
 
 > **Tác giả:** Lê Hoàng Ngọc Tươi | **Dự án:** Codex Dual-Lane & Security Kit (Apache License 2.0)  
 > Danh sách này giúp bạn (hoặc đội kiểm duyệt an ninh) tự kiểm chứng bằng lệnh thực tế từng cơ chế bảo vệ, ACL, `execpolicy`, TOML merge, SQLite UPSERT và khôi phục SHA-256 trước và sau khi cài đặt — không tin mù quáng vào cấu hình tĩnh.
+>
+> **Ranh giới minh bạch CI vs. Codex Runtime thật:** **4/4 job xanh trên GitHub Actions CI** (`hygiene-and-policy`, Windows PS 5.1 & 7+, Ubuntu, macOS) kiểm chứng logic script, bảo toàn `trust_level`, worktree fail-closed và rollback **bằng các binary `codex` giả lập (`mock codex`)** trên đa hệ điều hành. CI xanh 4/4 **không thay thế** cho việc chạy `scripts/doctor.ps1` / `scripts/doctor.sh` và tự kiểm chứng các mục dưới đây trực tiếp trên **đúng phiên bản Codex Desktop/CLI thật đang cài trên máy bạn** (và chạy lại sau mỗi lần nâng cấp Codex).
 
 ---
 
 ## 1. Kiểm chứng Không lưu Plaintext API Key trong `config.toml` & Bản sao lưu (Linh hoạt Luồng 2 CLI & Luồng 1 Desktop)
 
-Khi dùng `-ConfigureGateway` (kèm `-GatewayTargetLane Lane2|Lane1|Both` trên Windows hoặc `--configure-gateway --gateway-target-lane lane2|lane1|both` trên Unix), bộ kit dùng thuộc tính `env_key = "<TEN_BIEN_MOI_TRUONG>"` của Codex (đọc từ biến môi trường User) thay vì ghi trực tiếp key vào `config.toml` — đồng thời mặc định giữ nguyên 100% `~/.codex/config.toml` để **Codex Desktop (`~/.codex`, Luồng 1 — `acc chính`) được toàn quyền như trước**:
+Khi dùng `-ConfigureCliGateway` / `-ConfigureGateway` (kèm `-GatewayTargetLane Lane2|Lane1|Both` trên Windows hoặc `--configure-cli-gateway` / `--configure-gateway --gateway-target-lane lane2|lane1|both` trên Unix), bộ kit dùng thuộc tính `env_key = "<TEN_BIEN_MOI_TRUONG>"` của Codex (đọc từ biến môi trường User) thay vì ghi trực tiếp key vào `config.toml` — đồng thời mặc định giữ nguyên 100% `~/.codex/config.toml` để **Codex Desktop (`~/.codex`, Luồng 1 — `acc chính`) được toàn quyền như trước**:
 
 **Windows (PowerShell):**
 ```powershell
@@ -21,6 +23,7 @@ grep -En 'experimental_bearer_token|sk-[A-Za-z0-9]{10,}' \
     ~/.codex/config*.toml* ~/.codex-official/config*.toml* 2>/dev/null || true
 ```
 * **Kỳ vọng:** Không có kết quả nào (`0` dòng khớp).
+* **Cảnh báo opt-in `-ShareAuthToLane2` / `--share-auth-to-lane2` (tắt mặc định):** Cờ này chỉ chạy khi bạn chủ động truyền vào; khi bật nó sẽ **tạo bản sao thứ 2 của `auth.json` (OAuth token)** tại Luồng 2 (`~/.codex-official/auth.json`) và phát cảnh báo `[WARN]` (cảnh báo mức cao hơn nếu đi cùng cờ gateway bên thứ 3). **Nên tránh hoặc hết sức thận trọng khi Luồng 2 đang cấu hình cổng API bên thứ 3.**
 * **Khuyến nghị nâng cao:** Nếu phiên bản Codex của bạn hỗ trợ, cấu hình thêm `cli_auth_credentials_store = "keyring"` để chuyển token đăng nhập từ tệp `auth.json` vào OS Credential Store / Keyring.
 
 ---
@@ -88,7 +91,7 @@ foreach ($f in @("$env:USERPROFILE\.codex\auth.json","$env:USERPROFILE\.codex\co
 ```
 * **Kỳ vọng:** `CodexSandboxUsers Allow ACEs: 0` (và `doctor.ps1` báo `kernel_acl=locked`, đồng thời không báo nhầm trên Deny ACE bảo vệ nếu có).
 * **Lưu ý thực tế:** Khi `codex` CLI/Desktop chạy `codex features ...`, sửa Settings trên App, hoặc tạo mới `auth.json` bằng ghi đè atomic, Windows sẽ áp lại quyền kế thừa `CodexSandboxUsers:(OI)(CI)(RX)` từ thư mục cha (script bên ngoài không thể ngăn trước thao tác ghi của chính Codex). Hãy chạy `.\scripts\doctor.ps1` và nếu thấy `kernel_acl=EXPOSED`, chạy ngay `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -ReapplyAclOnly` (và giữ `env_key` + `cli_auth_credentials_store = "keyring"`).
-* **Ranh giới CI vs. Codex thật:** Bộ test trong `tests/test-kit.ps1` và GitHub Actions CI chạy trên mock CLI để kiểm tra logic/portable nhanh; hãy luôn chạy các lệnh ở Mục 1–4 trên máy bạn với chính binary Codex thật sau khi cài.
+* **Ranh giới CI (4/4 xanh bằng Mock `codex`) vs. Codex Runtime thật:** Bộ test trong `tests/test-kit.ps1` và **4/4 job xanh trên GitHub Actions CI** (Windows PS 5.1 & 7+, Ubuntu, macOS) kiểm chứng logic script, bảo toàn `trust_level` và rollback bằng các binary `codex` giả lập (`mock codex`) — **không thay thế** cho việc chạy `scripts/doctor.ps1` / `scripts/doctor.sh` và tự kiểm chứng Mục 1–4 trực tiếp trên đúng phiên bản **Codex Desktop/CLI thật** đang cài trên máy bạn.
 
 **macOS / Linux / WSL (Bash):**
 ```bash
@@ -99,14 +102,14 @@ ls -la ~/.codex/config.toml ~/.codex/auth.json ~/.codex-official/config.toml ~/.
 
 ---
 
-## 5. Kiểm chứng Merge `config.toml`, `-ConfigureCliGateway` / `-GatewayTargetLane` (CLI Login + API Key), Kế thừa Chỉ-đọc `[projects.*]`, Git Bash Shims, Đường dẫn 8.3, Worktree Fail-Closed, Quyền Sở hữu Link & Preflight Fail-Closed (v1.3.2)
+## 5. Kiểm chứng Merge `config.toml`, Bảo toàn Nghiêm ngặt `trust_level`, Cảnh báo Auth-Share, `-ConfigureCliGateway` / `-GatewayTargetLane`, Git Bash Shims, Đường dẫn 8.3, Worktree Fail-Closed, Quyền Sở hữu Link & Preflight Fail-Closed (v1.3.3)
 
-Chạy bộ test tích hợp 12 pha trên Windows (không đụng tới `~/.codex*` thật của bạn, dùng thư mục tạm cô lập):
+Chạy bộ test tích hợp 12 pha trên Windows (không đụng tới `~/.codex*` thật của bạn, dùng thư mục tạm cô lập; tương đương trên Unix là Section 9a–9e trong `.github/workflows/ci.yml`):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1
 ```
-* **Kỳ vọng:** Toàn bộ 12 pha kiểm tra đều báo `[PASS]`: cú pháp AST & CRLF, unit test Python, Starlark `default.rules`, `-DryRun`/`-WhatIf`, TOML merge giữ nguyên `[mcp_servers.*]`/`[tui]`/`[projects.*]`, cô lập `env_key` & `-ConfigureCliGateway` / `-GatewayTargetLane` (giữ `~/.codex/config.toml` của Desktop nguyên vẹn 100% SHA-256 khi cấu hình `Lane2`, kế thừa chỉ-đọc `[projects."..."]` từ Desktop sang CLI, hỗ trợ `-ShareAuthToLane2`, đường dẫn tương đối `-RepoPath .` và POSIX shim không đuôi cho Git Bash/MSYS2), UTF-8 không BOM, khóa ACL 2 bước & `-ReapplyAclOnly`, chuẩn hóa đường dẫn ngắn 8.3 (`RUNNER~1`/`PROGRA~1` qua `GetLongPathNameW` + `%%~fs`), worktree fail-closed cứng (từ chối chạy khi worktree bị xóa/thay bằng tệp thường/lỗi `cd`, chỉ tắt auto-cd với `CODEX_NO_AUTO_WORKTREE_CD=1` trong khi vẫn chặn `-C`/`-C<path>`/`--cd`/`--add-dir`), `doctor.ps1`, chống path-traversal, khôi phục SHA-256, phục hồi cài đặt bị ngắt giữa chừng (`.rollback/latest.json` `Completed=false`), vòng lặp cài đặt + khôi phục 3 lần liên tiếp (0 tệp backup rác, 0 mất dữ liệu Luồng 1), bảo toàn Junction/symlink có từ trước của người dùng (`SharedLinkRecords`), khôi phục thư mục từ đúng đường dẫn backup trong manifest (chống decoy backup), và kiểm tra preflight fail-closed khi thiếu backup (0 thay đổi trên đĩa).
+* **Kỳ vọng:** Toàn bộ 12 pha kiểm tra đều báo `[PASS]`: cú pháp AST & CRLF, unit test Python, Starlark `default.rules`, `-DryRun`/`-WhatIf`, TOML merge giữ nguyên `[mcp_servers.*]`/`[tui]`/`[projects.*]`, cô lập `env_key` & `-ConfigureCliGateway` / `-GatewayTargetLane` (giữ `~/.codex/config.toml` của Desktop nguyên vẹn 100% SHA-256 khi cấu hình `Lane2`, kế thừa chỉ-đọc `[projects."..."]` từ Desktop sang CLI với **bảo toàn nghiêm ngặt `trust_level`** — `trusted` giữ `"trusted"`, `untrusted` ở cả Luồng 1 lẫn Luồng 2 giữ nguyên `"untrusted"` và tuyệt đối không bị nâng cấp, mục thiếu `trust_level` không bao giờ bị nâng cấp lên `"trusted"` — phát cảnh báo `[WARN]` cho cờ opt-in `-ShareAuthToLane2` đặc biệt khi đi kèm `-ConfigureCliGateway`, hỗ trợ đường dẫn tương đối `-RepoPath .` và POSIX shim không đuôi cho Git Bash/MSYS2), UTF-8 không BOM, khóa ACL 2 bước & `-ReapplyAclOnly`, chuẩn hóa đường dẫn ngắn 8.3 (`RUNNER~1`/`PROGRA~1` qua `GetLongPathNameW` + `%%~fs`), worktree fail-closed cứng (từ chối chạy khi worktree bị xóa/thay bằng tệp thường/lỗi `cd`, chỉ tắt auto-cd với `CODEX_NO_AUTO_WORKTREE_CD=1` trong khi vẫn chặn `-C`/`-C<path>`/`--cd`/`--add-dir`), `doctor.ps1`, chống path-traversal, khôi phục SHA-256, phục hồi cài đặt bị ngắt giữa chừng (`.rollback/latest.json` `Completed=false`), vòng lặp cài đặt + khôi phục 3 lần liên tiếp (0 tệp backup rác, 0 mất dữ liệu Luồng 1), bảo toàn Junction/symlink có từ trước của người dùng (`SharedLinkRecords`), khôi phục thư mục từ đúng đường dẫn backup trong manifest (chống decoy backup), và kiểm tra preflight fail-closed khi thiếu backup (0 thay đổi trên đĩa).
 
 ---
 

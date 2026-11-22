@@ -704,15 +704,31 @@ jobs:
             ./scripts/restore-original.sh
           [ -L "${P9_L2}/skills" ]
 
-          # 9e) v1.3.2 Workflow Parity & Zero-Intrusion Desktop Harvesting:
+          # 9e) v1.3.3 Security Trust-Boundary Parity, Zero-Intrusion Desktop Harvesting & Auth-Share Guardrails:
           #     Desktop (Lane 1) = Primary Account (untouched config.toml + auth.json, full authority)
-          #     + CLI (Lane 2) = read-only harvests trusted [projects.*] & auth.json (--share-auth-to-lane2),
-          #       configures CLI gateway via --configure-cli-gateway / --cli-api-key-env, and resolves relative --repo-path .
+          #     + CLI (Lane 2) = read-only harvests [projects.*] strictly preserving trust_level
+          #       (trusted stays trusted, untrusted stays untrusted, missing/invalid trust_level is NEVER
+          #       harvested/promoted, pre-existing Lane 2 untrusted entries are NEVER overwritten or
+          #       duplicated across quote/trailing-slash variants), emits explicit opt-in & third-party
+          #       gateway [WARN] guardrails for --share-auth-to-lane2, configures CLI gateway via
+          #       --configure-cli-gateway / --cli-api-key-env, and resolves relative --repo-path .
           cat > "${P9_L1}/config.toml" <<'EOF'
           # Desktop primary account config
           model = "desktop-primary"
 
           [projects."/tmp/desktop-trusted-proj"]
+          trust_level = "trusted"
+
+          [projects."/tmp/desktop-untrusted-proj"]
+          trust_level = "untrusted"
+
+          [projects."/tmp/desktop-no-trust-proj"]
+          # intentionally missing trust_level
+
+          [projects."/tmp/desktop-invalid-trust-proj"]
+          trust_level = "unknown"
+
+          [projects."/tmp/lane2-preexisting-untrusted/"]
           trust_level = "trusted"
           EOF
           chmod 600 "${P9_L1}/config.toml"
@@ -720,31 +736,77 @@ jobs:
           printf '{"auth_mode":"chatgpt","token":"%s"}\n' "${SECRET_CANARY}" > "${P9_L1}/auth.json"
           chmod 600 "${P9_L1}/auth.json"
           P9_L1_AUTH_HASH="$(sha256_of "${P9_L1}/auth.json")"
+          cat > "${P9_L2}/config.toml" <<'EOF'
+          model = "p9-original"
+
+          [projects.'/tmp/lane2-preexisting-untrusted']
+          trust_level = "untrusted"
+          EOF
+          chmod 644 "${P9_L2}/config.toml"
+          P9E_ORIG_CFG_HASH="$(sha256_of "${P9_L2}/config.toml")"
           rm -f "${P9_L2}/auth.json"
           P9_REPO_CANON="$(cd -P -- "${P9_REPO}" && pwd -P)"
           KIT_ROOT_ABS="$(pwd -P)"
 
-          (
+          # Confirm --share-auth-to-lane2 is strictly opt-in (default off: no auth copy or warning without flag).
+          P9E_OPTIN_OUT="$(
+            cd "${P9_REPO}"
+            PATH="${FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+              "${KIT_ROOT_ABS}/scripts/setup-dual-lane.sh" --repo-path . --dry-run 2>&1
+          )"
+          if printf '%s\n' "${P9E_OPTIN_OUT}" | grep -Fq -- '--share-auth-to-lane2'; then
+            echo "[FAIL] --share-auth-to-lane2 warning fired even though flag was not passed!" >&2
+            exit 1
+          fi
+          [ ! -e "${P9_L2}/auth.json" ]
+
+          P9E_SETUP_OUT="$(
             cd "${P9_REPO}"
             PATH="${FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
               "${KIT_ROOT_ABS}/scripts/setup-dual-lane.sh" --repo-path . \
                 --configure-cli-gateway \
                 --gateway-base-url "https://gateway.example.invalid/v1" \
                 --cli-api-key-env "CODEX_CLI_API_KEY" \
-                --share-auth-to-lane2
-          )
+                --share-auth-to-lane2 2>&1
+          )"
+          printf '%s\n' "${P9E_SETUP_OUT}"
+          printf '%s\n' "${P9E_SETUP_OUT}" | grep -Fq '[WARN] --share-auth-to-lane2'
+          printf '%s\n' "${P9E_SETUP_OUT}" | grep -Eqi '\[WARN\].*third-party API gateway'
+          if printf '%s' "${P9E_SETUP_OUT}" | grep -Fq "${SECRET_CANARY}"; then
+            echo "[FAIL] setup-dual-lane.sh leaked auth.json secret canary in 9e!" >&2
+            exit 1
+          fi
 
           # Lane 1 config.toml and auth.json MUST remain 100% untouched (Desktop full native authority).
           [ "$(sha256_of "${P9_L1}/config.toml")" = "${P9_L1_CFG_HASH}" ]
           [ "$(sha256_of "${P9_L1}/auth.json")" = "${P9_L1_AUTH_HASH}" ]
-          # Lane 2 config.toml MUST have env_key + preserved model + read-only harvested Desktop [projects.*]
-          # + canonicalized --repo-path . + zero plaintext secrets, coexisting with harvested auth.json (0600).
+          # Lane 2 config.toml MUST be valid TOML (no duplicate project tables), preserve trust boundaries
+          # strictly across Lane 1 & Lane 2, keep env_key + preserved model + canonicalized --repo-path .
+          # + zero plaintext secrets, coexisting with harvested auth.json (0600).
           grep -Fq 'model_provider = "OpenAI"' "${P9_L2}/config.toml"
           grep -Fq 'env_key = "CODEX_CLI_API_KEY"' "${P9_L2}/config.toml"
           grep -Fq 'model = "p9-original"' "${P9_L2}/config.toml"
           grep -Fq '[projects."/tmp/desktop-trusted-proj"]' "${P9_L2}/config.toml"
+          grep -Fq '[projects."/tmp/desktop-untrusted-proj"]' "${P9_L2}/config.toml"
           grep -Fq "[projects.\"${P9_REPO_CANON}\"]" "${P9_L2}/config.toml"
+          ! grep -Fq '/tmp/desktop-no-trust-proj' "${P9_L2}/config.toml"
+          ! grep -Fq '/tmp/desktop-invalid-trust-proj' "${P9_L2}/config.toml"
           ! grep -Eq '^[[:space:]]*(api_key|experimental_bearer_token)[[:space:]]*=' "${P9_L2}/config.toml"
+          python3 -B - "${P9_L2}/config.toml" "${P9_REPO_CANON}" <<'PY'
+          import pathlib, sys, tomllib
+
+          cfg_path = pathlib.Path(sys.argv[1])
+          repo_canon = sys.argv[2]
+          data = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
+          projects = data.get("projects", {})
+          assert projects.get("/tmp/desktop-trusted-proj", {}).get("trust_level") == "trusted", projects
+          assert projects.get("/tmp/desktop-untrusted-proj", {}).get("trust_level") == "untrusted", projects
+          assert projects.get("/tmp/lane2-preexisting-untrusted", {}).get("trust_level") == "untrusted", projects
+          assert "/tmp/lane2-preexisting-untrusted/" not in projects, projects
+          assert "/tmp/desktop-no-trust-proj" not in projects, projects
+          assert "/tmp/desktop-invalid-trust-proj" not in projects, projects
+          assert projects.get(repo_canon, {}).get("trust_level") == "trusted", projects
+          PY
           [ -f "${P9_L2}/auth.json" ] && [ ! -L "${P9_L2}/auth.json" ]
           [ "$(sha256_of "${P9_L2}/auth.json")" = "${P9_L1_AUTH_HASH}" ]
           python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600' "${P9_L2}/auth.json"
@@ -768,8 +830,9 @@ jobs:
             ./scripts/restore-original.sh
           [ "$(sha256_of "${P9_L1}/config.toml")" = "${P9_L1_CFG_HASH}" ]
           [ "$(sha256_of "${P9_L1}/auth.json")" = "${P9_L1_AUTH_HASH}" ]
-          [ "$(sha256_of "${P9_L2}/config.toml")" = "${P9_CFG_HASH}" ]
+          [ "$(sha256_of "${P9_L2}/config.toml")" = "${P9E_ORIG_CFG_HASH}" ]
+          python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o644' "${P9_L2}/config.toml"
           [ ! -e "${P9_L2}/auth.json" ]
           [ -L "${P9_L2}/skills" ]
 
-          echo "[PASS] Unix smoke, fail-closed worktree, traversal/SUID defense, interrupted rollback, 3x loop, pre-existing link/exact backup/missing-backup preflight, and v1.3.2 CLI gateway + Desktop harvesting parity passed!"
+          echo "[PASS] Unix smoke, fail-closed worktree, traversal/SUID defense, interrupted rollback, 3x loop, pre-existing link/exact backup/missing-backup preflight, and v1.3.3 trust-boundary + CLI gateway + auth-share parity passed!"
