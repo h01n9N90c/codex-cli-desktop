@@ -56,6 +56,7 @@ trap 'handle_signal_exit TERM' TERM
 # SHA-256 rollback manifest incrementally for `./scripts/restore-original.sh`.
 MANIFEST_ROWS=()
 LINKED_SHARED_DIRS=()
+LINK_MANIFEST_ROWS=()
 ROLLBACK_READY=0
 ROLLBACK_STATUS="in-progress"
 ROLLBACK_DIR=""
@@ -79,6 +80,12 @@ Options:
   --allow-sandbox-network     Enable network_access=true inside [sandbox_workspace_write]
   --use-git-worktree          Create an isolated Git worktree (<repo>-lane2) for OS-level file isolation
   --worktree-path PATH        Custom worktree path when using --use-git-worktree
+  --configure-gateway         Configure custom API key / gateway provider via env_key (zero plaintext secrets)
+  --gateway-target-lane LANE  Target lane for gateway/API key config: 'lane1' (default), 'lane2' (CLI), or 'both'
+  --gateway-provider NAME     Provider identifier for [model_providers."<NAME>"] (default: OpenAI)
+  --gateway-base-url URL      Absolute http(s) base URL for the gateway (required with --configure-gateway)
+  --gateway-model SLUG        Optional default model and review_model slug for the gateway lane
+  --gateway-api-key-env VAR   Environment variable referenced by env_key (default: CODEX_GATEWAY_API_KEY)
   --install-bridge            Copy templates/DUAL_LANE_BRIDGE.md into <repo>/artifacts/dual-lane/
   --sync-sessions             Run scripts/sync-sessions.py after install (requires python3)
   --pinned-only               With --sync-sessions, only sync pinned threads
@@ -86,13 +93,18 @@ Options:
   -h, --help                  Show this help message
 
 Environment overrides:
-  CODEX_LANE1_HOME            Primary CODEX_HOME (default: ~/.codex)
-  CODEX_LANE2_HOME            Secondary CODEX_HOME (default: ~/.codex-official)
+  CODEX_LANE1_HOME            Primary CODEX_HOME (Desktop / Primary Account, default: ~/.codex)
+  CODEX_LANE2_HOME            Secondary CODEX_HOME (CLI: Login + API Key, default: ~/.codex-official)
   CODEX_LOCAL_BIN             Launcher install directory (default: ~/.local/bin)
   CODEX_CARGO_TARGET_DIR      Isolated Rust Cargo target dir for Lane 2
   CODEX_APPROVAL_POLICY       Default approval policy ('on-request' or 'never')
   CODEX_SANDBOX_NETWORK       Default sandbox network flag ('false' or 'true')
   CODEX_LANE2_BRANCH          Git branch name when --use-git-worktree is enabled (default: dual-lane-2)
+  CODEX_GATEWAY_TARGET_LANE   Target lane for gateway config ('lane1', 'lane2', or 'both')
+  CODEX_GATEWAY_PROVIDER      Gateway provider name (default: OpenAI)
+  CODEX_GATEWAY_BASE_URL      Gateway http(s) base URL
+  CODEX_GATEWAY_MODEL         Optional gateway default model slug
+  CODEX_GATEWAY_API_KEY_ENV   Environment variable name for gateway env_key (default: CODEX_GATEWAY_API_KEY)
 EOF
 }
 
@@ -273,12 +285,28 @@ atomic_write_from_stdin() {
   mv -f -- "${tmp}" "${dst}"
 }
 
+# Generate a unique timestamped backup path that never overwrites an existing
+# backup file, directory, or symlink created in the same second.
+unique_backup_path() {
+  local base="$1"
+  local cand="${base}.backup-${stamp}"
+  local idx=1
+  while [ -e "${cand}" ] || [ -L "${cand}" ]; do
+    cand="${base}.backup-${stamp}-${idx}"
+    idx=$((idx + 1))
+  done
+  printf '%s' "${cand}"
+}
+
 # Emit the current rollback manifest (5-column TSV with metadata headers).
-# Comment lines record schema_version, completion status (`in-progress` during
-# incremental checkpoints vs `complete` at finish), timestamp, and linked shared
-# directories while remaining 100% compatible with restore-original.sh.
+# Comment lines record schema_version=2, completion status (`in-progress` during
+# incremental checkpoints vs `complete` at finish), timestamp, and kit-created
+# shared links. Structured `L` rows record every shared link's initial state
+# (`absent`, `preexisting_link`, `preexisting_dir`), ownership (`created_by_kit`
+# 1/0), and exact `backup_dir_path` so rollback preserves pre-existing links and
+# never guesses directory backups by wildcard sorting.
 emit_manifest() {
-  printf '# schema_version=1\n'
+  printf '# schema_version=2\n'
   printf '# status=%s\n' "${ROLLBACK_STATUS}"
   printf '# timestamp=%s\n' "${stamp}"
   printf '# created_at_utc=%s\n' "${UTC_NOW}"
@@ -293,7 +321,13 @@ emit_manifest() {
     done
     printf '# shared_links=%s\n' "${joined_links}"
   fi
-  printf '# columns: existed_prior<TAB>original_sha256<TAB>target_path<TAB>backup_path<TAB>original_mode\n'
+  printf '# columns: record_type(0|1|L)<TAB>sha256_or_created<TAB>target_path<TAB>backup_path<TAB>mode_or_prior_state\n'
+  if [ "${#LINK_MANIFEST_ROWS[@]}" -gt 0 ]; then
+    local lrow
+    for lrow in "${LINK_MANIFEST_ROWS[@]}"; do
+      printf '%s\n' "${lrow}"
+    done
+  fi
   if [ "${#MANIFEST_ROWS[@]}" -gt 0 ]; then
     local row
     for row in "${MANIFEST_ROWS[@]}"; do
@@ -430,6 +464,12 @@ SANDBOX_NETWORK="${CODEX_SANDBOX_NETWORK:-false}"
 USE_GIT_WORKTREE=0
 LANE2_WORKTREE_PATH=""
 LANE2_BRANCH="${CODEX_LANE2_BRANCH:-dual-lane-2}"
+CONFIGURE_GATEWAY=0
+GATEWAY_TARGET_LANE="${CODEX_GATEWAY_TARGET_LANE:-lane1}"
+GATEWAY_PROVIDER="${CODEX_GATEWAY_PROVIDER:-OpenAI}"
+GATEWAY_BASE_URL="${CODEX_GATEWAY_BASE_URL:-}"
+GATEWAY_MODEL="${CODEX_GATEWAY_MODEL:-}"
+GATEWAY_API_KEY_ENV="${CODEX_GATEWAY_API_KEY_ENV:-CODEX_GATEWAY_API_KEY}"
 INSTALL_BRIDGE=0
 SYNC_SESSIONS=0
 PINNED_ONLY=0
@@ -458,6 +498,36 @@ while [ "$#" -gt 0 ]; do
     --worktree-path)
       require_arg "$1" "$#"
       LANE2_WORKTREE_PATH="$2"
+      shift 2
+      ;;
+    --configure-gateway)
+      CONFIGURE_GATEWAY=1
+      shift
+      ;;
+    --gateway-target-lane)
+      require_arg "$1" "$#"
+      GATEWAY_TARGET_LANE="$2"
+      shift 2
+      ;;
+    --gateway-provider|--gateway-provider-name)
+      require_arg "$1" "$#"
+      GATEWAY_PROVIDER="$2"
+      shift 2
+      ;;
+    --gateway-base-url)
+      require_arg "$1" "$#"
+      GATEWAY_BASE_URL="$2"
+      CONFIGURE_GATEWAY=1
+      shift 2
+      ;;
+    --gateway-model)
+      require_arg "$1" "$#"
+      GATEWAY_MODEL="$2"
+      shift 2
+      ;;
+    --gateway-api-key-env)
+      require_arg "$1" "$#"
+      GATEWAY_API_KEY_ENV="$2"
       shift 2
       ;;
     --install-bridge)
@@ -518,6 +588,59 @@ case "${SANDBOX_NETWORK}" in
     exit 1
     ;;
 esac
+
+# Validate gateway target lane and gateway parameters when gateway mode is active.
+GATEWAY_TARGET_LOWER="$(printf '%s' "${GATEWAY_TARGET_LANE}" | awk '{print tolower($0)}')"
+GATEWAY_ON_LANE1=0
+GATEWAY_ON_LANE2=0
+case "${GATEWAY_TARGET_LOWER}" in
+  lane1)
+    [ "${CONFIGURE_GATEWAY}" -eq 1 ] && GATEWAY_ON_LANE1=1
+    ;;
+  lane2)
+    [ "${CONFIGURE_GATEWAY}" -eq 1 ] && GATEWAY_ON_LANE2=1
+    ;;
+  both)
+    if [ "${CONFIGURE_GATEWAY}" -eq 1 ]; then
+      GATEWAY_ON_LANE1=1
+      GATEWAY_ON_LANE2=1
+    fi
+    ;;
+  *)
+    echo "[FAIL] Invalid --gateway-target-lane '${GATEWAY_TARGET_LANE}'. Allowed values: 'lane1', 'lane2', 'both'." >&2
+    exit 1
+    ;;
+esac
+
+GATEWAY_MODELS_URL=""
+if [ "${CONFIGURE_GATEWAY}" -eq 1 ]; then
+  if [ -z "${GATEWAY_BASE_URL}" ]; then
+    echo "[FAIL] --configure-gateway requires --gateway-base-url <https://...>." >&2
+    exit 1
+  fi
+  if printf '%s' "${GATEWAY_BASE_URL}" | LC_ALL=C grep -q '[[:cntrl:][:space:]"'\'']'; then
+    echo "[FAIL] Invalid --gateway-base-url '${GATEWAY_BASE_URL}': whitespace, quotes, and control characters are not allowed." >&2
+    exit 1
+  fi
+  if ! printf '%s' "${GATEWAY_BASE_URL}" | grep -Eq '^https?://[^/]+'; then
+    echo "[FAIL] Invalid --gateway-base-url '${GATEWAY_BASE_URL}': must start with https:// or http://." >&2
+    exit 1
+  fi
+  GATEWAY_MODELS_URL="${GATEWAY_BASE_URL%/}/models"
+
+  if [ -z "${GATEWAY_PROVIDER}" ] || printf '%s' "${GATEWAY_PROVIDER}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    echo "[FAIL] Invalid --gateway-provider '${GATEWAY_PROVIDER}': must be non-empty without control characters." >&2
+    exit 1
+  fi
+  if ! printf '%s' "${GATEWAY_API_KEY_ENV}" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then
+    echo "[FAIL] Invalid --gateway-api-key-env '${GATEWAY_API_KEY_ENV}': must be a valid POSIX environment variable identifier." >&2
+    exit 1
+  fi
+  if [ -n "${GATEWAY_MODEL}" ] && printf '%s' "${GATEWAY_MODEL}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    echo "[FAIL] Invalid --gateway-model: control characters are not allowed." >&2
+    exit 1
+  fi
+fi
 
 REPO_PATH="$(validate_path_value "REPO_PATH" "${REPO_PATH}")"
 if [ ! -d "${REPO_PATH}" ]; then
@@ -610,8 +733,12 @@ TEMP_ARTIFACTS+=("${PROBE_DIR}")
 FEATURES_OUT="$(CODEX_HOME="${PROBE_DIR}" "${CODEX_BIN}" features list 2>/dev/null || true)"
 HAS_DAEMON_FLAG=0
 HAS_GOALS_FLAG=0
+HAS_API_DISCOVERY_FLAG=0
+HAS_IMAGE_GEN_FLAG=0
 if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^daemon_auto_start[[:space:]]+'; then HAS_DAEMON_FLAG=1; fi
 if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^goals[[:space:]]+'; then HAS_GOALS_FLAG=1; fi
+if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^api_key_model_discovery[[:space:]]+'; then HAS_API_DISCOVERY_FLAG=1; fi
+if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^image_generation[[:space:]]+'; then HAS_IMAGE_GEN_FLAG=1; fi
 
 # ------------------------------------------------------------------------------
 # 3. Optional: Create Isolated Git Worktree for Lane 2 (Hard OS Write Boundary)
@@ -706,26 +833,35 @@ for d in "${SHARED_DIRS[@]}"; do
   if [ -L "${dst_link}" ]; then
     existing_target="$(readlink "${dst_link}" 2>/dev/null || true)"
     if [ "${existing_target}" = "${src_dir}" ]; then
-      echo "    Already linked: ${dst_link} -> ${src_dir}"
-      LINKED_SHARED_DIRS+=("${d}")
-      flush_rollback_manifest
+      echo "    Already linked (pre-existing): ${dst_link} -> ${src_dir}"
     else
       echo "[WARN] Existing symlink ${dst_link} points to '${existing_target}' (expected '${src_dir}'); leaving untouched." >&2
     fi
+    # Pre-existing symlinks were NOT created by this install (created_by_kit=0).
+    # Record them explicitly in LINK_MANIFEST_ROWS so rollback preserves them intact.
+    LINK_MANIFEST_ROWS+=("$(printf 'L\t0\t%s\t-\tpreexisting_link' "${dst_link}")")
+    flush_rollback_manifest
     continue
   elif [ -e "${dst_link}" ]; then
+    dir_bkp="$(unique_backup_path "${dst_link}")"
     if [ "${DRY_RUN}" -eq 0 ]; then
-      mv -- "${dst_link}" "${dst_link}.backup-${stamp}"
-      echo "    Backed up existing directory: ${dst_link}.backup-${stamp}"
+      mv -- "${dst_link}" "${dir_bkp}"
+      echo "    Backed up existing directory: ${dir_bkp}"
+      # Write-ahead manifest checkpoint with EXACT dir_bkp path BEFORE ln -s so
+      # even an interrupt between mv and ln -s recovers the exact backup directory.
+      LINK_MANIFEST_ROWS+=("$(printf 'L\t1\t%s\t%s\tpreexisting_dir' "${dst_link}" "${dir_bkp}")")
+      LINKED_SHARED_DIRS+=("${d}")
       flush_rollback_manifest
     else
-      echo "    [DRY-RUN] Would back up existing directory: ${dst_link}.backup-${stamp}"
+      echo "    [DRY-RUN] Would back up existing directory: ${dir_bkp}"
     fi
+  else
+    LINK_MANIFEST_ROWS+=("$(printf 'L\t1\t%s\t-\tabsent' "${dst_link}")")
+    LINKED_SHARED_DIRS+=("${d}")
   fi
   if [ "${DRY_RUN}" -eq 0 ]; then
     ln -s -- "${src_dir}" "${dst_link}"
     echo "    Linked: ${dst_link} -> ${src_dir}"
-    LINKED_SHARED_DIRS+=("${d}")
     flush_rollback_manifest
   else
     echo "    [DRY-RUN] Would link: ${dst_link} -> ${src_dir}"
@@ -741,10 +877,181 @@ backup_and_copy "${KIT_ROOT}/templates/AGENTS.lane1.md" "${LANE1_HOME}/AGENTS.md
 backup_and_copy "${KIT_ROOT}/templates/AGENTS.lane2.md" "${LANE2_HOME}/AGENTS.md" 600
 
 # ------------------------------------------------------------------------------
-# 7. Non-Destructively Merge & Atomically Write Lane 2 Official config.toml
+# 7. Non-Destructively Merge & Atomically Write Lane 2 (and Optional Lane 1 Gateway) config.toml
 # ------------------------------------------------------------------------------
-# Never writes plaintext API keys; Lane 2 uses OAuth/ChatGPT login (`codex login`)
-# and excludes secret-bearing env vars from sandboxed subshells.
+# Never writes plaintext API keys or bearer tokens:
+#   - Lane 1 (Desktop, ~/.codex) = Primary Account (`acc chính`), or optional gateway via env_key.
+#   - Lane 2 (CLI, ~/.codex-official) = Supports BOTH OAuth/ChatGPT Login (`codex login`) AND
+#     API Key / gateway (`env_key` via `--configure-gateway --gateway-target-lane lane2|both`),
+#     with full workspace directory tree traversal and file read/write/edit/delete inside
+#     `sandbox_mode = "workspace-write"`.
+
+ESC_REPO="$(escape_toml "${REPO_PATH}")"
+ESC_LANE2_REPO="$(escape_toml "${EFFECTIVE_LANE2_REPO}")"
+ESC_CARGO="$(escape_toml "${CARGO_TARGET_LANE2}")"
+ESC_GW_PROV="$(escape_toml "${GATEWAY_PROVIDER}")"
+ESC_GW_URL="$(escape_toml "${GATEWAY_BASE_URL}")"
+ESC_GW_MODELS_URL="$(escape_toml "${GATEWAY_MODELS_URL}")"
+ESC_GW_MODEL="$(escape_toml "${GATEWAY_MODEL}")"
+ESC_GW_ENV="$(escape_toml "${GATEWAY_API_KEY_ENV}")"
+GW_PROV_LOWER="$(printf '%s' "${GATEWAY_PROVIDER}" | awk '{print tolower($0)}')"
+HAS_GW_MODEL=0
+[ -n "${GATEWAY_MODEL}" ] && HAS_GW_MODEL=1
+
+# Fail-closed pre-write gate guaranteeing zero plaintext API keys or bearer tokens
+# ever reach config.toml in either lane.
+assert_no_plaintext_secret_in_toml() {
+  local label="$1"
+  local content="$2"
+  if printf '%s\n' "${content}" | awk '
+    { sub(/\r$/, "", $0) }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*experimental_bearer_token[[:space:]]*=/ { found = 1; exit }
+    /^[[:space:]]*api_key[[:space:]]*=[[:space:]]*["\047][^"\047]+["\047]/ { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  '; then
+    echo "[FAIL] Security invariant violation in ${label}: refusing to write plaintext api_key or experimental_bearer_token to config.toml. Use env_key instead." >&2
+    exit 1
+  fi
+}
+
+# Preserve custom user top-level keys (e.g. model, service_tier,
+# cli_auth_credentials_store) except installer-managed sandbox/approval/gateway keys.
+# Strips trailing CR and handles section headers with trailing `#` comments
+# (while preserving `#` inside quoted paths like `[projects."/a#b"]`).
+extract_preserved_top_keys() {
+  local cfg_file="$1"
+  local use_gw="$2"
+  local has_model="$3"
+  local preserve_sandbox="${4:-0}"
+  awk -v use_gw="${use_gw}" -v has_model="${has_model}" -v preserve_sandbox="${preserve_sandbox}" '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    {
+      sub(/\r$/, "", $0)
+      clean = strip_comment($0)
+    }
+    clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ { exit }
+    clean ~ /^[[:space:]]*$/ { next }
+    clean ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/ {
+      key = clean
+      sub(/^[[:space:]]*/, "", key)
+      sub(/[[:space:]]*=.*$/, "", key)
+      if (key == "experimental_bearer_token" || key == "api_key") {
+        next
+      }
+      if (preserve_sandbox == 0 && (key == "sandbox_mode" || key == "approval_policy")) {
+        next
+      }
+      if (use_gw == 1) {
+        if (key == "model_provider" || key == "web_search" || key == "disable_response_storage") {
+          next
+        }
+        if (has_model == 1 && (key == "model" || key == "review_model")) {
+          next
+        }
+      }
+      print $0
+    }
+  ' "${cfg_file}" || true
+}
+
+# Preserve custom user sections (e.g. [mcp_servers.*], [tui], [plugins.*],
+# pre-existing [projects.*]) while refreshing only Dual-Lane managed sections.
+extract_preserved_user_sections() {
+  local cfg_file="$1"
+  local use_gw="$2"
+  local gw_prov_lc="$3"
+  local preserve_sandbox="${4:-0}"
+  awk -v use_gw="${use_gw}" -v gw_prov_lc="${gw_prov_lc}" -v preserve_sandbox="${preserve_sandbox}" '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    function norm_sec(sec,    s) {
+      s = tolower(sec)
+      if (s ~ /^model_providers\./) {
+        sub(/^model_providers\.[[:space:]]*/, "", s)
+        gsub(/^["\047]|["\047]$/, "", s)
+        return "model_providers." s
+      }
+      return s
+    }
+    {
+      sub(/\r$/, "", $0)
+      clean = strip_comment($0)
+    }
+    clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ {
+      sec = clean
+      sub(/^[[:space:]]*\[/, "", sec)
+      sub(/\][[:space:]]*$/, "", sec)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
+      nsec = norm_sec(sec)
+      if (nsec == "windows" || nsec == "features" || nsec == "memories" || nsec == "shell_environment_policy" || nsec == "shell_environment_policy.set") {
+        keep = 0
+      } else if (preserve_sandbox == 0 && nsec == "sandbox_workspace_write") {
+        keep = 0
+      } else if (use_gw == 1 && nsec == ("model_providers." gw_prov_lc)) {
+        keep = 0
+      } else {
+        keep = 1
+      }
+    }
+    keep == 1 {
+      if (clean ~ /^[[:space:]]*(experimental_bearer_token|api_key)[[:space:]]*=/) {
+        next
+      }
+      print $0
+    }
+  ' "${cfg_file}" || true
+}
+
+# Helper to test if a project table already exists in preserved sections using
+# either double-quoted or single-quoted TOML syntax.
+has_project_section_in() {
+  local preserved_sections="$1"
+  local raw_p="$2"
+  local esc_p="$3"
+  printf '%s\n' "${preserved_sections}" | grep -Fq -e "[projects.\"${esc_p}\"]" \
+    || printf '%s\n' "${preserved_sections}" | grep -Fq -e "[projects.'${raw_p}']"
+}
+
 CFG2="${LANE2_HOME}/config.toml"
 PRESERVED_TOP_KEYS=""
 PRESERVED_USER_SECTIONS=""
@@ -777,121 +1084,44 @@ if [ -f "${CFG2}" ]; then
   MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s\t%s' "${CFG2_ORIG_HASH}" "${CFG2}" "${CFG2_BKP}" "${CFG2_ORIG_MODE}")")
   flush_rollback_manifest
 
-  # Preserve custom user top-level keys (e.g. model, service_tier,
-  # cli_auth_credentials_store) except installer-managed sandbox/approval keys.
-  # Strips trailing CR and handles section headers with trailing `#` comments
-  # (while preserving `#` inside quoted paths like `[projects."/a#b"]`).
-  PRESERVED_TOP_KEYS="$(awk '
-    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
-      in_dq = 0; in_sq = 0; esc = 0; out = ""
-      for (i = 1; i <= length(s); i++) {
-        c = substr(s, i, 1)
-        if (esc) { out = out c; esc = 0; continue }
-        if (in_dq) {
-          out = out c
-          if (c == "\\") esc = 1
-          else if (c == "\"") in_dq = 0
-        } else if (in_sq) {
-          out = out c
-          if (c == "\047") in_sq = 0
-        } else {
-          if (c == "#") break
-          if (c == "\"") in_dq = 1
-          else if (c == "\047") in_sq = 1
-          out = out c
-        }
-      }
-      return out
-    }
-    {
-      sub(/\r$/, "", $0)
-      clean = strip_comment($0)
-    }
-    clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ { exit }
-    clean ~ /^[[:space:]]*$/ { next }
-    clean ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/ {
-      key = clean
-      sub(/^[[:space:]]*/, "", key)
-      sub(/[[:space:]]*=.*$/, "", key)
-      if (key != "sandbox_mode" && key != "approval_policy") {
-        print $0
-      }
-    }
-  ' "${CFG2}" || true)"
-
-  # Preserve custom user sections (e.g. [mcp_servers.*], [tui], [plugins.*],
-  # pre-existing [projects.*]) while refreshing only Dual-Lane managed sections.
-  PRESERVED_USER_SECTIONS="$(awk '
-    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
-      in_dq = 0; in_sq = 0; esc = 0; out = ""
-      for (i = 1; i <= length(s); i++) {
-        c = substr(s, i, 1)
-        if (esc) { out = out c; esc = 0; continue }
-        if (in_dq) {
-          out = out c
-          if (c == "\\") esc = 1
-          else if (c == "\"") in_dq = 0
-        } else if (in_sq) {
-          out = out c
-          if (c == "\047") in_sq = 0
-        } else {
-          if (c == "#") break
-          if (c == "\"") in_dq = 1
-          else if (c == "\047") in_sq = 1
-          out = out c
-        }
-      }
-      return out
-    }
-    {
-      sub(/\r$/, "", $0)
-      clean = strip_comment($0)
-    }
-    clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ {
-      sec = clean
-      sub(/^[[:space:]]*\[/, "", sec)
-      sub(/\][[:space:]]*$/, "", sec)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
-      if (sec == "windows" || sec == "features" || sec == "memories" || sec == "sandbox_workspace_write" || sec == "shell_environment_policy" || sec == "shell_environment_policy.set") {
-        keep = 0
-      } else {
-        keep = 1
-      }
-    }
-    keep == 1 { print $0 }
-  ' "${CFG2}" || true)"
+  PRESERVED_TOP_KEYS="$(extract_preserved_top_keys "${CFG2}" "${GATEWAY_ON_LANE2}" "${HAS_GW_MODEL}")"
+  PRESERVED_USER_SECTIONS="$(extract_preserved_user_sections "${CFG2}" "${GATEWAY_ON_LANE2}" "${GW_PROV_LOWER}")"
 else
   MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${CFG2}")")
   flush_rollback_manifest
 fi
 
-ESC_REPO="$(escape_toml "${REPO_PATH}")"
-ESC_LANE2_REPO="$(escape_toml "${EFFECTIVE_LANE2_REPO}")"
-ESC_CARGO="$(escape_toml "${CARGO_TARGET_LANE2}")"
-
-# Helper to test if a project table already exists in preserved sections using
-# either double-quoted or single-quoted TOML syntax.
-has_project_section() {
-  local raw_p="$1"
-  local esc_p="$2"
-  printf '%s\n' "${PRESERVED_USER_SECTIONS}" | grep -Fq -e "[projects.\"${esc_p}\"]" \
-    || printf '%s\n' "${PRESERVED_USER_SECTIONS}" | grep -Fq -e "[projects.'${raw_p}']"
-}
-
 render_lane2_config() {
-  printf '# Official OpenAI / ChatGPT Codex CLI configuration (LANE 2)\n'
-  printf '# Zero plaintext secrets: authenticate via `codex login` (OAuth/keyring).\n'
+  printf '# Official OpenAI / ChatGPT & Flexible API-Key Codex CLI configuration (LANE 2)\n'
+  printf '# Zero plaintext secrets: supports BOTH `codex login` (OAuth/keyring) AND API key (`env_key`).\n'
+  if [ "${GATEWAY_ON_LANE2}" -eq 1 ]; then
+    printf 'model_provider = "%s"\n' "${ESC_GW_PROV}"
+    if [ "${HAS_GW_MODEL}" -eq 1 ]; then
+      printf 'model = "%s"\n' "${ESC_GW_MODEL}"
+      printf 'review_model = "%s"\n' "${ESC_GW_MODEL}"
+    fi
+    printf 'web_search = "live"\n'
+    printf 'disable_response_storage = true\n'
+  fi
   printf 'sandbox_mode = "workspace-write"\n'
   printf 'approval_policy = "%s"\n' "${APPROVAL_POLICY}"
   if [ -n "${PRESERVED_TOP_KEYS}" ]; then
     printf '%s\n' "${PRESERVED_TOP_KEYS}"
   fi
   printf '\n'
-  if ! has_project_section "${REPO_PATH}" "${ESC_REPO}"; then
+  if [ "${GATEWAY_ON_LANE2}" -eq 1 ]; then
+    printf '[model_providers."%s"]\n' "${ESC_GW_PROV}"
+    printf 'name = "%s"\n' "${ESC_GW_PROV}"
+    printf 'base_url = "%s"\n' "${ESC_GW_URL}"
+    printf 'model_catalog_url = "%s"\n' "${ESC_GW_MODELS_URL}"
+    printf 'wire_api = "responses"\n'
+    printf 'env_key = "%s"\n\n' "${ESC_GW_ENV}"
+  fi
+  if ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${REPO_PATH}" "${ESC_REPO}"; then
     printf '[projects."%s"]\n' "${ESC_REPO}"
     printf 'trust_level = "trusted"\n\n'
   fi
-  if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section "${EFFECTIVE_LANE2_REPO}" "${ESC_LANE2_REPO}"; then
+  if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}" "${ESC_LANE2_REPO}"; then
     printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
     printf 'trust_level = "trusted"\n\n'
   fi
@@ -899,6 +1129,10 @@ render_lane2_config() {
   [ "${HAS_DAEMON_FLAG}" -eq 1 ] && printf 'daemon_auto_start = false\n'
   printf 'memories = true\n'
   printf 'js_repl = false\n'
+  if [ "${GATEWAY_ON_LANE2}" -eq 1 ]; then
+    [ "${HAS_API_DISCOVERY_FLAG}" -eq 1 ] && printf 'api_key_model_discovery = true\n'
+    [ "${HAS_IMAGE_GEN_FLAG}" -eq 1 ] && printf 'image_generation = true\n'
+  fi
   [ "${HAS_GOALS_FLAG}" -eq 1 ] && printf 'goals = true\n'
   printf '\n[memories]\n'
   printf 'generate_memories = true\n'
@@ -915,23 +1149,150 @@ render_lane2_config() {
   fi
 }
 
-if [ "${DRY_RUN}" -eq 0 ]; then
-  atomic_write_from_stdin "${CFG2}" 600 < <(render_lane2_config)
+CFG2_RENDERED="$(render_lane2_config)"
+assert_no_plaintext_secret_in_toml "Lane 2 config.toml" "${CFG2_RENDERED}"
+if [ "${GATEWAY_ON_LANE2}" -eq 1 ]; then
+  if ! printf '%s\n' "${CFG2_RENDERED}" | grep -Fq "env_key = \"${ESC_GW_ENV}\""; then
+    echo "[FAIL] Security invariant violation in Lane 2 config.toml: expected env_key = \"${ESC_GW_ENV}\" is missing." >&2
+    exit 1
+  fi
+fi
 
+if [ "${DRY_RUN}" -eq 0 ]; then
+  atomic_write_from_stdin "${CFG2}" 600 < <(printf '%s\n' "${CFG2_RENDERED}")
+  echo "    Wrote: ${CFG2} (approval_policy=${APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK}, gateway=${GATEWAY_ON_LANE2})"
+else
+  echo "    [DRY-RUN] Would write: ${CFG2} (approval_policy=${APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK}, gateway=${GATEWAY_ON_LANE2})"
+fi
+
+# Optional: Also configure gateway / API key in Lane 1 when --gateway-target-lane is 'lane1' or 'both'.
+if [ "${GATEWAY_ON_LANE1}" -eq 1 ]; then
+  CFG1="${LANE1_HOME}/config.toml"
+  CFG1_CLEAN_BKP="${LANE1_HOME}/config.backup.toml"
+  CFG1_TOP_KEYS=""
+  CFG1_USER_SECTIONS=""
+
+  for p1 in "${CFG1}" "${CFG1_CLEAN_BKP}"; do
+    if [ -L "${p1}" ]; then
+      echo "[FAIL] Security refusal: '${p1}' is a symlink; refusing to overwrite." >&2
+      exit 1
+    fi
+    if [ -d "${p1}" ]; then
+      echo "[FAIL] Refusing to overwrite directory '${p1}'." >&2
+      exit 1
+    fi
+  done
+
+  if [ -f "${CFG1}" ] && [ ! -e "${CFG1_CLEAN_BKP}" ]; then
+    MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${CFG1_CLEAN_BKP}")")
+    flush_rollback_manifest
+    if [ "${DRY_RUN}" -eq 0 ]; then
+      atomic_write_from_stdin "${CFG1_CLEAN_BKP}" 600 < "${CFG1}"
+      echo "    Saved clean original backup: ${CFG1_CLEAN_BKP}"
+    else
+      echo "    [DRY-RUN] Would save clean original backup: ${CFG1_CLEAN_BKP}"
+    fi
+  fi
+
+  if [ -f "${CFG1}" ]; then
+    CFG1_ORIG_HASH="$(sha256_file "${CFG1}")"
+    CFG1_ORIG_MODE="$(get_octal_mode "${CFG1}")"
+    [ -z "${CFG1_ORIG_MODE}" ] && CFG1_ORIG_MODE="-"
+    CFG1_BKP="${CFG1}.backup-${stamp}"
+    if [ "${DRY_RUN}" -eq 0 ]; then
+      atomic_write_from_stdin "${CFG1_BKP}" 600 < "${CFG1}"
+      CFG1_BKP_HASH="$(sha256_file "${CFG1_BKP}")"
+      if [ "${CFG1_BKP_HASH}" != "${CFG1_ORIG_HASH}" ]; then
+        echo "[FAIL] Backup SHA-256 verification failed for ${CFG1_BKP}." >&2
+        exit 1
+      fi
+      echo "    Backup saved: ${CFG1_BKP} (SHA256=${CFG1_ORIG_HASH:0:12}...)"
+    else
+      echo "    [DRY-RUN] Would save backup: ${CFG1_BKP} (SHA256=${CFG1_ORIG_HASH:0:12}...)"
+    fi
+    MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s\t%s' "${CFG1_ORIG_HASH}" "${CFG1}" "${CFG1_BKP}" "${CFG1_ORIG_MODE}")")
+    flush_rollback_manifest
+
+    CFG1_TOP_KEYS="$(extract_preserved_top_keys "${CFG1}" 1 "${HAS_GW_MODEL}" 1)"
+    CFG1_USER_SECTIONS="$(extract_preserved_user_sections "${CFG1}" 1 "${GW_PROV_LOWER}" 1)"
+  else
+    MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${CFG1}")")
+    flush_rollback_manifest
+  fi
+
+  render_lane1_config() {
+    printf '# Lane 1 Codex Desktop configuration (Primary Account / Gateway via env_key, full native authority)\n'
+    printf 'model_provider = "%s"\n' "${ESC_GW_PROV}"
+    if [ "${HAS_GW_MODEL}" -eq 1 ]; then
+      printf 'model = "%s"\n' "${ESC_GW_MODEL}"
+      printf 'review_model = "%s"\n' "${ESC_GW_MODEL}"
+    fi
+    printf 'web_search = "live"\n'
+    printf 'disable_response_storage = true\n'
+    if [ -n "${CFG1_TOP_KEYS}" ]; then
+      printf '%s\n' "${CFG1_TOP_KEYS}"
+    fi
+    printf '\n[model_providers."%s"]\n' "${ESC_GW_PROV}"
+    printf 'name = "%s"\n' "${ESC_GW_PROV}"
+    printf 'base_url = "%s"\n' "${ESC_GW_URL}"
+    printf 'model_catalog_url = "%s"\n' "${ESC_GW_MODELS_URL}"
+    printf 'wire_api = "responses"\n'
+    printf 'env_key = "%s"\n\n' "${ESC_GW_ENV}"
+    if ! has_project_section_in "${CFG1_USER_SECTIONS}" "${REPO_PATH}" "${ESC_REPO}"; then
+      printf '[projects."%s"]\n' "${ESC_REPO}"
+      printf 'trust_level = "trusted"\n\n'
+    fi
+    if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${CFG1_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}" "${ESC_LANE2_REPO}"; then
+      printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
+      printf 'trust_level = "trusted"\n\n'
+    fi
+    printf '[features]\n'
+    [ "${HAS_DAEMON_FLAG}" -eq 1 ] && printf 'daemon_auto_start = false\n'
+    printf 'memories = true\n'
+    printf 'js_repl = false\n'
+    [ "${HAS_API_DISCOVERY_FLAG}" -eq 1 ] && printf 'api_key_model_discovery = true\n'
+    [ "${HAS_IMAGE_GEN_FLAG}" -eq 1 ] && printf 'image_generation = true\n'
+    [ "${HAS_GOALS_FLAG}" -eq 1 ] && printf 'goals = true\n'
+    printf '\n[memories]\n'
+    printf 'generate_memories = true\n'
+    printf 'use_memories = true\n\n'
+    printf '[shell_environment_policy]\n'
+    printf 'exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]\n\n'
+    printf '[shell_environment_policy.set]\n'
+    printf 'CODEX_ACTIVE_LANE = "LANE_1"\n'
+    if [ -n "${CFG1_USER_SECTIONS}" ]; then
+      printf '\n# Preserved existing sections\n%s\n' "${CFG1_USER_SECTIONS}"
+    fi
+  }
+
+  CFG1_RENDERED="$(render_lane1_config)"
+  assert_no_plaintext_secret_in_toml "Lane 1 config.toml" "${CFG1_RENDERED}"
+  if ! printf '%s\n' "${CFG1_RENDERED}" | grep -Fq "env_key = \"${ESC_GW_ENV}\""; then
+    echo "[FAIL] Security invariant violation in Lane 1 config.toml: expected env_key = \"${ESC_GW_ENV}\" is missing." >&2
+    exit 1
+  fi
+
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    atomic_write_from_stdin "${CFG1}" 600 < <(printf '%s\n' "${CFG1_RENDERED}")
+    echo "    Wrote: ${CFG1} (zero plaintext keys; reads from env ${GATEWAY_API_KEY_ENV})"
+  else
+    echo "    [DRY-RUN] Would write: ${CFG1} (zero plaintext keys; reads from env ${GATEWAY_API_KEY_ENV})"
+  fi
+fi
+
+if [ "${DRY_RUN}" -eq 0 ]; then
   # Tighten permissions on sensitive auth/config files in both lanes (regular
   # files only; never traverse symlinks with chmod; omit `--` for BSD/macOS chmod).
   for sec_f in \
     "${LANE1_HOME}/auth.json" \
     "${LANE1_HOME}/config.toml" \
+    "${LANE1_HOME}/config.backup.toml" \
     "${LANE2_HOME}/auth.json" \
     "${LANE2_HOME}/config.toml"; do
     if [ -f "${sec_f}" ] && [ ! -L "${sec_f}" ]; then
       chmod 600 "${sec_f}" 2>/dev/null || true
     fi
   done
-  echo "    Wrote: ${CFG2} (approval_policy=${APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK})"
-else
-  echo "    [DRY-RUN] Would write: ${CFG2} (approval_policy=${APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK})"
 fi
 
 # ------------------------------------------------------------------------------

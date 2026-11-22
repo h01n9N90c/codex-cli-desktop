@@ -105,8 +105,11 @@
 
 ---
 
-### Lỗi 9: Cách khôi phục / gỡ bỏ hoàn toàn (hoặc phục hồi sau khi cài đặt bị ngắt giữa chừng) mà không làm mất lịch sử phiên trong `~/.codex`
+### Lỗi 9: Cách khôi phục / gỡ bỏ hoàn toàn (hoặc phục hồi sau khi cài đặt bị ngắt giữa chừng) mà không làm mất lịch sử phiên hay link có trước
 * **Cảnh báo quan trọng:** Các thư mục `memories`, `memories_v2`, `sessions`, `archived_sessions`, `skills`, `plugins` bên trong `~/.codex-official` là **NTFS Directory Junction** (Windows) hoặc **symlink** (macOS/Linux/WSL) trỏ về `~/.codex`. **Tuyệt đối không dùng công cụ xóa đệ quy bừa bãi lên `~/.codex-official` trước khi tháo các liên kết này!**
+* **Bảo toàn liên kết có trước, khôi phục đúng thư mục backup & preflight fail-closed (v1.3.1):**
+  * Từ v1.3.1 (`SchemaVersion = 2` / `schema_version=2`), manifest ghi nhận rõ `SharedLinkRecords` / dòng `L` (`PriorState`: `absent`, `preexisting_link`, `preexisting_dir` và `CreatedByKit`): mọi Junction/symlink do bạn tự tạo từ trước khi cài kit sẽ **được giữ nguyên 100%** khi rollback; các thư mục gốc được khôi phục từ **đúng đường dẫn `BackupDirPath` / `dir_bkp` ghi trong manifest** (không đoán mò theo tên wildcard `.backup-*`).
+  * Nếu bạn vô tình xóa/di chuyển mất một tệp hoặc thư mục `.backup-*` bắt buộc, bước **Preflight Fail-Closed** của `restore-original.*` sẽ dừng ngay lập tức với mã thoát `1` **trước khi tháo bất kỳ Junction/symlink nào hay sửa tệp trên đĩa** (0 tác dụng phụ bán phần).
 * **Phục hồi khi cài đặt bị ngắt giữa chừng (`Ctrl+C` / lỗi đột ngột):** Bộ cài ghi nhật ký rollback tăng dần sau từng thao tác (`.rollback/latest.json` với `Completed: false` trên Windows / `.rollback/latest.tsv` với `# status=in-progress` trên Unix). Nếu `doctor.ps1` / `doctor.sh` báo `[WARN] Rollback Journal`, hãy chạy ngay `restore-original.*` bên dưới để hoàn nguyên sạch toàn bộ thay đổi bán phần rồi cài lại.
 * **Cách gỡ chuẩn và an toàn nhất (tự động kiểm chứng SHA-256 & tháo liên kết trước):**
   * **Windows:**
@@ -129,3 +132,15 @@
   1. **Tạo lại worktree Luồng 2 (khuyên dùng):** Chạy lại bộ cài với `-UseGitWorktree` (Windows) hoặc `--use-git-worktree` (Unix) để dựng lại worktree chuẩn và cập nhật wrapper.
   2. **Tạm tắt tự động đổi thư mục (chỉ khi thực sự cần):** Đặt `CODEX_NO_AUTO_WORKTREE_CD=1` trong shell hiện tại (lưu ý: cơ chế chặn đối số `-C`/`--cd`/`--add-dir` trỏ vào repo chính vẫn luôn bật fail-closed).
   3. **Gỡ chế độ worktree:** Chạy lại `setup-dual-lane.*` **không kèm** cờ `-UseGitWorktree` / `--use-git-worktree`.
+
+---
+
+### Lỗi 11 *(Câu hỏi thực tế)*: Làm sao giữ Codex Desktop (`~/.codex`, Luồng 1 — `acc chính`) toàn quyền như trước, vừa dùng Codex CLI (`~/.codex-official`, Luồng 2) với cả Login OAuth lẫn API Key mà agent vẫn tự do nắm cây thư mục & sửa/xóa file?
+* **1. Giữ Codex Desktop (`~/.codex`, Luồng 1) toàn quyền như trước (`acc chính`):**
+  * Khi cài mặc định (hoặc dùng `-ConfigureGateway -GatewayTargetLane Lane2` trên Windows / `--configure-gateway --gateway-target-lane lane2` trên Unix), bộ kit **không chạm vào `~/.codex/config.toml`**, giữ nguyên 100% quyền hạn, cấu hình và mạng gốc của Codex Desktop. Ngay cả khi dùng `-GatewayTargetLane Lane1` hoặc `Both`, bộ kit cũng không bao giờ chèn `sandbox_mode` hạn chế hay `network_access = false` vào `~/.codex/config.toml`.
+  * Trong `AGENTS.lane1.md` (Rule 4 & Rule 6), Codex Desktop được khẳng định rõ **toàn quyền như trước** trên toàn bộ cây thư mục dự án (đọc, ghi, tạo, sửa, di chuyển, xóa file, build & test toàn dự án mặc định; chỉ phân chia thư mục nếu bạn chủ động khai báo nhiệm vụ song song trong `DUAL_LANE_BRIDGE.md`).
+* **2. Dùng cả Login OAuth lẫn API Key trên Codex CLI (`~/.codex-official`, Luồng 2):**
+  * **Đăng nhập OAuth (`auth.json` / `keyring`):** Chạy `codex login`.
+  * **Dùng API Key / Gateway (`env_key`):** Cài với `-ConfigureGateway -GatewayTargetLane Lane2 -GatewayBaseUrl "https://<endpoint>/v1" -GatewayApiKeyEnv "CODEX_CLI_API_KEY" -PromptGatewayApiKey` (Windows) hoặc `--configure-gateway --gateway-target-lane lane2 --gateway-base-url "https://<endpoint>/v1" --gateway-api-key-env CODEX_CLI_API_KEY` (Unix), hoặc nạp key chuẩn bằng `$env:OPENAI_API_KEY | codex login --with-api-key`.
+* **3. Toàn quyền nắm cây thư mục & thao tác File CRUD trong Workspace:**
+  * Bên trong thư mục dự án (`workspace-write`), toàn bộ công cụ duyệt cây thư mục (`rg --files`, `git status`, `Get-ChildItem`, `find`) và thao tác file CRUD (`apply_patch`, `Set-Content`, `Remove-Item`, `rm`, `mv`, `cp`, `mkdir`) đều được phép 100% (`matchedRules: []` trong `default.rules`). Quy tắc `Static-Analysis-Only` chỉ cấm **thực thi/kích nổ** tệp mẫu mã độc/payload bên thứ 3, tuyệt đối không hạn chế việc đọc/tạo/sửa/xóa code của dự án.

@@ -6,8 +6,8 @@
     Configures two isolated OpenAI Codex lanes on ANY Windows 10/11 machine (single-drive C:\ or
     multi-drive, spaces/Unicode/'&' in paths, WindowsApps MSIX Desktop OR standalone/npm Codex CLI):
 
-      - Lane 1 (default: %USERPROFILE%\.codex)          : Codex Desktop App / optional gateway via `codex-t3`
-      - Lane 2 (default: %USERPROFILE%\.codex-official) : Official OpenAI/ChatGPT CLI via `codex` / `codex-official`
+      - Lane 1 (default: %USERPROFILE%\.codex)          : Codex Desktop App (Primary Account / acc chính, or optional gateway via `codex-t3`)
+      - Lane 2 (default: %USERPROFILE%\.codex-official) : Codex CLI via `codex` / `codex-official` (supports BOTH OAuth/ChatGPT Login AND API Key / `env_key` gateway)
 
     Security & Safety Guarantees:
       1. Zero hardcoded mock data, zero hardcoded model tiers, and zero plaintext secrets:
@@ -98,20 +98,29 @@
     against Git ref rules and option injection. Default: dual-lane-2.
 
 .PARAMETER ConfigureGateway
-    Configures a third-party OpenAI-compatible gateway in Lane 1 config.toml using `env_key` ONLY
-    (never writing plaintext API keys to disk).
+    Configures an OpenAI-compatible API key / gateway provider in config.toml using `env_key` ONLY
+    (never writing plaintext API keys to disk). Use -GatewayTargetLane to target Lane 1, Lane 2 (CLI),
+    or Both.
+
+.PARAMETER GatewayTargetLane
+    Selects which lane(s) receive the `[model_providers."<Name>"]` (`env_key`) gateway configuration
+    when -ConfigureGateway is enabled:
+      - 'Lane1' (default, backward-compatible): Lane 1 (`~/.codex`)
+      - 'Lane2': Lane 2 CLI (`~/.codex-official`), leaving Lane 1 Desktop on your Primary Account (`acc chính`)
+        while Lane 2 CLI supports both OAuth Login (`auth.json`) and API Key (`env_key`)
+      - 'Both' : Configures both Lane 1 and Lane 2 with `env_key`
 
 .PARAMETER GatewayProviderName
     TOML provider identifier for [model_providers."<Name>"] when -ConfigureGateway is set. Default: OpenAI.
 
 .PARAMETER GatewayBaseUrl
-    Absolute http(s) base URL for the Lane 1 gateway (required with -ConfigureGateway).
+    Absolute http(s) base URL for the gateway (required with -ConfigureGateway).
 
 .PARAMETER GatewayModel
-    Optional default model and review_model slug for Lane 1 when -ConfigureGateway is set.
+    Optional default model and review_model slug for the target gateway lane(s) when -ConfigureGateway is set.
 
 .PARAMETER GatewayApiKeyEnv
-    Environment variable name referenced by `env_key` in Lane 1 config.toml. Default: CODEX_GATEWAY_API_KEY.
+    Environment variable name referenced by `env_key` in the target lane's config.toml. Default: CODEX_GATEWAY_API_KEY.
 
 .PARAMETER GatewayApiKey
     (Legacy compatibility) Stores the provided API key in the User environment variable named by
@@ -120,6 +129,11 @@
 .PARAMETER PromptGatewayApiKey
     Prompts securely via Read-Host -AsSecureString and stores the key only in User environment
     variable -GatewayApiKeyEnv (never echoed, never written to config.toml).
+
+.PARAMETER ShareAuthToLane2
+    Copies Lane 1's authenticated `auth.json` (if present) into Lane 2 (`~/.codex-official\auth.json`),
+    tracks it in the rollback journal, and locks its NTFS DACL via `Protect-SensitiveFileAcl` so Lane 2 CLI
+    can immediately use your primary login alongside or without an `env_key` API key.
 
 .PARAMETER SyncSessions
     Invokes scripts\sync-sessions.py (if Python 3 is installed) to UPSERT session index, pinned
@@ -186,12 +200,16 @@ param(
     [string]$Lane2WorktreePath = '',
     [string]$Lane2Branch = 'dual-lane-2',
     [switch]$ConfigureGateway,
+    [ValidateSet('Lane1', 'Lane2', 'Both')]
+    [string]$GatewayTargetLane = 'Lane1',
     [string]$GatewayProviderName = 'OpenAI',
     [string]$GatewayBaseUrl = '',
     [string]$GatewayModel = '',
     [string]$GatewayApiKeyEnv = 'CODEX_GATEWAY_API_KEY',
     [string]$GatewayApiKey = '',
     [switch]$PromptGatewayApiKey,
+    [Alias('ShareOfficialAuth')]
+    [switch]$ShareAuthToLane2,
     [switch]$SyncSessions,
     [switch]$PinnedOnlySync,
     [switch]$InstallBridgeTemplate,
@@ -214,6 +232,7 @@ $script:IsDryRun = $DryRun.IsPresent -or [bool]$WhatIfPreference
 $WhatIfPreference = $false
 $script:SnapshotEntries    = New-Object 'System.Collections.Generic.List[object]'
 $script:TrackedJunctions   = New-Object 'System.Collections.Generic.List[string]'
+$script:SharedLinkRecords  = New-Object 'System.Collections.Generic.List[object]'
 $script:InstalledWrappers  = New-Object 'System.Collections.Generic.List[string]'
 $script:InstallStamp       = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:CreatedAtUtc       = (Get-Date).ToUniversalTime().ToString('o')
@@ -780,21 +799,22 @@ function Save-RollbackManifestCheckpoint {
     }
 
     $manifestObj = [PSCustomObject]@{
-        SchemaVersion    = 1
-        Timestamp        = $script:InstallStamp
-        CreatedAtUtc     = $script:CreatedAtUtc
-        UpdatedAtUtc     = (Get-Date).ToUniversalTime().ToString('o')
-        Completed        = $Completed
-        LastStage        = $Stage
-        Lane1Home        = $script:ManifestContext.Lane1Home
-        Lane2Home        = $script:ManifestContext.Lane2Home
-        LocalBin         = $script:ManifestContext.LocalBin
-        RepoPath         = $script:ManifestContext.RepoPath
-        Lane2Worktree    = $script:ManifestContext.Lane2Worktree
-        GatewayApiKeyEnv = $script:ManifestContext.GatewayApiKeyEnv
-        SharedJunctions  = @($script:TrackedJunctions.ToArray())
-        Wrappers         = @($script:InstalledWrappers.ToArray())
-        Files            = @($script:SnapshotEntries.ToArray())
+        SchemaVersion     = 2
+        Timestamp         = $script:InstallStamp
+        CreatedAtUtc      = $script:CreatedAtUtc
+        UpdatedAtUtc      = (Get-Date).ToUniversalTime().ToString('o')
+        Completed         = $Completed
+        LastStage         = $Stage
+        Lane1Home         = $script:ManifestContext.Lane1Home
+        Lane2Home         = $script:ManifestContext.Lane2Home
+        LocalBin          = $script:ManifestContext.LocalBin
+        RepoPath          = $script:ManifestContext.RepoPath
+        Lane2Worktree     = $script:ManifestContext.Lane2Worktree
+        GatewayApiKeyEnv  = $script:ManifestContext.GatewayApiKeyEnv
+        SharedJunctions   = @($script:TrackedJunctions.ToArray())
+        SharedLinkRecords = @($script:SharedLinkRecords.ToArray())
+        Wrappers          = @($script:InstalledWrappers.ToArray())
+        Files             = @($script:SnapshotEntries.ToArray())
     }
     $manifestJson = $manifestObj | ConvertTo-Json -Depth 6
     Write-Utf8NoBom -FilePath $script:RollbackSnapPath   -Text $manifestJson
@@ -1284,7 +1304,8 @@ if ($ReapplyAclOnly) {
         (Join-Path $Lane1Home 'config.toml'),
         (Join-Path $Lane1Home 'config.backup.toml'),
         (Join-Path $Lane2Home 'auth.json'),
-        (Join-Path $Lane2Home 'config.toml')
+        (Join-Path $Lane2Home 'config.toml'),
+        (Join-Path $Lane2Home 'config.backup.toml')
     )) {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { $aclTargets.Add($candidate) }
     }
@@ -1550,31 +1571,57 @@ foreach ($name in $sharedDirs) {
     }
     if (Test-Path -LiteralPath $dst) {
         $item = Get-Item -LiteralPath $dst -Force
-        if ($item.LinkType -eq 'Junction') {
+        if ($item.LinkType -eq 'Junction' -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
             $existingTarget = (@($item.Target) | Select-Object -First 1)
             $cleanExisting  = if ($existingTarget) { ($existingTarget -replace '^\\\?\?\\', '') } else { '' }
             $normExisting   = if ($cleanExisting) { (Resolve-CanonicalLongPath -PathValue $cleanExisting).TrimEnd('\').ToLowerInvariant() } else { '' }
             $normExpected   = $src.TrimEnd('\').ToLowerInvariant()
             if ($normExisting -and ($normExisting -ne $normExpected)) {
-                Write-Warning "Existing Junction '$dst' points to '$existingTarget' instead of expected '$src'."
+                Write-Warning "Existing Junction/link '$dst' points to '$existingTarget' instead of expected '$src'; leaving untouched."
             } else {
-                Write-Host "    Already linked: $name -> $existingTarget"
+                Write-Host "    Already linked (pre-existing): $name -> $existingTarget"
             }
-            if (-not $script:TrackedJunctions.Contains($name)) {
-                $script:TrackedJunctions.Add($name)
-            }
+            # SECURITY & ROLLBACK INVARIANT: Pre-existing user links were NOT created by this install.
+            # Record CreatedByKit=$false (and do NOT add to TrackedJunctions) so rollback preserves them intact.
+            $script:SharedLinkRecords.Add([PSCustomObject]@{
+                Name          = $name
+                LinkPath      = $dst
+                PriorState    = 'preexisting_link'
+                CreatedByKit  = $false
+                BackupDirPath = ''
+            })
             Save-RollbackManifestCheckpoint -Stage "junction:$name"
             continue
         }
-        # Never delete a pre-existing real directory in Lane 2; move it safely aside with a unique backup name.
-        $dirBackup = Get-UniqueBackupPath $dst
+        # Never delete a pre-existing real directory in Lane 2; move it safely aside with a unique backup name
+        # and record the EXACT BackupDirPath in the manifest so rollback never guesses by wildcard sorting.
+        $dirBackup = Resolve-CanonicalLongPath -PathValue (Get-UniqueBackupPath $dst)
         if (-not $script:IsDryRun) { Move-Item -LiteralPath $dst -Destination $dirBackup -Force }
         Write-Host "    Moved existing directory safely to: $dirBackup" -ForegroundColor DarkGray
+        $script:SharedLinkRecords.Add([PSCustomObject]@{
+            Name          = $name
+            LinkPath      = $dst
+            PriorState    = 'preexisting_dir'
+            CreatedByKit  = $true
+            BackupDirPath = $dirBackup
+        })
+        if (-not $script:TrackedJunctions.Contains($name)) {
+            $script:TrackedJunctions.Add($name)
+        }
+        Save-RollbackManifestCheckpoint -Stage "backup-dir:$name"
+    } else {
+        $script:SharedLinkRecords.Add([PSCustomObject]@{
+            Name          = $name
+            LinkPath      = $dst
+            PriorState    = 'absent'
+            CreatedByKit  = $true
+            BackupDirPath = ''
+        })
+        if (-not $script:TrackedJunctions.Contains($name)) {
+            $script:TrackedJunctions.Add($name)
+        }
     }
     if (-not $script:IsDryRun) { New-Item -ItemType Junction -Path $dst -Target $src | Out-Null }
-    if (-not $script:TrackedJunctions.Contains($name)) {
-        $script:TrackedJunctions.Add($name)
-    }
     Save-RollbackManifestCheckpoint -Stage "junction:$name"
     Write-Host "    Linked: $dst -> $src"
 }
@@ -1620,124 +1667,11 @@ Write-Host "    Installed: $lane2AgentsDst"
 # ============================================================================
 # Step 9: Non-Destructively Merge & Atomically Write Lane 2 config.toml
 # ============================================================================
-Write-Step 'Merging & writing Lane 2 Official OpenAI config.toml (non-destructive TOML merge)...'
-$lane2ConfigPath = Join-Path $Lane2Home 'config.toml'
-Assert-NotReparsePoint -PathValue $lane2ConfigPath -Label 'Lane 2 config.toml'
-$trustedProjects = Get-ExistingTrustedProjects -ConfigPaths @((Join-Path $Lane1Home 'config.toml'), $lane2ConfigPath)
-foreach ($rp in @($RepoPath, $effectiveLane2Repo)) {
-    $rpCanon = Resolve-CanonicalLongPath -PathValue $rp
-    $alreadyTrusted = @($trustedProjects | Where-Object {
-        $existingCanon = try { Resolve-CanonicalLongPath -PathValue $_ } catch { $_ }
-        $existingCanon.Equals($rpCanon, [System.StringComparison]::OrdinalIgnoreCase)
-    }).Count -gt 0
-    if (-not $alreadyTrusted) {
-        $trustedProjects.Add($rpCanon)
-    }
-}
+$configureGatewayLane1 = $ConfigureGateway.IsPresent -and ($GatewayTargetLane -in @('Lane1', 'Both'))
+$configureGatewayLane2 = $ConfigureGateway.IsPresent -and ($GatewayTargetLane -in @('Lane2', 'Both'))
+$suppliedSecretForGuard = ''
 
-$managedTopKeys = New-Object 'System.Collections.Generic.List[string]'
-$managedTopKeys.AddRange([string[]]@('sandbox_mode', 'approval_policy', 'windows_wsl_setup_acknowledged'))
-
-$lane2TopLines = New-Object 'System.Collections.Generic.List[string]'
-$lane2TopLines.Add('# Official OpenAI / ChatGPT Codex CLI configuration (LANE 2)')
-$lane2TopLines.Add('# Leave model/service_tier unset unless overridden so Codex uses your account''s real defaults.')
-$lane2TopLines.Add('sandbox_mode = "workspace-write"')
-$lane2TopLines.Add("approval_policy = `"$ApprovalPolicy`"")
-$lane2TopLines.Add('windows_wsl_setup_acknowledged = true')
-
-if ($OfficialModel) {
-    $lane2TopLines.Add("model = `"$(Escape-TomlBasicString $OfficialModel)`"")
-    $managedTopKeys.Add('model')
-}
-if ($OfficialReasoning) {
-    $lane2TopLines.Add("model_reasoning_effort = `"$(Escape-TomlBasicString $OfficialReasoning)`"")
-    $managedTopKeys.Add('model_reasoning_effort')
-}
-if ($OfficialServiceTier) {
-    $lane2TopLines.Add("service_tier = `"$(Escape-TomlBasicString $OfficialServiceTier)`"")
-    $managedTopKeys.Add('service_tier')
-}
-
-# Only enable feature flags confirmed by the real binary (or safe defaults when probing is unsupported).
-$featureLines = New-Object 'System.Collections.Generic.List[string]'
-if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('daemon_auto_start')) {
-    $featureLines.Add('daemon_auto_start = false')
-}
-if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('memories')) {
-    $featureLines.Add('memories = true')
-}
-if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('js_repl')) {
-    $featureLines.Add('js_repl = false')
-}
-if ($supportedFeatures.ContainsKey('goals')) {
-    $featureLines.Add('goals = true')
-}
-
-$projectsBlock = ($trustedProjects | ForEach-Object {
-    "[projects.`"$(Escape-TomlBasicString $_)`"]`r`ntrust_level = `"trusted`""
-}) -join "`r`n`r`n"
-
-$sandboxNetworkValue = if ($AllowSandboxNetwork) { 'true' } else { 'false' }
-$lane2TopBlock = $lane2TopLines -join "`r`n"
-
-$lane2SectionsBlock = @"
-[windows]
-sandbox = "elevated"
-
-$projectsBlock
-
-[features]
-$($featureLines -join "`r`n")
-
-[memories]
-generate_memories = true
-use_memories = true
-
-[sandbox_workspace_write]
-network_access = $sandboxNetworkValue
-
-[shell_environment_policy]
-exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]
-
-[shell_environment_policy.set]
-CODEX_ACTIVE_LANE = "LANE_2"
-CARGO_TARGET_DIR = "$(Escape-TomlBasicString $CargoTargetDir)"
-"@
-
-$managedSectionNames = @(
-    'windows',
-    'features',
-    'memories',
-    'sandbox_workspace_write',
-    'shell_environment_policy',
-    'shell_environment_policy.set'
-)
-
-$mergedLane2Config = Merge-CodexConfigToml `
-    -ExistingPath $lane2ConfigPath `
-    -ManagedTopBlock $lane2TopBlock `
-    -ManagedSectionsBlock $lane2SectionsBlock `
-    -ManagedTopKeys ($managedTopKeys.ToArray()) `
-    -ManagedSectionNames $managedSectionNames
-
-# Fail-closed secret check before touching disk.
-Assert-NoPlaintextSecretInToml -TomlContent $mergedLane2Config -ContextLabel 'Lane 2 config.toml'
-
-Backup-IfExists $lane2ConfigPath
-if (-not $script:IsDryRun) {
-    Write-Utf8NoBom -FilePath $lane2ConfigPath -Text $mergedLane2Config
-    Protect-SensitiveFileAcl $lane2ConfigPath
-    Save-RollbackManifestCheckpoint -Stage 'write:lane2-config.toml'
-}
-Write-Host "    Wrote: $lane2ConfigPath (preserved custom sections & $($trustedProjects.Count) trusted project(s))"
-
-# ============================================================================
-# Step 10: Optional Lane 1 Gateway Configuration (env_key ONLY, Zero Plaintext Keys)
-# ============================================================================
 if ($ConfigureGateway) {
-    Write-Step "Configuring Lane 1 gateway in $Lane1Home\config.toml (using env_key = `"$GatewayApiKeyEnv`", zero plaintext secrets in file)..."
-    $suppliedSecretForGuard = ''
-
     if ($GatewayApiKey) {
         $suppliedSecretForGuard = $GatewayApiKey
         Write-Warning "Passing -GatewayApiKey on the command line may leave the key in PowerShell history. Prefer -PromptGatewayApiKey or setting `$env:$GatewayApiKeyEnv before running."
@@ -1763,7 +1697,7 @@ if ($ConfigureGateway) {
                     Set-Item -Path "Env:\$GatewayApiKeyEnv" -Value $plainKey
                     Write-Host "    Stored API key securely in User environment variable: $GatewayApiKeyEnv"
                 } else {
-                    Write-Warning "No API key entered; ensure User env '$GatewayApiKeyEnv' is set before launching Lane 1."
+                    Write-Warning "No API key entered; ensure User env '$GatewayApiKeyEnv' is set before launching target lane ($GatewayTargetLane)."
                 }
             } finally {
                 [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
@@ -1771,6 +1705,203 @@ if ($ConfigureGateway) {
             }
         }
     }
+}
+
+if ($configureGatewayLane2) {
+    Write-Step "Merging & writing Lane 2 CLI config.toml with API Key / Gateway (env_key = `"$GatewayApiKeyEnv`", compatible with OAuth Login)..."
+} else {
+    Write-Step 'Merging & writing Lane 2 Official OpenAI config.toml (non-destructive TOML merge)...'
+}
+$lane2ConfigPath = Join-Path $Lane2Home 'config.toml'
+Assert-NotReparsePoint -PathValue $lane2ConfigPath -Label 'Lane 2 config.toml'
+$trustedProjects = Get-ExistingTrustedProjects -ConfigPaths @((Join-Path $Lane1Home 'config.toml'), $lane2ConfigPath)
+foreach ($rp in @($RepoPath, $effectiveLane2Repo)) {
+    $rpCanon = Resolve-CanonicalLongPath -PathValue $rp
+    $alreadyTrusted = @($trustedProjects | Where-Object {
+        $existingCanon = try { Resolve-CanonicalLongPath -PathValue $_ } catch { $_ }
+        $existingCanon.Equals($rpCanon, [System.StringComparison]::OrdinalIgnoreCase)
+    }).Count -gt 0
+    if (-not $alreadyTrusted) {
+        $trustedProjects.Add($rpCanon)
+    }
+}
+
+if ($configureGatewayLane2) {
+    $lane2CleanBackup = Join-Path $Lane2Home 'config.backup.toml'
+    Assert-NotReparsePoint -PathValue $lane2CleanBackup -Label 'Lane 2 config.backup.toml'
+    if ((Test-Path -LiteralPath $lane2ConfigPath -PathType Leaf) -and -not (Test-Path -LiteralPath $lane2CleanBackup)) {
+        Backup-IfExists $lane2CleanBackup
+        if (-not $script:IsDryRun) {
+            Copy-Item -LiteralPath $lane2ConfigPath -Destination $lane2CleanBackup -Force
+            Protect-SensitiveFileAcl $lane2CleanBackup
+            Save-RollbackManifestCheckpoint -Stage 'write:lane2-config.backup.toml'
+        }
+        Write-Host "    Saved clean original backup: $lane2CleanBackup"
+    }
+}
+
+$managedTopKeys = New-Object 'System.Collections.Generic.List[string]'
+$managedTopKeys.AddRange([string[]]@('sandbox_mode', 'approval_policy', 'windows_wsl_setup_acknowledged'))
+
+$lane2TopLines = New-Object 'System.Collections.Generic.List[string]'
+if ($configureGatewayLane2) {
+    $managedTopKeys.AddRange([string[]]@('model_provider', 'web_search', 'disable_response_storage'))
+    $lane2TopLines.Add('# Lane 2 Codex CLI configuration (Flexible OAuth Login + API Key Gateway via env_key)')
+    $lane2TopLines.Add("model_provider = `"$(Escape-TomlBasicString $GatewayProviderName)`"")
+    $effectiveLane2Model = if ($GatewayModel) { $GatewayModel } else { $OfficialModel }
+    if ($effectiveLane2Model) {
+        $managedTopKeys.Add('model')
+        $managedTopKeys.Add('review_model')
+        $lane2TopLines.Add("model = `"$(Escape-TomlBasicString $effectiveLane2Model)`"")
+        $lane2TopLines.Add("review_model = `"$(Escape-TomlBasicString $effectiveLane2Model)`"")
+    }
+    $lane2TopLines.Add('web_search = "live"')
+    $lane2TopLines.Add('disable_response_storage = true')
+} else {
+    $lane2TopLines.Add('# Official OpenAI / ChatGPT Codex CLI configuration (LANE 2 - supports Login & API Key)')
+    $lane2TopLines.Add('# Leave model/service_tier unset unless overridden so Codex uses your account''s real defaults.')
+    if ($OfficialModel) {
+        $lane2TopLines.Add("model = `"$(Escape-TomlBasicString $OfficialModel)`"")
+        $managedTopKeys.Add('model')
+    }
+}
+$lane2TopLines.Add('sandbox_mode = "workspace-write"')
+$lane2TopLines.Add("approval_policy = `"$ApprovalPolicy`"")
+$lane2TopLines.Add('windows_wsl_setup_acknowledged = true')
+
+if ($OfficialReasoning) {
+    $lane2TopLines.Add("model_reasoning_effort = `"$(Escape-TomlBasicString $OfficialReasoning)`"")
+    $managedTopKeys.Add('model_reasoning_effort')
+}
+if ($OfficialServiceTier) {
+    $lane2TopLines.Add("service_tier = `"$(Escape-TomlBasicString $OfficialServiceTier)`"")
+    $managedTopKeys.Add('service_tier')
+}
+
+# Only enable feature flags confirmed by the real binary (or safe defaults when probing is unsupported).
+$featureLines = New-Object 'System.Collections.Generic.List[string]'
+if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('daemon_auto_start')) {
+    $featureLines.Add('daemon_auto_start = false')
+}
+if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('memories')) {
+    $featureLines.Add('memories = true')
+}
+if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('js_repl')) {
+    $featureLines.Add('js_repl = false')
+}
+if ($configureGatewayLane2) {
+    if ($supportedFeatures.ContainsKey('api_key_model_discovery')) { $featureLines.Add('api_key_model_discovery = true') }
+    if ($supportedFeatures.ContainsKey('image_generation')) { $featureLines.Add('image_generation = true') }
+}
+if ($supportedFeatures.ContainsKey('goals')) {
+    $featureLines.Add('goals = true')
+}
+
+$projectsBlock = ($trustedProjects | ForEach-Object {
+    "[projects.`"$(Escape-TomlBasicString $_)`"]`r`ntrust_level = `"trusted`""
+}) -join "`r`n`r`n"
+
+$sandboxNetworkValue = if ($AllowSandboxNetwork) { 'true' } else { 'false' }
+$lane2TopBlock = $lane2TopLines -join "`r`n"
+
+$managedSectionNames = @(
+    'windows',
+    'features',
+    'memories',
+    'sandbox_workspace_write',
+    'shell_environment_policy',
+    'shell_environment_policy.set'
+)
+
+$lane2ProviderBlock = ''
+$lane2ManagedSectionNames = $managedSectionNames
+if ($configureGatewayLane2) {
+    $modelsUrlL2 = $GatewayBaseUrl.TrimEnd('/') + '/models'
+    $provHeaderL2 = "model_providers.`"$(Escape-TomlBasicString $GatewayProviderName)`""
+    $lane2ProviderBlock = @"
+[$provHeaderL2]
+name = "$(Escape-TomlBasicString $GatewayProviderName)"
+base_url = "$(Escape-TomlBasicString $GatewayBaseUrl)"
+model_catalog_url = "$(Escape-TomlBasicString $modelsUrlL2)"
+wire_api = "responses"
+env_key = "$(Escape-TomlBasicString $GatewayApiKeyEnv)"
+
+"@
+    $lane2ManagedSectionNames = $managedSectionNames + @($provHeaderL2, "model_providers.$GatewayProviderName", "model_providers.'$GatewayProviderName'")
+}
+
+$lane2SectionsBlock = $lane2ProviderBlock + @"
+[windows]
+sandbox = "elevated"
+
+$projectsBlock
+
+[features]
+$($featureLines -join "`r`n")
+
+[memories]
+generate_memories = true
+use_memories = true
+
+[sandbox_workspace_write]
+network_access = $sandboxNetworkValue
+
+[shell_environment_policy]
+exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]
+
+[shell_environment_policy.set]
+CODEX_ACTIVE_LANE = "LANE_2"
+CARGO_TARGET_DIR = "$(Escape-TomlBasicString $CargoTargetDir)"
+"@
+
+$mergedLane2Config = Merge-CodexConfigToml `
+    -ExistingPath $lane2ConfigPath `
+    -ManagedTopBlock $lane2TopBlock `
+    -ManagedSectionsBlock $lane2SectionsBlock `
+    -ManagedTopKeys ($managedTopKeys.ToArray()) `
+    -ManagedSectionNames $lane2ManagedSectionNames
+
+# Fail-closed secret check before touching disk.
+Assert-NoPlaintextSecretInToml -TomlContent $mergedLane2Config -ContextLabel 'Lane 2 config.toml' -ForbiddenLiteralSecret $suppliedSecretForGuard
+if ($configureGatewayLane2) {
+    $expectedEnvKeyLineL2 = "env_key = `"$(Escape-TomlBasicString $GatewayApiKeyEnv)`""
+    if (-not $mergedLane2Config.Contains($expectedEnvKeyLineL2)) {
+        throw "Security invariant violation in Lane 2 config.toml: expected '$expectedEnvKeyLineL2' is missing."
+    }
+}
+
+Backup-IfExists $lane2ConfigPath
+if (-not $script:IsDryRun) {
+    Write-Utf8NoBom -FilePath $lane2ConfigPath -Text $mergedLane2Config
+    Protect-SensitiveFileAcl $lane2ConfigPath
+    Save-RollbackManifestCheckpoint -Stage 'write:lane2-config.toml'
+}
+Write-Host "    Wrote: $lane2ConfigPath (preserved custom sections & $($trustedProjects.Count) trusted project(s))"
+
+if ($ShareAuthToLane2) {
+    Write-Step "Sharing authenticated session (auth.json) from Lane 1 to Lane 2 (-ShareAuthToLane2)..."
+    $lane1AuthPath = Join-Path $Lane1Home 'auth.json'
+    $lane2AuthPath = Join-Path $Lane2Home 'auth.json'
+    Assert-NotReparsePoint -PathValue $lane1AuthPath -Label 'Lane 1 auth.json'
+    Assert-NotReparsePoint -PathValue $lane2AuthPath -Label 'Lane 2 auth.json'
+    if (-not (Test-Path -LiteralPath $lane1AuthPath -PathType Leaf)) {
+        Write-Warning "Lane 1 auth.json was not found at '$lane1AuthPath'; skipping -ShareAuthToLane2. Run 'codex login' to sign in to Lane 2."
+    } else {
+        Backup-IfExists $lane2AuthPath
+        if (-not $script:IsDryRun) {
+            Copy-Item -LiteralPath $lane1AuthPath -Destination $lane2AuthPath -Force
+            Protect-SensitiveFileAcl $lane2AuthPath
+            Save-RollbackManifestCheckpoint -Stage 'write:lane2-auth.json'
+        }
+        Write-Host "    Shared & ACL-locked auth.json: $lane1AuthPath -> $lane2AuthPath"
+    }
+}
+
+# ============================================================================
+# Step 10: Optional Lane 1 Gateway Configuration (env_key ONLY, Zero Plaintext Keys)
+# ============================================================================
+if ($configureGatewayLane1) {
+    Write-Step "Configuring Lane 1 gateway in $Lane1Home\config.toml (using env_key = `"$GatewayApiKeyEnv`", zero plaintext secrets in file)..."
 
     $lane1ConfigPath = Join-Path $Lane1Home 'config.toml'
     $lane1CleanBackup = Join-Path $Lane1Home 'config.backup.toml'
@@ -1792,10 +1923,10 @@ if ($ConfigureGateway) {
 
     $modelsUrl = $GatewayBaseUrl.TrimEnd('/') + '/models'
     $gwTopKeys = New-Object 'System.Collections.Generic.List[string]'
-    $gwTopKeys.AddRange([string[]]@('model_provider', 'web_search', 'disable_response_storage', 'sandbox_mode', 'approval_policy', 'windows_wsl_setup_acknowledged'))
+    $gwTopKeys.AddRange([string[]]@('model_provider', 'web_search', 'disable_response_storage', 'windows_wsl_setup_acknowledged'))
 
     $lane1TopLines = New-Object 'System.Collections.Generic.List[string]'
-    $lane1TopLines.Add('# Lane 1 Codex configuration (Gateway via env_key + Security Guardrails)')
+    $lane1TopLines.Add('# Lane 1 Codex Desktop configuration (Full Desktop Authority + Gateway via env_key)')
     $lane1TopLines.Add("model_provider = `"$(Escape-TomlBasicString $GatewayProviderName)`"")
     if ($GatewayModel) {
         $gwTopKeys.Add('model')
@@ -1805,8 +1936,6 @@ if ($ConfigureGateway) {
     }
     $lane1TopLines.Add('web_search = "live"')
     $lane1TopLines.Add('disable_response_storage = true')
-    $lane1TopLines.Add('sandbox_mode = "workspace-write"')
-    $lane1TopLines.Add("approval_policy = `"$ApprovalPolicy`"")
     $lane1TopLines.Add('windows_wsl_setup_acknowledged = true')
 
     $gwFeatureLines = New-Object 'System.Collections.Generic.List[string]'
@@ -1835,9 +1964,6 @@ $projectsBlock
 [features]
 $($gwFeatureLines -join "`r`n")
 
-[sandbox_workspace_write]
-network_access = $sandboxNetworkValue
-
 [shell_environment_policy]
 exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]
 
@@ -1845,12 +1971,22 @@ exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]
 CODEX_ACTIVE_LANE = "LANE_1"
 "@
 
+    $lane1ManagedSections = @(
+        'windows',
+        'features',
+        'shell_environment_policy',
+        'shell_environment_policy.set',
+        $provHeader,
+        "model_providers.$GatewayProviderName",
+        "model_providers.'$GatewayProviderName'"
+    )
+
     $mergedLane1Config = Merge-CodexConfigToml `
         -ExistingPath $lane1ConfigPath `
         -ManagedTopBlock $lane1TopBlock `
         -ManagedSectionsBlock $lane1SectionsBlock `
         -ManagedTopKeys ($gwTopKeys.ToArray()) `
-        -ManagedSectionNames ($managedSectionNames + @($provHeader, "model_providers.$GatewayProviderName", "model_providers.'$GatewayProviderName'"))
+        -ManagedSectionNames $lane1ManagedSections
 
     # Fail-closed invariant check: zero plaintext bearer tokens or supplied API key literals in TOML,
     # and env_key MUST be present.
@@ -1859,7 +1995,6 @@ CODEX_ACTIVE_LANE = "LANE_1"
     if (-not $mergedLane1Config.Contains($expectedEnvKeyLine)) {
         throw "Security invariant violation in Lane 1 config.toml: expected '$expectedEnvKeyLine' is missing."
     }
-    $suppliedSecretForGuard = ''
 
     if (-not $script:IsDryRun) {
         Write-Utf8NoBom -FilePath $lane1ConfigPath -Text $mergedLane1Config
@@ -1868,6 +2003,7 @@ CODEX_ACTIVE_LANE = "LANE_1"
     }
     Write-Host "    Wrote: $lane1ConfigPath (zero plaintext keys; reads from env $GatewayApiKeyEnv)"
 }
+$suppliedSecretForGuard = ''
 
 # ============================================================================
 # Step 11: Install Self-Healing CLI Wrappers into LocalBin & Update User PATH
@@ -2175,6 +2311,7 @@ if (-not $script:IsDryRun) {
         (Join-Path $Lane1Home 'config.backup.toml'),
         (Join-Path $Lane2Home 'auth.json'),
         (Join-Path $Lane2Home 'config.toml'),
+        (Join-Path $Lane2Home 'config.backup.toml'),
         $script:RollbackSnapPath,
         $script:RollbackLatestPath
     )) {

@@ -30,6 +30,16 @@
 #       * Layer 2: `[shell_environment_policy]` secret filtering & `env_key`
 #       * Layer 4: Global `AGENTS.md` (anti-prompt-injection & static-only rules)
 #
+#   - FULL WORKSPACE DIRECTORY TREE MASTERY & FILE CRUD AUTHORITY:
+#     This firewall intentionally leaves all standard workspace directory-tree
+#     inspection and file CRUD tools 100% unobstructed (`matchedRules: []`),
+#     including `rg`, `find`, `git status`, `Get-ChildItem`, `Set-Content`,
+#     `Remove-Item`, `rm`, `mv`, `cp`, `mkdir`, and `apply_patch`. Within the
+#     `workspace-write` sandbox, the agent can freely grasp the entire project
+#     directory tree and read, create, edit, move, and delete project files,
+#     while destructive OS/ACL/ransomware commands and untrusted sample payload
+#     execution remain hard-blocked (`decision="forbidden"`).
+#
 # HOW END USERS CAN SAFELY CUSTOMIZE THIS FILE:
 #   1. NEVER remove Sections 1-4 (ransomware/system tampering, persistence,
 #      NTFS ACL/network tampering, or Git force-push blocks).

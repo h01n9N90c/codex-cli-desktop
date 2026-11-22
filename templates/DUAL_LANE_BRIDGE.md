@@ -21,14 +21,16 @@ HƯỚNG DẪN TÙY BIẾN & QUY TẮC AN TOÀN CHO NGƯỜI DÙNG CUỐI (End-U
 
 ## 1. Phân vùng quyền sở hữu (Zero-Collision Ownership)
 
-| Hạng mục | **LUỒNG 1 (`LANE_1` — Desktop App / `codex-t3`)** | **LUỒNG 2 (`LANE_2` — CLI Chính chủ `codex`)** |
+| Hạng mục | **LUỒNG 1 (`LANE_1` — Codex Desktop / Tài khoản Chính `acc chính` / `codex-t3`)** | **LUỒNG 2 (`LANE_2` — Codex CLI `codex` / Linh hoạt Đăng nhập OAuth & API Key)** |
 | :--- | :--- | :--- |
+| **Vai trò & Xác thực** | **Codex Desktop App** (`~/.codex`, tài khoản chính `acc chính`, hoặc cổng phụ khi cấu hình `-GatewayTargetLane Lane1\|Both`) | **Codex CLI** (`~/.codex-official`, hỗ trợ **cả Đăng nhập OAuth `codex login` lẫn API Key / Gateway** qua `env_key` & `-GatewayTargetLane Lane2\|Both`) |
 | **Nhiệm vụ chính** *(Tùy biến)* | *(Ví dụ: Backend Core, Binary/Parser Engine, hoặc Module A)* | *(Ví dụ: SAST/Analyzers, CLI, Frontend, hoặc Module B)* |
 | **Thư mục code được GHI** *(Tùy biến — không giao nhau)* | `src/module-a/**`<br>`crates/core/src/module_a/**` | `src/module-b/**`<br>`crates/core/src/module_b/**`, `crates/cli/**` |
 | **Sổ cái (Ledger) được GHI** *(Tùy biến)* | `docs/progress/PHASE_LEDGER.md` | `artifacts/dual-lane/LANE2_LEDGER.md` |
 | **Handoff & Artifacts** *(Tùy biến)* | `docs/progress/handoffs/LANE1-*_HANDOFF.md` | `artifacts/dual-lane/handoffs/LANE2-*_HANDOFF.md` |
 | **Thư mục Build Cargo (nếu là Rust)** *(Giữ mặc định)* | `target/` mặc định của repo | Windows: `%TEMP%\codex-lane2-target`<br>Unix/macOS: `${TMPDIR:-/tmp}/codex-lane2-target` (`CARGO_TARGET_DIR`) |
 | **Quyền ĐỌC chéo (Read-Only)** *(Giữ nguyên)* | Chỉ đọc `LANE2_LEDGER.md` & handoff Luồng 2 ở đầu mỗi pha | Chỉ đọc `PHASE_LEDGER.md` & handoff Luồng 1 ở đầu mỗi pha |
+| **Nắm bắt Cây Thư mục & Thao tác File CRUD (Full Workspace Directory Tree Mastery & File CRUD Authority)** | **Toàn quyền như trước trên Codex Desktop:** Mặc định nắm toàn bộ cây thư mục dự án (`rg --files`, `git status`, `Get-ChildItem`, `find`) và tự do đọc, ghi, tạo, sửa, di chuyển, xóa file, build & test trên toàn dự án (chỉ giới hạn theo phân vùng khi chạy song song với Luồng 2 theo bảng này) | Toàn quyền duyệt & nắm toàn bộ cây thư mục dự án (`rg --files`, `git status`, `Get-ChildItem`, `find`), tự do đọc, tạo mới, sửa, di chuyển và xóa file trong vùng sở hữu của Luồng 2 (`workspace-write`) |
 
 ## 2. Hợp đồng giao tiếp chung (Shared Interfaces) *(Tùy biến theo dự án)*
 
@@ -36,7 +38,9 @@ Liệt kê các kiểu dữ liệu / API / Schema mà cả 2 luồng cùng sử 
 
 - **Shared Types / Schema:** `...`
 - **Shared API / CLI Contract / Output Format:** `...`
-- **Chính sách bảo mật bắt buộc (Giữ nguyên):** Mọi phân tích mẫu lỗ hổng/nhị phân đều tuân thủ **Static-Analysis-Only** (tuyệt đối không thực thi mẫu); không lưu secret/API key/token vào repo hay tệp cầu nối này.
+- **Chính sách bảo mật & Toàn quyền Thao tác File trong Workspace (Giữ nguyên):**
+  - Trong phạm vi dự án (`sandbox_mode = "workspace-write"`), agent được **toàn quyền nắm bắt toàn bộ cây thư mục** và **đọc, ghi, tạo, sửa, đổi tên, xóa file** dự án phục vụ lập trình (tuân thủ vùng sở hữu Zero-Collision ở Mục 1).
+  - Mọi phân tích mẫu lỗ hổng/nhị phân bên thứ ba đều tuân thủ **Static-Analysis-Only** (chỉ cấm thực thi/kích nổ mẫu độc hại, không bao giờ hạn chế việc đọc/sửa/xóa mã nguồn dự án); không lưu secret/API key/token vào repo hay tệp cầu nối này.
 
 ## 3. Trạng thái đồng bộ gần nhất (Snapshot) *(Cập nhật sau mỗi pha)*
 

@@ -302,12 +302,13 @@ is_sandbox_network_restricted() {
   ' "${cfg_file}" 2>/dev/null
 }
 
-# Detect hardcoded plaintext `api_key =` assignments without ever printing them.
+# Detect hardcoded plaintext `api_key =` or `experimental_bearer_token =` assignments without ever printing them.
 has_plaintext_api_key() {
   local cfg_file="$1"
   awk '
     { sub(/\r$/, "", $0) }
     /^[[:space:]]*#/ { next }
+    /^[[:space:]]*experimental_bearer_token[[:space:]]*=/ { found = 1; exit }
     /^[[:space:]]*api_key[[:space:]]*=/ { found = 1; exit }
     END { exit(found ? 0 : 1) }
   ' "${cfg_file}" 2>/dev/null
@@ -415,16 +416,67 @@ read_auth_mode() {
   fi
 }
 
+# Extract ONLY the `env_key` environment variable identifier from config.toml
+# (strictly validated as a POSIX identifier `[A-Za-z_][A-Za-z0-9_]*` and rejecting
+# token-like prefixes so secret values can never be echoed).
+read_env_key_name() {
+  local file="$1"
+  if [ ! -f "${file}" ] || [ -L "${file}" ]; then
+    printf ''
+    return 0
+  fi
+  local raw_env=""
+  raw_env="$(awk '
+    { sub(/\r$/, "", $0) }
+    /^[[:space:]]*#/ { next }
+    match($0, /^[[:space:]]*env_key[[:space:]]*=[[:space:]]*["\047][A-Za-z_][A-Za-z0-9_]*["\047]/) {
+      seg = substr($0, RSTART, RLENGTH)
+      sub(/^[[:space:]]*env_key[[:space:]]*=[[:space:]]*["\047]/, "", seg)
+      sub(/["\047]$/, "", seg)
+      print seg
+      exit
+    }
+  ' "${file}" 2>/dev/null || true)"
+  if printf '%s' "${raw_env}" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]{0,63}$' \
+    && ! printf '%s' "${raw_env}" | grep -Eq '^(sk-|eyJ|Bearer|ghp_|gho_|xox)'; then
+    printf '%s' "${raw_env}"
+  else
+    printf ''
+  fi
+}
+
 M1="$(read_auth_mode "${LANE1_HOME}/auth.json")"
 M2="$(read_auth_mode "${LANE2_HOME}/auth.json")"
+E1="$(read_env_key_name "${LANE1_HOME}/config.toml")"
+E2="$(read_env_key_name "${LANE2_HOME}/config.toml")"
+
+M1_LABEL="${M1}"
+if [ -n "${E1}" ]; then
+  if [ "${M1}" = "not-logged-in" ]; then
+    M1_LABEL="env_key(${E1})"
+  else
+    M1_LABEL="${M1}+env_key(${E1})"
+  fi
+fi
+
+M2_LABEL="${M2}"
+if [ -n "${E2}" ]; then
+  if [ "${M2}" = "not-logged-in" ]; then
+    M2_LABEL="env_key(${E2})"
+  else
+    M2_LABEL="${M2}+env_key(${E2})"
+  fi
+fi
 
 # Audit POSIX permission bits on sensitive files across both lanes (expect 0600).
 PERM_EXPOSED=0
 for sf in \
   "${LANE1_HOME}/auth.json" \
   "${LANE1_HOME}/config.toml" \
+  "${LANE1_HOME}/config.backup.toml" \
   "${LANE2_HOME}/auth.json" \
-  "${LANE2_HOME}/config.toml"; do
+  "${LANE2_HOME}/config.toml" \
+  "${LANE2_HOME}/.rollback/latest.tsv"; do
   if [ -f "${sf}" ] && [ ! -L "${sf}" ]; then
     fmode="$(get_octal_mode "${sf}")"
     if [ -n "${fmode}" ] && mode_has_group_or_other_bits "${fmode}"; then
@@ -439,10 +491,10 @@ else
   PERM_LABEL="perms=exposed(${PERM_EXPOSED}; run chmod 600)"
 fi
 
-if [ "${M2}" != "not-logged-in" ] && [ "${M2}" != "symlink-warning" ] && [ "${M1}" != "symlink-warning" ] && [ "${PERM_EXPOSED}" -eq 0 ]; then
-  report "PASS" "Auth & Perm Isolation" "Lane 1=${M1} | Lane 2=${M2} | ${PERM_LABEL}"
+if { [ "${M2}" != "not-logged-in" ] || [ -n "${E2}" ]; } && [ "${M2}" != "symlink-warning" ] && [ "${M1}" != "symlink-warning" ] && [ "${PERM_EXPOSED}" -eq 0 ]; then
+  report "PASS" "Auth & Perm Isolation" "Lane 1=${M1_LABEL} | Lane 2=${M2_LABEL} | ${PERM_LABEL}"
 else
-  report "WARN" "Auth & Perm Isolation" "Lane 1=${M1} | Lane 2=${M2} | ${PERM_LABEL}"
+  report "WARN" "Auth & Perm Isolation" "Lane 1=${M1_LABEL} | Lane 2=${M2_LABEL} | ${PERM_LABEL}"
 fi
 
 # ------------------------------------------------------------------------------

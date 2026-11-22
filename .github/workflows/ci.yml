@@ -631,4 +631,120 @@ jobs:
             [ "$(sha256_of "${LANE1}/sessions/keep.jsonl")" = "${SESSION_HASH}" ]
           done
 
-          echo "[PASS] Unix smoke, fail-closed worktree, traversal/SUID defense, interrupted rollback, and 3x install/rollback loop passed!"
+          # 9) v1.3.1 Rollback Invariants: Pre-existing symlink preservation, exact dir-backup
+          #    restoration (decoy-proof), fail-closed missing-backup preflight, and idempotent re-run.
+          P9_L1="${WORK_DIR}/p9 lane 1"
+          P9_L2="${WORK_DIR}/p9 lane 2"
+          P9_BIN="${WORK_DIR}/p9 local bin"
+          P9_REPO="${WORK_DIR}/p9 repo"
+          P9_CUSTOM="${WORK_DIR}/p9 user skills"
+          mkdir -p "${P9_L1}/sessions" "${P9_L2}/memories" "${P9_L2}/memories.backup-99999999-999999" "${P9_BIN}" "${P9_REPO}" "${P9_CUSTOM}"
+          P9_L2_CANON="$(cd -P -- "${P9_L2}" && pwd -P)"
+          printf 'KEEP_USER_SKILLS_LINK\n' > "${P9_CUSTOM}/user_skill.txt"
+          ln -s -- "${P9_CUSTOM}" "${P9_L2}/skills"
+          printf 'REAL_ORIGINAL_MEMORIES\n' > "${P9_L2}/memories/marker.txt"
+          printf 'WRONG_DECOY_BACKUP\n' > "${P9_L2}/memories.backup-99999999-999999/marker.txt"
+          printf 'model = "p9-original"\n' > "${P9_L2}/config.toml"
+          chmod 644 "${P9_L2}/config.toml"
+          P9_CFG_HASH="$(sha256_of "${P9_L2}/config.toml")"
+
+          PATH="${FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+            ./scripts/setup-dual-lane.sh --repo "${P9_REPO}"
+          grep -q '^# schema_version=2$' "${P9_L2}/.rollback/latest.tsv"
+          grep -Fq $'L\t0\t'"${P9_L2_CANON}/skills"$'\t-\tpreexisting_link' "${P9_L2}/.rollback/latest.tsv"
+
+          P9_CFG_BKP="$(awk -F'\t' '$1=="1" && $3 ~ /p9 lane 2\/config\.toml$/ {print $4; exit}' "${P9_L2}/.rollback/latest.tsv")"
+          P9_MEM_BKP="$(awk -F'\t' '$1=="L" && $5=="preexisting_dir" && $3 ~ /p9 lane 2\/memories$/ {print $4; exit}' "${P9_L2}/.rollback/latest.tsv")"
+          [ -f "${P9_CFG_BKP}" ]
+          [ -d "${P9_MEM_BKP}" ]
+          [ "${P9_MEM_BKP}" != "${P9_L2_CANON}/memories.backup-99999999-999999" ]
+
+          # 9a) Missing FILE backup MUST fail closed BEFORE Step 1 unlinks any symlinks!
+          mv -- "${P9_CFG_BKP}" "${WORK_DIR}/p9-held-cfg-bkp"
+          set +e
+          CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+            ./scripts/restore-original.sh >/dev/null 2>&1
+          P9_MISS_FILE_RC=$?
+          set -e
+          mv -- "${WORK_DIR}/p9-held-cfg-bkp" "${P9_CFG_BKP}"
+          [ "${P9_MISS_FILE_RC}" -ne 0 ] || { echo "[FAIL] Missing file backup exited 0!" >&2; exit 1; }
+          [ -L "${P9_L2}/sessions" ] || { echo "[FAIL] ZERO-SIDE-EFFECT VIOLATION: sessions symlink unlinked despite missing file backup!" >&2; exit 1; }
+          [ -L "${P9_L2}/memories" ] || { echo "[FAIL] ZERO-SIDE-EFFECT VIOLATION: memories symlink unlinked despite missing file backup!" >&2; exit 1; }
+          [ -f "${P9_BIN}/codex" ] || { echo "[FAIL] ZERO-SIDE-EFFECT VIOLATION: codex wrapper removed despite missing file backup!" >&2; exit 1; }
+
+          # 9b) Missing DIRECTORY backup MUST fail closed BEFORE Step 1 unlinks any symlinks!
+          mv -- "${P9_MEM_BKP}" "${WORK_DIR}/p9-held-mem-bkp"
+          set +e
+          CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+            ./scripts/restore-original.sh >/dev/null 2>&1
+          P9_MISS_DIR_RC=$?
+          set -e
+          mv -- "${WORK_DIR}/p9-held-mem-bkp" "${P9_MEM_BKP}"
+          [ "${P9_MISS_DIR_RC}" -ne 0 ] || { echo "[FAIL] Missing dir backup exited 0!" >&2; exit 1; }
+          [ -L "${P9_L2}/sessions" ] || { echo "[FAIL] ZERO-SIDE-EFFECT VIOLATION: sessions symlink unlinked despite missing dir backup!" >&2; exit 1; }
+          [ -f "${P9_BIN}/codex" ] || { echo "[FAIL] ZERO-SIDE-EFFECT VIOLATION: codex wrapper removed despite missing dir backup!" >&2; exit 1; }
+
+          # 9c) Full restore: preserves pre-existing skills symlink, restores EXACT memories dir (ignoring decoy),
+          #     detaches kit-created symlinks, and passes idempotent 2nd restore cleanly!
+          CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+            ./scripts/restore-original.sh
+          [ -L "${P9_L2}/skills" ] || { echo "[FAIL] REGRESSION: Pre-existing skills symlink was unlinked!" >&2; exit 1; }
+          [ "$(readlink "${P9_L2}/skills")" = "${P9_CUSTOM}" ] || { echo "[FAIL] Pre-existing skills symlink target altered!" >&2; exit 1; }
+          for d in memories_v2 sessions archived_sessions plugins; do
+            [ ! -L "${P9_L2}/${d}" ] || { echo "[FAIL] Kit-created symlink ${d} was not unlinked!" >&2; exit 1; }
+          done
+          [ -d "${P9_L2}/memories" ] && [ ! -L "${P9_L2}/memories" ]
+          [ "$(cat "${P9_L2}/memories/marker.txt")" = "REAL_ORIGINAL_MEMORIES" ] || { echo "[FAIL] Wrong dir backup restored!" >&2; exit 1; }
+          [ "$(cat "${P9_L2}/memories.backup-99999999-999999/marker.txt")" = "WRONG_DECOY_BACKUP" ]
+          [ "$(sha256_of "${P9_L2}/config.toml")" = "${P9_CFG_HASH}" ]
+          python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o644' "${P9_L2}/config.toml"
+
+          # 9d) Idempotent 2nd restore succeeds cleanly with backups already consumed.
+          CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+            ./scripts/restore-original.sh
+          [ -L "${P9_L2}/skills" ]
+
+          # 9e) v1.3.1 Workflow Parity: Desktop (Lane 1) = Primary Account (untouched config.toml, full authority)
+          #     + CLI (Lane 2) = supports BOTH OAuth Login (auth.json) AND API Key (--gateway-target-lane lane2).
+          printf '# Desktop primary account config\nmodel = "desktop-primary"\n' > "${P9_L1}/config.toml"
+          chmod 600 "${P9_L1}/config.toml"
+          P9_L1_CFG_HASH="$(sha256_of "${P9_L1}/config.toml")"
+          printf '{"auth_mode":"chatgpt","token":"%s"}\n' "${SECRET_CANARY}" > "${P9_L2}/auth.json"
+          chmod 600 "${P9_L2}/auth.json"
+
+          PATH="${FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+            ./scripts/setup-dual-lane.sh --repo "${P9_REPO}" \
+              --configure-gateway --gateway-target-lane lane2 \
+              --gateway-base-url "https://gateway.example.invalid/v1" \
+              --gateway-api-key-env "CODEX_CLI_API_KEY"
+
+          # Lane 1 config.toml MUST remain 100% untouched (Desktop full native authority).
+          [ "$(sha256_of "${P9_L1}/config.toml")" = "${P9_L1_CFG_HASH}" ]
+          # Lane 2 config.toml MUST have env_key + preserved model + zero plaintext secrets, coexisting with auth.json.
+          grep -Fq 'model_provider = "OpenAI"' "${P9_L2}/config.toml"
+          grep -Fq 'env_key = "CODEX_CLI_API_KEY"' "${P9_L2}/config.toml"
+          grep -Fq 'model = "p9-original"' "${P9_L2}/config.toml"
+          ! grep -Eq '^[[:space:]]*(api_key|experimental_bearer_token)[[:space:]]*=' "${P9_L2}/config.toml"
+          [ -f "${P9_L2}/auth.json" ]
+
+          P9_DOC_OUT="$(
+            PATH="${P9_BIN}:${FAKE_BIN}:${PATH}" \
+            CODEX_LANE1_HOME="${P9_L1}" \
+            CODEX_LANE2_HOME="${P9_L2}" \
+            CODEX_LOCAL_BIN="${P9_BIN}" \
+            ./scripts/doctor.sh
+          )"
+          printf '%s\n' "${P9_DOC_OUT}"
+          printf '%s' "${P9_DOC_OUT}" | grep -Fq 'chatgpt+env_key(CODEX_CLI_API_KEY)'
+          if printf '%s' "${P9_DOC_OUT}" | grep -Fq "${SECRET_CANARY}"; then
+            echo "[FAIL] doctor.sh leaked auth.json secret canary in 9e!" >&2
+            exit 1
+          fi
+
+          CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+            ./scripts/restore-original.sh
+          [ "$(sha256_of "${P9_L1}/config.toml")" = "${P9_L1_CFG_HASH}" ]
+          [ "$(sha256_of "${P9_L2}/config.toml")" = "${P9_CFG_HASH}" ]
+          [ -L "${P9_L2}/skills" ]
+
+          echo "[PASS] Unix smoke, fail-closed worktree, traversal/SUID defense, interrupted rollback, 3x loop, pre-existing link/exact backup/missing-backup preflight, and CLI login+API-key parity passed!"

@@ -9,11 +9,12 @@
 
 | Trường hợp của bạn | Vấn đề bạn đang gặp | Bộ kit này giải quyết thế nào? |
 | :--- | :--- | :--- |
-| **1. Có cả tài khoản OpenAI chính chủ lẫn key/gateway bên thứ 3** | Muốn vừa dùng Desktop App (chạy key/gateway riêng) vừa dùng CLI (tài khoản ChatGPT/OpenAI chính chủ), nhưng đăng nhập bên này lại đè mất `auth.json` và `config.toml` của bên kia. | Tách 2 `CODEX_HOME` độc lập (`~/.codex` và `~/.codex-official`), sinh sẵn 2 lệnh riêng trên Terminal: **`codex`** *(chính chủ)* và **`codex-t3`** *(cổng phụ)*. |
-| **2. Muốn chạy 2 agent song song trên cùng 1 dự án mà vẫn hiểu nhau** | Ví dụ: Luồng 1 làm Backend/Binary, Luồng 2 làm SAST/Frontend/CLI. Chạy chung thì đè file nhau; tách riêng thì không hiểu bên kia đang làm gì. | Nối **NTFS Directory Junction** (Windows) / **symlink** (macOS/Linux) cho `memories`, `sessions`, `skills`, `plugins` + cơ chế **Ghi riêng – Đọc chung** qua `DUAL_LANE_BRIDGE.md` *(ranh giới mềm qua prompt)* hoặc thêm cờ **`-UseGitWorktree`** / **`--use-git-worktree`** *(ranh giới cứng cưỡng chế ở cấp OS sandbox qua worktree riêng)*. |
-| **3. Máy chỉ có 1 ổ `C:\`, cấu hình khác nhau hoặc dùng Codex bản `npm`/standalone** | Các script cứng đường dẫn `D:\`, `E:\` hay ghi đè mất cấu hình cũ trong `config.toml` sẽ lỗi trên máy khác. | Tự dò thực tế mọi nguồn cài đặt (`WindowsApps`, `PATH`, `npm`, `-CodexPath`), tự dò feature flags bằng `codex features list`, **merge `config.toml` không phá hủy** (giữ nguyên `[mcp_servers]`, `[tui]`, `[plugins]` cũ), tự kiểm tra ổ đĩa NTFS & dung lượng trống. |
-| **4. Dự án Rust bị kẹt `Blocking waiting for file lock` khi 2 agent cùng test** | Hai agent cùng chạy `cargo test` tranh nhau khóa `target/.cargo-lock`. | Tự tách `CARGO_TARGET_DIR` riêng cho Luồng 2 (mặc định `%TEMP%\codex-lane2-target` trên Windows hoặc `${TMPDIR:-/tmp}/codex-lane2-target` trên Unix, tùy chỉnh qua `-CargoTargetDir` / `CODEX_CARGO_TARGET_DIR`) $\rightarrow$ biên dịch song song không khóa nhau. |
-| **5. Dùng CLI từ Windows Desktop gặp lỗi `--no-daemon`, mất task ghim (`Pinned`), hoặc lo rủi ro thực thi lệnh / lộ API key** | Báo lỗi `this CLI has no complete local package`, mất danh sách `Pinned` khi DB mới chưa có dòng `threads`, hoặc lộ API key trong `config.toml`. | Tự động tắt `daemon_auto_start = false` khi có hỗ trợ, kèm `sync-sessions.py` thực hiện **UPSERT (`INSERT` + `UPDATE`)** theo schema động (đọc nguồn chỉ-đọc `?mode=ro`), dùng `env_key` để **không bao giờ lưu plaintext API key vào `config.toml`**, mặc định `approval_policy = "on-request"`, và phòng thủ 4 lớp (`workspace-write` + `network_access = false`, lọc `*KEY*/*TOKEN*` & khóa ACL/chmod, `default.rules`, `AGENTS.md`). |
+| **1. Dùng Codex Desktop cho tài khoản chính (`acc chính`, giữ toàn quyền như trước) và muốn Codex CLI hỗ trợ linh hoạt cả Login lẫn API Key** | Muốn giữ **Codex Desktop (`~/.codex`)** cố định ở **tài khoản chính (`acc chính`)** với **toàn quyền như trước** (không bị bóp quyền hay đè `config.toml`), trong khi **Codex CLI (`~/.codex-official`)** vừa đăng nhập được OAuth (`codex login`) vừa chạy được **API Key / cổng Gateway riêng**. | Tách 2 `CODEX_HOME` độc lập: **Luồng 1 (`~/.codex` — Codex Desktop / Tài khoản chính `acc chính`, giữ nguyên 100% `config.toml` & toàn quyền trên toàn bộ dự án)** và **Luồng 2 (`~/.codex-official` — Codex CLI `codex` / `codex-official`, hỗ trợ CẢ Login OAuth lẫn API Key `env_key` qua `-GatewayTargetLane Lane2\|Lane1\|Both` / `--gateway-target-lane lane2\|lane1\|both`)**. |
+| **2. Muốn chạy 2 agent song song trên cùng 1 dự án mà vẫn hiểu nhau** | Ví dụ: Luồng 1 làm Backend/Binary trên Desktop, Luồng 2 làm SAST/Frontend/CLI trên Terminal. Chạy chung thì đè file nhau; tách riêng thì không hiểu bên kia đang làm gì. | Nối **NTFS Directory Junction** (Windows) / **symlink** (macOS/Linux) cho `memories`, `sessions`, `skills`, `plugins` + cơ chế **Ghi riêng – Đọc chung** qua `DUAL_LANE_BRIDGE.md` *(ranh giới mềm qua prompt)* hoặc thêm cờ **`-UseGitWorktree`** / **`--use-git-worktree`** *(ranh giới cứng cưỡng chế ở cấp OS sandbox qua worktree riêng)*. |
+| **3. Cần agent nắm toàn bộ cây thư mục và tự do đọc/ghi/sửa/xóa file code mà vẫn chặn tuyệt đối lệnh phá hoại & mã độc** | Sợ bật bảo mật quá chặt làm agent không đọc được cây thư mục hoặc không tạo/sửa/xóa được file dự án, nhưng mở toang lại sợ lệnh phá hệ thống, sửa ACL hay chạy nhầm file mẫu lỗ hổng. | Kết hợp `sandbox_mode = "workspace-write"` + tường lửa `default.rules` + `AGENTS.md`: cho phép agent **tự do 100% nắm bắt toàn bộ cây thư mục** (`rg --files`, `git status`, `Get-ChildItem`, `find`) và **đọc, tạo, sửa, di chuyển, xóa file** trong workspace dự án, trong khi chặn cứng (`forbidden`) lệnh ransomware/hệ thống/ACL và khóa **`Static-Analysis-Only`** (chỉ cấm thực thi file mẫu/payload bên thứ 3, không bao giờ cản trở thao tác sửa/xóa code bình thường). |
+| **4. Máy chỉ có 1 ổ `C:\`, cấu hình khác nhau hoặc dùng Codex bản `npm`/standalone** | Các script cứng đường dẫn `D:\`, `E:\` hay ghi đè mất cấu hình cũ trong `config.toml` sẽ lỗi trên máy khác. | Tự dò thực tế mọi nguồn cài đặt (`WindowsApps`, `PATH`, `npm`, `-CodexPath`), tự dò feature flags bằng `codex features list`, **merge `config.toml` không phá hủy** (giữ nguyên `[mcp_servers]`, `[tui]`, `[plugins]` cũ), tự kiểm tra ổ đĩa NTFS & dung lượng trống. |
+| **5. Dự án Rust bị kẹt `Blocking waiting for file lock` khi 2 agent cùng test** | Hai agent cùng chạy `cargo test` tranh nhau khóa `target/.cargo-lock`. | Tự tách `CARGO_TARGET_DIR` riêng cho Luồng 2 (mặc định `%TEMP%\codex-lane2-target` trên Windows hoặc `${TMPDIR:-/tmp}/codex-lane2-target` trên Unix, tùy chỉnh qua `-CargoTargetDir` / `CODEX_CARGO_TARGET_DIR`) $\rightarrow$ biên dịch song song không khóa nhau. |
+| **6. Dùng CLI từ Windows Desktop gặp lỗi `--no-daemon`, mất task ghim (`Pinned`), hoặc lo rủi ro lộ API key** | Báo lỗi `this CLI has no complete local package`, mất danh sách `Pinned` khi DB mới chưa có dòng `threads`, hoặc lộ API key trong `config.toml`. | Tự động tắt `daemon_auto_start = false` khi có hỗ trợ, kèm `sync-sessions.py` thực hiện **UPSERT (`INSERT` + `UPDATE`)** theo schema động (đọc nguồn chỉ-đọc `?mode=ro`), dùng `env_key` để **không bao giờ lưu plaintext API key vào `config.toml`**, mặc định `approval_policy = "on-request"`, và phòng thủ 4 lớp (`workspace-write` + `network_access = false`, lọc `*KEY*/*TOKEN*` & khóa ACL/chmod, `default.rules`, `AGENTS.md`). |
 
 ---
 
@@ -21,16 +22,16 @@
 
 ```mermaid
 flowchart LR
-    subgraph L1["LUỒNG 1 (~/.codex) — Desktop App / codex-t3"]
-        A1["config.toml & auth.json riêng<br/>(Cổng phụ hoặc API riêng)"]
+    subgraph L1["LUỒNG 1 (~/.codex) — Codex Desktop (Tài khoản chính / acc chính — Toàn quyền như trước)"]
+        A1["config.toml & auth.json gốc được giữ nguyên<br/>(Toàn quyền mặc định của Codex Desktop)"]
         B1["Build Cargo: target/ mặc định"]
-        C1["Chỉ GHI vào vùng sở hữu của Luồng 1"]
+        C1["Toàn quyền nắm cây thư mục, Đọc/Ghi/Sửa/Xóa,<br/>Build & Test trên toàn bộ dự án"]
     end
 
-    subgraph L2["LUỒNG 2 (~/.codex-official) — Lệnh codex (Chính chủ)"]
-        A2["config.toml & auth.json riêng<br/>(Tài khoản ChatGPT / OpenAI chính chủ)"]
+    subgraph L2["LUỒNG 2 (~/.codex-official) — Codex CLI (codex / codex-official)"]
+        A2["config.toml & auth.json riêng<br/>(Hỗ trợ CẢ Login OAuth lẫn API Key / env_key)"]
         B2["Build Cargo: CARGO_TARGET_DIR riêng"]
-        C2["Chỉ GHI vào vùng sở hữu của Luồng 2"]
+        C2["Nắm toàn bộ cây thư mục & Full File CRUD<br/>trong vùng sở hữu Luồng 2"]
     end
 
     subgraph SHARED["PHẦN DÙNG CHUNG (NTFS Junction / Symlink + Bridge)"]
@@ -52,14 +53,15 @@ flowchart LR
   * Không hardcode model hay `service_tier` vào `config.toml` trừ khi bạn truyền `-OfficialModel` / `-OfficialServiceTier` — tránh lỗi trên tài khoản không có model đó.
   * Tự chạy `codex features list` thật để chỉ bật các flag mà phiên bản Codex trên máy bạn thực sự hỗ trợ.
   * `sync-sessions.py` tự dò tệp `state_*.sqlite` và `goals_*.sqlite` mới nhất + đọc cột thật qua `PRAGMA table_info`, tương thích ngược/xuôi khi Codex nâng cấp database.
-* **An toàn tuyệt đối khi chạy thử, ngắt giữa chừng & khôi phục:** Luôn sao lưu bản gốc có dấu thời gian (`.backup-yyyyMMdd-HHmmss`) kèm **nhật ký rollback tăng dần chống crash (Crash-Safe Incremental Rollback Journal)** (`.rollback/latest.json` với `Completed: false -> true` trên Windows / `.rollback/latest.tsv` với `# status=in-progress -> complete` trên Unix) được ghi nguyên tử ngay sau từng thay đổi — nên ngay cả khi cài đặt bị ngắt giữa chừng (`Ctrl+C`/lỗi), `restore-original.ps1` / `restore-original.sh` vẫn khôi phục chính xác từng byte (SHA-256 + chế độ POSIX trên Unix), bảo toàn launcher cũ chưa kịp chạm tới và không làm mất dữ liệu Luồng 1. Luôn giữ lại toàn bộ `[projects]` đã `trusted` và các mục `[mcp_servers.*]`/`[tui]`/`[plugins.*]`, hỗ trợ **`-DryRun`** / **`-WhatIf`** (Windows) và **`--dry-run`** (Unix) không sửa 1 byte nào trên đĩa, và đã kiểm chứng qua **vòng lặp cài đặt + khôi phục 3 lần liên tiếp** với 0 tệp rác.
+* **Codex Desktop (`~/.codex`, Luồng 1) giữ toàn quyền như trước & Toàn quyền Nắm bắt Cây Thư mục / Thao tác File CRUD trong Workspace:** Mặc định (và khi dùng `-GatewayTargetLane Lane2` / `--gateway-target-lane lane2`), tệp `~/.codex/config.toml` của **Codex Desktop (Tài khoản chính / `acc chính`) được giữ nguyên 100%** (ngay cả khi cấu hình `-ConfigureGateway` cho `Lane1` hoặc `Both`, bộ kit cũng không bao giờ ép `sandbox_mode` hạn chế hay `network_access = false` vào `~/.codex/config.toml`), đảm bảo Codex Desktop giữ **toàn quyền như trước** trên toàn bộ dự án (chỉ phân chia phạm vi thư mục nếu bạn chủ động khai báo nhiệm vụ chia đôi trong `DUAL_LANE_BRIDGE.md`). Đồng thời trên cả 2 luồng, bên trong thư mục dự án (`workspace-write`), agent hoàn toàn tự do duyệt và nắm toàn bộ cây thư mục (`rg --files`, `git status`, `Get-ChildItem`, `find`) cũng như **đọc, ghi, tạo mới, chỉnh sửa, di chuyển, xóa file dự án, build và chạy test** (`apply_patch`, `Set-Content`, `Remove-Item`, `rm`, `mv`, `cp`, `mkdir`). Các lớp khóa chỉ chặn lệnh phá hủy hệ thống/ransomware/sửa ACL (`vssadmin`, `bcdedit`, `icacls`, `schtasks`), chặn thoát ra ngoài workspace và áp dụng `Static-Analysis-Only` đối với việc **thực thi/kích nổ file mẫu mã độc hoặc payload bên thứ 3**.
+* **An toàn tuyệt đối khi chạy thử, ngắt giữa chừng & khôi phục (v1.3.1):** Luôn sao lưu bản gốc có dấu thời gian (`.backup-yyyyMMdd-HHmmss`) kèm **nhật ký rollback tăng dần chống crash (Crash-Safe Incremental Rollback Journal)** (`.rollback/latest.json` với `Completed: false -> true` trên Windows / `.rollback/latest.tsv` với `# status=in-progress -> complete` trên Unix) được ghi nguyên tử ngay sau từng thay đổi. Đặc biệt từ v1.3.1, rollback ghi nhận chính xác quyền sở hữu (`SharedLinkRecords` / `L` rows): **bảo toàn nguyên vẹn symlink/Junction có từ trước của người dùng** (chỉ gỡ liên kết do kit tạo ra), **khôi phục thư mục từ đúng đường dẫn sao lưu ghi trong manifest** (không đoán mò theo sắp xếp tên wildcard `.backup-*`), và **kiểm tra tiền trạm (preflight) fail-closed nghiêm ngặt** (nếu thiếu bản sao lưu và đích chưa ở trạng thái gốc, script lập tức dừng với mã lỗi `1` trước khi gỡ bất kỳ Junction nào hay đụng vào ổ đĩa). Ngay cả khi cài đặt bị ngắt giữa chừng (`Ctrl+C`/lỗi), `restore-original.ps1` / `restore-original.sh` vẫn khôi phục chính xác từng byte (SHA-256 + chế độ POSIX trên Unix), bảo toàn launcher cũ chưa kịp chạm tới và không làm mất dữ liệu Luồng 1. Luôn giữ lại toàn bộ `[projects]` đã `trusted` và các mục `[mcp_servers.*]`/`[tui]`/`[plugins.*]`, hỗ trợ **`-DryRun`** / **`-WhatIf`** (Windows) và **`--dry-run`** (Unix) không sửa 1 byte nào trên đĩa, và đã kiểm chứng qua **vòng lặp cài đặt + khôi phục 3 lần liên tiếp** với 0 tệp rác.
 * **Chuẩn hóa đường dẫn 8.3 ngắn trên Windows (`RUNNER~1` / `PROGRA~1`):** Toàn bộ script PowerShell, wrapper `.cmd` sinh ra (so khớp đồng thời đường dẫn dài chuẩn và `%%~fs`) và bộ test đều chuẩn hóa bằng Win32 `GetLongPathNameW`, đảm bảo định tuyến worktree, chặn `-C`/`--cd`/`--add-dir` và kiểm tra containment luôn khớp nhất quán khi `%TEMP%` hoặc `cwd` dùng tên ngắn 8.3 (vd trên Windows CI `RUNNER~1`).
 * **Minh bạch giới hạn OS / Codex runtime (đọc kỹ [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md)):**
   * **Windows NTFS ACL & giới hạn không thể chặn từ bên ngoài khi Codex tự ghi đè file:** Thư mục `~/.codex*` trên Windows có thể mang quyền kế thừa `CodexSandboxUsers:(OI)(CI)(RX)`. Bộ cài chạy quy trình **`icacls.exe` 2 bước fail-closed** (`/inheritance:d` rồi `/remove:g "CodexSandboxUsers"`) lên `auth.json`, `config.toml`, bản sao lưu và manifest `.rollback/` (đã kiểm chứng thực tế trên `codex-cli 0.171.0-alpha.13` với Win32 `AuthzAccessCheck`: quyền đọc của danh tính elevated `CodexSandboxOffline` chuyển từ `Error=0` sang `Error=5 [ERROR_ACCESS_DENIED]`). Tuy nhiên, **script bên ngoài không thể ngăn chính Codex CLI/Desktop** khi nó ghi lại `config.toml` (đã xác nhận thực nghiệm với `codex features enable/disable`: `AreAccessRulesProtected` bị reset về `False` và `CodexSandboxUsers:(RX)` quay lại cho tới khi chạy `setup-dual-lane.ps1 -ReapplyAclOnly`), đồng thời backend Windows sandbox không nâng quyền (unelevated write-restricted token) khóa ghi cứng nhưng vẫn chạy dưới SID của user hiện tại nên không chặn được thao tác đọc tệp thuộc chính user. Hãy chạy `-ReapplyAclOnly` + `doctor.ps1` sau mỗi lần đổi Settings Codex.
   * **Khuyến nghị vệ sinh secret mạnh nhất:** Kết hợp **`cli_auth_credentials_store = "keyring"`** (khi phiên bản Codex của bạn hỗ trợ) để lưu OAuth token trong OS Keyring thay vì `auth.json` dạng văn bản, cùng **`env_key`** (không bao giờ lưu plaintext API key trong `config.toml`) để ngay cả khi DACL của `config.toml` bị reset hoặc chạy ở chế độ sandbox không nâng quyền cũng không lộ khóa.
   * **Ranh giới `execpolicy`, Hard Fail-Closed Worktree & phạm vi CI vs. Codex thật:**
     * `default.rules` kiểm khớp tiền tố lệnh trực tiếp (`argv[0]`, đã kiểm chứng sống **13/13** probe trên `codex-cli 0.171.0-alpha.13`), không phân tích hết chuỗi lồng trong `powershell -Command "..."` — vì vậy luôn giữ đủ 4 lớp phòng thủ.
-    * Khi dùng `-UseGitWorktree` / `--use-git-worktree`, wrapper Luồng 2 (`codex`, `codex-official`) cưỡng chế **ranh giới worktree fail-closed cứng**: tự động chuyển `cwd` từ thư mục gốc dự án **và mọi thư mục con bên trong** sang thư mục tương ứng trong worktree, hậu kiểm `cwd` sau khi `cd`, và **từ chối chạy (`exit 1`, không khởi chạy `codex`)** nếu thư mục worktree bị xóa/thiếu/bị thay bằng tệp thường/symlink hoặc lệnh `cd` thất bại — **tuyệt đối không âm thầm fallback về repo chính**. Đồng thời Guard 2 luôn chặn mọi biến thể `-C`, `-C=`, `-C<path>`, `--cd`, `--cd=`, `--add-dir`, `--add-dir=` trỏ ngược về repo chính (kể cả qua đường dẫn 8.3 ngắn). Chỉ khi đặt `CODEX_NO_AUTO_WORKTREE_CD=1` mới tắt bước tự động `cd`, trong khi Guard 2 chặn đối số vẫn luôn bật fail-closed.
+    * Khi dùng `-UseGitWorktree` / `--use-git-worktree`, wrapper Luồng 2 (`codex`, `codex-official`) cưỡng chế **ranh giới worktree fail-closed cứng**: tự động chuyển `cwd` từ thư mục gốc dự án **và mọi thư mục con bên trong** sang thư mục tương ứng trong worktree, hậu kiểm `cwd` sau khi `cd`, và **từ chối chạy (`exit 1`, không khởi chạy `codex`)** nếu thư mục worktree bị xóa/thiếu/bị thay bằng tệp thường/symlink hoặc lệnh `cd` thất bại — **tuyệt đối không âm thầm fallback về repo chính**. Đồng thời Guard 2 luôn chặn mọi biến thể `-C`, `-C=`, `-C<path>`, `--cd`, `--cd=`, `--add-dir`, `--add-dir=` trỏ ngược về repo chính (kể cả qua đường dẫn 8.3 ngắn). Chỉ khi đặt `CODEX_NO_AUTO_WORKTREE_CD=1` mới tắt bước tự động `cd` (phục vụ mục đích kiểm thử hoặc khi người dùng chủ động điều khiển thư mục làm việc), trong khi Guard 2 chặn đối số truy cập repo chính vẫn luôn hoạt động fail-closed.
     * CI GitHub Actions (4 job: `hygiene-and-policy`, Windows PS 5.1 & 7+, Ubuntu, macOS) kiểm chứng cú pháp, tường lửa, fail-closed worktree, bảo toàn chế độ POSIX (`original_mode`), chống path traversal/SUID, khôi phục cài đặt bị ngắt giữa chừng và vòng lặp 3x install/rollback trên mock CLI; kết quả kiểm chứng trực tiếp trên **`codex-cli 0.171.0-alpha.13` thật** (bao gồm sandbox write boundary, atomic DACL reset & `AuthzAccessCheck`) được ghi nhận đầy đủ tại [docs/REAL_CODEX_CHECKLIST.md](docs/REAL_CODEX_CHECKLIST.md).
 
 ---
@@ -69,7 +71,7 @@ flowchart LR
 ```text
 codex-dual-lane-kit/
 ├── README.md                     # Hướng dẫn tổng hợp (tệp bạn đang đọc)
-├── CHANGELOG.md                  # Lịch sử phát hành & thay đổi (v1.0.0 -> v1.3.0)
+├── CHANGELOG.md                  # Lịch sử phát hành & thay đổi (v1.0.0 -> v1.3.1)
 ├── LICENSE                       # Giấy phép Apache License 2.0
 ├── NOTICE                        # Khai báo bản quyền tác giả (Apache-2.0)
 ├── SECURITY.md                   # Chính sách bảo mật & báo cáo lỗ hổng (tab Security trên GitHub)
@@ -91,7 +93,7 @@ codex-dual-lane-kit/
 │   └── DUAL_LANE_BRIDGE.md       # Mẫu cầu nối giao tiếp 2 luồng cho bất kỳ dự án nào
 ├── tests/
 │   ├── test_sync_sessions.py     # Unit test kiểm chứng UPSERT, ?mode=ro, atomic JSONL, --pinned-only & --dry-run
-│   └── test-kit.ps1              # Bộ test PowerShell 10 pha: AST, -DryRun, TOML, env_key, ACL, 8.3, fail-closed worktree, interrupted rollback & 3x loop
+│   └── test-kit.ps1              # Bộ test PowerShell 11 pha: AST, -DryRun, TOML, env_key, ACL, 8.3, fail-closed worktree, interrupted rollback, 3x loop & pre-existing link/exact backup/preflight
 └── docs/
     ├── GUIDE_AND_MANIFEST.md     # Hướng dẫn chi tiết, khai báo từng tệp/hàm/tham số & cách gỡ an toàn
     ├── REAL_CODEX_CHECKLIST.md   # Danh sách kiểm chứng thực tế & bằng chứng đo trực tiếp trên codex-cli thật
@@ -133,34 +135,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps
     -InstallBridgeTemplate
 ```
 
-#### Kịch bản C: Có thêm cổng API trung gian (bên thứ 3) cho Luồng 1 *(Không lưu key vào `config.toml` hay lịch sử lệnh)*
-> **Bảo mật:** Dùng `-PromptGatewayApiKey` để nhập ẩn key vào biến môi trường User (`env_key = "CODEX_GATEWAY_API_KEY"`), tuyệt đối không ghi plaintext API key vào `config.toml` hay các tệp `.backup-*`:
+#### Kịch bản C: Giữ Codex Desktop (`~/.codex`, Luồng 1) cho Tài khoản chính (`acc chính`) và cấu hình API Key / Gateway cho Codex CLI (`~/.codex-official`, Luồng 2) *(Không lưu key vào `config.toml` hay lịch sử lệnh)*
+> **Bảo mật & Linh hoạt (`-GatewayTargetLane Lane2|Lane1|Both`):** Tham số `-GatewayTargetLane` cho phép bạn gắn API key (`env_key`) vào **Luồng 2 (`Lane2` — Codex CLI)**, **Luồng 1 (`Lane1` — Desktop / `codex-t3`)**, hoặc **cả hai (`Both`)**. Dùng `-PromptGatewayApiKey` để nhập ẩn key vào biến môi trường User (`env_key = "CODEX_CLI_API_KEY"`), tuyệt đối không ghi plaintext API key vào `config.toml` hay các tệp `.backup-*`:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 `
     -RepoPath "C:\Projects\my-app" `
     -ConfigureGateway `
-    -GatewayBaseUrl "https://<cong-api-cua-ban>/v1" `
+    -GatewayTargetLane Lane2 `
+    -GatewayBaseUrl "https://<cong-api-hoac-openai-endpoint>/v1" `
     -GatewayModel "<ten-model>" `
-    -GatewayApiKeyEnv "CODEX_GATEWAY_API_KEY" `
+    -GatewayApiKeyEnv "CODEX_CLI_API_KEY" `
     -PromptGatewayApiKey `
     -InstallBridgeTemplate
 ```
+*(Nếu muốn gắn cổng phụ cho Luồng 1 Desktop/codex-t3 để giữ Luồng 2 thuần OAuth, đổi thành `-GatewayTargetLane Lane1` hoặc bỏ qua `-GatewayTargetLane`; nếu ổ `C:\` ít dung lượng trống và máy có ổ khác cho dự án Rust, thêm `-CargoTargetDir "D:\codex-lane2-target"`).*
 
-*(Nếu ổ `C:\` của bạn ít dung lượng trống và máy có ổ khác cho dự án Rust, thêm tham số `-CargoTargetDir "D:\codex-lane2-target"`).*
-
-### Bước 2 — Đăng nhập tài khoản OpenAI / ChatGPT chính chủ cho Luồng 2 (1 lần duy nhất)
-```powershell
-codex login
-codex login status   # Kỳ vọng: Logged in using ChatGPT
-```
+### Bước 2 — Xác thực cho Codex CLI Luồng 2 (Hỗ trợ CẢ Đăng nhập OAuth LẪN API Key)
+* **Cách 1 — Đăng nhập tài khoản ChatGPT / OpenAI OAuth (`auth.json` / `keyring`):**
+  ```powershell
+  codex login
+  codex login status   # Kỳ vọng: Logged in using ChatGPT (hoặc kết hợp song song với env_key của Kịch bản C)
+  ```
+* **Cách 2 — Đăng nhập trực tiếp bằng OpenAI API Key chuẩn (hoặc dùng `env_key` đã cài ở Kịch bản C):**
+  ```powershell
+  # Nếu đã chạy Kịch bản C (-GatewayTargetLane Lane2), Codex CLI tự đọc biến môi trường env_key (vd CODEX_CLI_API_KEY).
+  # Hoặc nạp trực tiếp vào trình quản lý đăng nhập của Codex CLI:
+  $env:OPENAI_API_KEY | codex login --with-api-key
+  ```
 
 ### Bước 3 — Kiểm tra sức khỏe toàn hệ thống bằng `doctor.ps1` & bắt đầu chạy
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\doctor.ps1
 ```
 Sau khi toàn bộ mục báo `[PASS]`:
-* **Luồng 1:** Mở **Codex Desktop App** *(hoặc gõ `codex-t3` trên Terminal)*.
-* **Luồng 2 (Chính chủ):** Mở PowerShell trong thư mục dự án và gõ `codex` *(hoặc `codex resume` để mở lại phiên đã ghim)*.
+* **Luồng 1 (Tài khoản chính / `acc chính`):** Mở **Codex Desktop App** *(hoặc gõ `codex-t3` trên Terminal)*.
+* **Luồng 2 (Codex CLI — Login & API Key):** Mở PowerShell trong thư mục dự án và gõ `codex` *(hoặc `codex resume` để mở lại phiên đã ghim)*.
 
 ---
 
@@ -170,9 +179,15 @@ git clone https://github.com/h01n9N90c/codex-cli-desktop.git
 cd codex-cli-desktop
 chmod +x ./scripts/setup-dual-lane.sh ./scripts/doctor.sh ./scripts/restore-original.sh
 ./scripts/setup-dual-lane.sh --repo /path/to/your-project --dry-run
+# Cài mặc định (Desktop ~/.codex = acc chính; CLI ~/.codex-official = OAuth login / API key):
 ./scripts/setup-dual-lane.sh --repo /path/to/your-project --install-bridge
+# Hoặc cấu hình thêm API key / gateway (env_key) cho Codex CLI Luồng 2 (--gateway-target-lane lane2|lane1|both):
+./scripts/setup-dual-lane.sh --repo /path/to/your-project \
+    --configure-gateway --gateway-target-lane lane2 \
+    --gateway-base-url "https://<cong-api-cua-ban>/v1" \
+    --gateway-api-key-env CODEX_CLI_API_KEY --install-bridge
 ./scripts/doctor.sh
-codex login
+codex login   # Hoặc: printenv OPENAI_API_KEY | codex login --with-api-key (hay dùng env_key ở trên)
 codex
 ```
 *(Khôi phục an toàn bất cứ lúc nào: `./scripts/restore-original.sh --dry-run` rồi `./scripts/restore-original.sh --remove-lane2-home`.)*
@@ -188,8 +203,8 @@ codex
 | Xem trước khôi phục chính xác về trạng thái gốc (`-DryRun`) | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1 -DryRun` *(Unix: `./scripts/restore-original.sh --dry-run`)* |
 | Khôi phục chính xác 100% về trạng thái trước khi cài (kèm kiểm chứng SHA-256) | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1` *(Unix: `./scripts/restore-original.sh`)* |
 | Chạy toàn bộ Unit Test, Smoke Test & Rollback Test của bộ kit | `powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1` *(Python: `python -m unittest discover -s .\tests -v`)* |
-| Chạy Codex CLI bằng **tài khoản OpenAI chính chủ (Luồng 2)** | `codex` *(hoặc `codex-official`)* |
-| Chạy Codex CLI bằng **cấu hình Desktop / Gateway (Luồng 1)** | `codex-t3` |
+| Chạy Codex CLI ở **Luồng 2 (`~/.codex-official` — hỗ trợ CẢ Login OAuth lẫn API Key)** | `codex` *(hoặc `codex-official`)* |
+| Chạy Codex CLI ở **Luồng 1 (`~/.codex` — cấu hình Codex Desktop / Tài khoản chính `acc chính`)** | `codex-t3` |
 | Đổi model ngay trong khung chat TUI | Gõ `/model` |
 | Mở CLI với một model cụ thể | `codex -m <model-slug>` |
 | Mở lại phiên cũ / phiên đã ghim | `codex resume` *(hoặc `codex resume --all`)* |

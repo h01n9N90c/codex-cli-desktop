@@ -254,6 +254,34 @@ function Get-SafeAuthMode([string]$AuthJsonPath, [string]$MissingLabel) {
     }
 }
 
+function Get-SafeConfigEnvKey([string]$ConfigPath) {
+    <#
+    .SYNOPSIS
+        Safely extracts ONLY a validated environment variable identifier from `env_key = "<VAR>"`
+        inside config.toml.
+        WHY: Allows doctor.ps1 to report whether a lane is configured for API key authentication via
+        `env_key` (either alongside or instead of `auth.json` OAuth login) without ever echoing a
+        secret or non-identifier string.
+    #>
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        return ''
+    }
+    try {
+        $raw = [string](Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop)
+        foreach ($line in ($raw -split "\r?\n")) {
+            if ($line -match '^\s*#') { continue }
+            if ($line -match '^\s*env_key\s*=\s*["'']([^"'']+)["'']') {
+                $candidate = $Matches[1].Trim()
+                if ($candidate -notmatch '^(sk-|eyJ|Bearer|ghp_|gho_|xox)' -and $candidate -match '^[A-Za-z_][A-Za-z0-9_]{1,63}$') {
+                    return $candidate
+                }
+                return 'redacted-env-key'
+            }
+        }
+    } catch {}
+    return ''
+}
+
 function Remove-TomlInlineComment([string]$Line) {
     <#
     .SYNOPSIS
@@ -609,7 +637,7 @@ foreach ($pair in @(@('Lane 1', $Lane1Home), @('Lane 2', $Lane2Home))) {
         }
     }
 
-    if ($hasRules -and $hasAgents -and $hasConfig) {
+    if ($hasRules -and $hasAgents -and ($hasConfig -or $label -eq 'Lane 1')) {
         $agentsText     = [string](Get-Content -LiteralPath $agentsPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
         $staticAgentsOk = ($agentsText -match 'Static-Analysis-Only')
         $cfgGuardrails  = Inspect-CodexConfigGuardrails -ConfigText $cfgText
@@ -643,6 +671,8 @@ foreach ($pair in @(@('Lane 1', $Lane1Home), @('Lane 2', $Lane2Home))) {
             Report 'FAIL' "$label Guardrails" "RULE BYPASS: $probesBypassed/$($probeCmds.Count) forbidden probe(s) NOT blocked | $netLabel | $envLabel"
         } elseif ($staticAgentsOk -and $envFilterOk -and $probesPassed -eq $probeCmds.Count) {
             Report 'PASS' "$label Guardrails" "config + AGENTS.md | engine_probe=$probesPassed/$($probeCmds.Count) forbidden | $netLabel | $envLabel"
+        } elseif ($label -eq 'Lane 1' -and $staticAgentsOk -and $probesPassed -eq $probeCmds.Count) {
+            Report 'PASS' "$label Guardrails" "desktop_config=untouched(full-authority) + AGENTS.md | engine_probe=$probesPassed/$($probeCmds.Count) forbidden"
         } elseif (-not $probeExe -or $probeEvaluated -eq 0) {
             $reason = if (-not $probeExe) { 'no codex binary' } else { 'engine_probe=0/' + $probeCmds.Count }
             Report 'WARN' "$label Guardrails" "config + AGENTS.md present (static_only=$staticAgentsOk); live probe skipped ($reason) | $netLabel | $envLabel"
@@ -672,6 +702,14 @@ $a1 = Join-Path $Lane1Home 'auth.json'
 $a2 = Join-Path $Lane2Home 'auth.json'
 $m1 = Get-SafeAuthMode -AuthJsonPath $a1 -MissingLabel 'not-configured'
 $m2 = Get-SafeAuthMode -AuthJsonPath $a2 -MissingLabel 'not-logged-in'
+$ek1 = Get-SafeConfigEnvKey -ConfigPath (Join-Path $Lane1Home 'config.toml')
+$ek2 = Get-SafeConfigEnvKey -ConfigPath (Join-Path $Lane2Home 'config.toml')
+if ($ek1) {
+    $m1 = if ($m1 -eq 'not-configured') { "env_key($ek1)" } else { "$m1+env_key($ek1)" }
+}
+if ($ek2) {
+    $m2 = if ($m2 -eq 'not-logged-in') { "env_key($ek2)" } else { "$m2+env_key($ek2)" }
+}
 
 # Inspect sensitive files for exposed CodexSandboxUsers ALLOW ACEs (ignoring protective DENY ACEs!)
 # and check whether NTFS inheritance has been broken (/inheritance:d -> AreAccessRulesProtected=$true).
@@ -681,6 +719,7 @@ $sensitiveChecks = @(
     @{ Name = 'Lane1/config.backup';     Path = (Join-Path $Lane1Home 'config.backup.toml') },
     @{ Name = 'Lane2/auth.json';         Path = $a2 },
     @{ Name = 'Lane2/config.toml';       Path = (Join-Path $Lane2Home 'config.toml') },
+    @{ Name = 'Lane2/config.backup';     Path = (Join-Path $Lane2Home 'config.backup.toml') },
     @{ Name = 'Lane2/.rollback/latest';  Path = (Join-Path $Lane2Home '.rollback\latest.json') }
 )
 
@@ -715,7 +754,7 @@ $aclLabel = if ($sandboxAllowCount -eq 0) {
     "kernel_acl=EXPOSED($sandboxAllowCount Allow ACEs on $($exposedFiles -join ', '); re-run setup-dual-lane.ps1 or two-step icacls)"
 }
 
-if ($m2 -ne 'not-logged-in' -and $m2 -ne 'unreadable' -and $sandboxAllowCount -eq 0) {
+if ($m2 -ne 'not-logged-in' -and $m2 -notmatch '^unreadable' -and $sandboxAllowCount -eq 0) {
     Report 'PASS' 'Auth & ACL Isolation' "Lane 1=$m1 | Lane 2=$m2 | $aclLabel"
 } else {
     Report 'WARN' 'Auth & ACL Isolation' "Lane 1=$m1 | Lane 2=$m2 | $aclLabel"

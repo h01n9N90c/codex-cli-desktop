@@ -582,6 +582,8 @@ theme = "light"
     Assert-True ($merged1 -notmatch 'experimental_bearer_token') 'Lane 1 config.toml must NEVER contain experimental_bearer_token'
     Assert-True ($merged1 -notmatch [regex]::Escape($legacyTokenCanary)) 'Legacy plaintext token leaked into merged Lane 1 config.toml'
     Assert-True ($merged1 -match '\[tui\]') 'Custom Lane 1 [tui] section was lost during gateway merge'
+    Assert-True ($merged1 -notmatch '(?m)^\s*sandbox_mode\s*=') 'Lane 1 Desktop config.toml must NEVER have restrictive sandbox_mode injected'
+    Assert-True ($merged1 -notmatch '(?m)^\s*network_access\s*=\s*false') 'Lane 1 Desktop config.toml must NEVER have network_access = false injected'
 
     # Verify UTF-8 NO-BOM on generated config.toml in both lanes.
     foreach ($cfgFile in @((Join-Path $l1 'config.toml'), (Join-Path $l2 'config.toml'))) {
@@ -1309,7 +1311,339 @@ theme = "light"
         Remove-TempTreeSafely -RootDir $null -Lane2Dir $loopL2
     }
 
-    Write-Host "`n[PASS] All 10 Windows test stages passed cleanly (AST, Python, default.rules, DryRun/WhatIf, TOML/env_key/ACL/8.3/fail-closed worktree, doctor, traversal defense, SHA-256 rollback, interrupted recovery, and 3x install/rollback loop)!" -ForegroundColor Green
+    # ========================================================================
+    # TEST 11: Pre-Existing Link Preservation, Exact Dir-Backup Restore & Fail-Closed Missing-Backup Preflight
+    # WHAT: Verifies v1.3.1 rollback invariants:
+    #   11a) Pre-existing user NTFS Junction (`Lane2\skills`) is recorded with CreatedByKit=$false and preserved on rollback.
+    #   11b) Missing file backup fails closed in Preflight (exit != 0) with ZERO disk side effects (no Junction detached).
+    #   11c) Missing dir backup fails closed in Preflight (exit != 0) with ZERO disk side effects (no Junction detached).
+    #   11d) Exact manifest BackupDirPath is restored even when a decoy newer `memories.backup-99999999-999999` exists,
+    #        and a 2nd idempotent restore exits 0 cleanly.
+    # ========================================================================
+    Write-Host "`n=== 11. Pre-Existing Link Preservation, Exact Dir Backup & Missing-Backup Fail-Closed Preflight ===" -ForegroundColor Cyan
+    $p11L1      = Join-Path $tmpRoot 'p11 lane 1'
+    $p11L2      = Join-Path $tmpRoot 'p11 lane 2'
+    $p11Bin     = Join-Path $tmpRoot 'p11 local bin'
+    $p11Repo    = Join-Path $tmpRoot 'p11 repo'
+    $p11Custom  = Join-Path $tmpRoot 'p11 user custom skills'
+    New-Item -ItemType Directory -Path (Join-Path $p11L1 'sessions'), $p11L2, $p11Bin, $p11Repo, $p11Custom -Force | Out-Null
+    try {
+        [System.IO.File]::WriteAllText((Join-Path $p11Custom 'user_skill.txt'), 'KEEP_USER_SKILLS_LINK', (New-Object System.Text.UTF8Encoding($false)))
+        $p11PreSkillLink = Join-Path $p11L2 'skills'
+        New-Item -ItemType Junction -Path $p11PreSkillLink -Target $p11Custom | Out-Null
+
+        $p11PreMemDir = Join-Path $p11L2 'memories'
+        New-Item -ItemType Directory -Path $p11PreMemDir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $p11PreMemDir 'marker.txt'), 'REAL_ORIGINAL_MEMORIES', (New-Object System.Text.UTF8Encoding($false)))
+
+        # Plant a decoy lexicographically NEWER directory backup to prove rollback uses exact manifest path, not wildcard sort!
+        $p11DecoyMemBkp = Join-Path $p11L2 'memories.backup-99999999-999999'
+        New-Item -ItemType Directory -Path $p11DecoyMemBkp -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $p11DecoyMemBkp 'marker.txt'), 'WRONG_DECOY_BACKUP', (New-Object System.Text.UTF8Encoding($false)))
+
+        $p11Cfg2 = Join-Path $p11L2 'config.toml'
+        [System.IO.File]::WriteAllText($p11Cfg2, "model = `"p11-original`"`r`n", (New-Object System.Text.UTF8Encoding($false)))
+        $p11Cfg2Hash = (Get-FileHash -LiteralPath $p11Cfg2 -Algorithm SHA256).Hash
+
+        $resP11Inst = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
+            '-RepoPath', $p11Repo, '-CodexPath', $fakeExe,
+            '-Lane1Home', $p11L1, '-Lane2Home', $p11L2, '-LocalBin', $p11Bin, '-SkipPathUpdate'
+        )
+        Assert-True ($resP11Inst.ExitCode -eq 0) "Test 11 install failed (exit=$($resP11Inst.ExitCode)):`n$($resP11Inst.Output)"
+
+        $p11Manifest = Get-Content -LiteralPath (Join-Path $p11L2 '.rollback\latest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-True ([int]$p11Manifest.SchemaVersion -ge 2) "Expected SchemaVersion >= 2, got $($p11Manifest.SchemaVersion)"
+        $skillRec = @($p11Manifest.SharedLinkRecords | Where-Object { $_.Name -eq 'skills' }) | Select-Object -First 1
+        $memRec   = @($p11Manifest.SharedLinkRecords | Where-Object { $_.Name -eq 'memories' }) | Select-Object -First 1
+        $cfg2Rec  = @($p11Manifest.Files | Where-Object { ([string]$_.TargetPath) -like '*p11 lane 2\config.toml' }) | Select-Object -First 1
+        Assert-True ($null -ne $skillRec -and -not [bool]$skillRec.CreatedByKit -and $skillRec.PriorState -eq 'preexisting_link') 'Pre-existing skills Junction must be recorded as CreatedByKit=false, PriorState=preexisting_link!'
+        Assert-True ($null -ne $memRec -and [bool]$memRec.CreatedByKit -and $memRec.PriorState -eq 'preexisting_dir' -and -not [string]::IsNullOrWhiteSpace([string]$memRec.BackupDirPath)) 'Pre-existing memories dir must record exact BackupDirPath!'
+        Assert-True ($memRec.BackupDirPath -ne $p11DecoyMemBkp) 'Manifest BackupDirPath must not point to decoy backup!'
+        Assert-True ($null -ne $cfg2Rec -and (Test-Path -LiteralPath $cfg2Rec.BackupPath -PathType Leaf)) 'Expected config.toml backup file in manifest!'
+
+        # 11b) Missing FILE backup -> Preflight MUST fail closed (exit != 0) with ZERO disk side effects!
+        $cfg2BkpHold = Join-Path $tmpRoot 'p11-held-cfg2-bkp.toml'
+        Move-Item -LiteralPath $cfg2Rec.BackupPath -Destination $cfg2BkpHold -Force
+        try {
+            $resMissFile = Invoke-PsScript -ScriptPath $RestoreScript -Arguments @(
+                '-Lane1Home', $p11L1, '-Lane2Home', $p11L2, '-LocalBin', $p11Bin, '-SkipPathUpdate'
+            )
+            Assert-True ($resMissFile.ExitCode -ne 0) "Missing file backup MUST fail closed (expected exit != 0, got $($resMissFile.ExitCode)):`n$($resMissFile.Output)"
+            Assert-True ($resMissFile.Output -match 'Preflight failed|missing') "Expected preflight missing-backup error message:`n$($resMissFile.Output)"
+            Assert-True (((Get-Item -LiteralPath (Join-Path $p11L2 'sessions') -Force).LinkType) -eq 'Junction') 'ZERO-SIDE-EFFECT VIOLATION: sessions Junction was detached despite missing file backup!'
+            Assert-True (((Get-Item -LiteralPath $p11PreMemDir -Force).LinkType) -eq 'Junction') 'ZERO-SIDE-EFFECT VIOLATION: memories Junction was detached despite missing file backup!'
+            Assert-True (Test-Path -LiteralPath (Join-Path $p11Bin 'codex.cmd') -PathType Leaf) 'ZERO-SIDE-EFFECT VIOLATION: codex.cmd removed despite missing file backup!'
+        } finally {
+            Move-Item -LiteralPath $cfg2BkpHold -Destination $cfg2Rec.BackupPath -Force
+        }
+
+        # 11c) Missing DIRECTORY backup -> Preflight MUST fail closed (exit != 0) with ZERO disk side effects!
+        $memBkpHold = Join-Path $tmpRoot 'p11-held-mem-bkp-dir'
+        Move-Item -LiteralPath $memRec.BackupDirPath -Destination $memBkpHold -Force
+        try {
+            $resMissDir = Invoke-PsScript -ScriptPath $RestoreScript -Arguments @(
+                '-Lane1Home', $p11L1, '-Lane2Home', $p11L2, '-LocalBin', $p11Bin, '-SkipPathUpdate'
+            )
+            Assert-True ($resMissDir.ExitCode -ne 0) "Missing directory backup MUST fail closed (expected exit != 0, got $($resMissDir.ExitCode)):`n$($resMissDir.Output)"
+            Assert-True ($resMissDir.Output -match 'Preflight failed|missing') "Expected preflight missing-dir-backup error message:`n$($resMissDir.Output)"
+            Assert-True (((Get-Item -LiteralPath (Join-Path $p11L2 'sessions') -Force).LinkType) -eq 'Junction') 'ZERO-SIDE-EFFECT VIOLATION: sessions Junction was detached despite missing dir backup!'
+            Assert-True (Test-Path -LiteralPath (Join-Path $p11Bin 'codex.cmd') -PathType Leaf) 'ZERO-SIDE-EFFECT VIOLATION: codex.cmd removed despite missing dir backup!'
+        } finally {
+            Move-Item -LiteralPath $memBkpHold -Destination $memRec.BackupDirPath -Force
+        }
+
+        # 11d) Full rollback: preserves pre-existing skills Junction, restores exact memories dir (ignoring decoy),
+        #      detaches kit-created Junctions, and supports idempotent 2nd restore cleanly!
+        $resP11Rest = Invoke-PsScript -ScriptPath $RestoreScript -Arguments @(
+            '-Lane1Home', $p11L1, '-Lane2Home', $p11L2, '-LocalBin', $p11Bin, '-SkipPathUpdate'
+        )
+        Assert-True ($resP11Rest.ExitCode -eq 0) "Test 11 rollback failed (exit=$($resP11Rest.ExitCode)):`n$($resP11Rest.Output)"
+
+        $postSkillItem = Get-Item -LiteralPath $p11PreSkillLink -Force
+        Assert-True ($postSkillItem.LinkType -eq 'Junction') 'REGRESSION: Rollback detached pre-existing user skills Junction!'
+        Assert-True (Test-Path -LiteralPath (Join-Path $p11PreSkillLink 'user_skill.txt') -PathType Leaf) 'Pre-existing skills Junction target broken after rollback!'
+
+        foreach ($d in @('memories_v2', 'sessions', 'archived_sessions', 'plugins')) {
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $p11L2 $d))) "Kit-created Junction Lane2\$d was not detached on rollback!"
+        }
+
+        $postMemItem = Get-Item -LiteralPath $p11PreMemDir -Force
+        Assert-True (($postMemItem.Attributes -band [System.IO.FileAttributes]::Directory) -and -not ($postMemItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) 'memories was not restored to a real directory!'
+        $restoredMarker = [System.IO.File]::ReadAllText((Join-Path $p11PreMemDir 'marker.txt')).Trim()
+        Assert-True ($restoredMarker -eq 'REAL_ORIGINAL_MEMORIES') "WRONG DIR BACKUP RESTORED! Expected 'REAL_ORIGINAL_MEMORIES', got '$restoredMarker'"
+        Assert-True (Test-Path -LiteralPath (Join-Path $p11DecoyMemBkp 'marker.txt') -PathType Leaf) 'Decoy backup directory should remain untouched!'
+        Assert-True ((Get-FileHash -LiteralPath $p11Cfg2 -Algorithm SHA256).Hash -eq $p11Cfg2Hash) 'Test 11 config.toml SHA-256 mismatch after rollback!'
+
+        # Idempotent 2nd restore (backups already consumed, targets already at original state) MUST exit 0 cleanly!
+        $resP11Rest2 = Invoke-PsScript -ScriptPath $RestoreScript -Arguments @(
+            '-Lane1Home', $p11L1, '-Lane2Home', $p11L2, '-LocalBin', $p11Bin, '-SkipPathUpdate'
+        )
+        Assert-True ($resP11Rest2.ExitCode -eq 0) "Idempotent 2nd restore failed (exit=$($resP11Rest2.ExitCode)):`n$($resP11Rest2.Output)"
+        Assert-True (((Get-Item -LiteralPath $p11PreSkillLink -Force).LinkType) -eq 'Junction') 'Idempotent 2nd restore detached pre-existing skills Junction!'
+        Write-Host "    [OK] Pre-existing Junction preservation, exact dir backup (decoy-proof), fail-closed missing-backup preflight, and idempotent re-run verified" -ForegroundColor Green
+    } finally {
+        Remove-TempTreeSafely -RootDir $null -Lane2Dir $p11L2
+    }
+
+    # ========================================================================
+    # TEST 12: Desktop Primary Account (Full Authority) + CLI Login & API Key (-GatewayTargetLane Lane2|Both) + Full Workspace File CRUD & Tree Mastery
+    # WHAT: Verifies the v1.3.1 workflow & workspace capabilities:
+    #   12a) Lane 1 (~/.codex, Codex Desktop) remains 100% untouched (full native authority,
+    #        SHA-256 identical) when -ConfigureGateway -GatewayTargetLane 'Lane2' is used, while
+    #        Lane 2 (~/.codex-official, Codex CLI) supports BOTH OAuth Login (auth.json via
+    #        -ShareAuthToLane2 or codex login) AND API Key / Gateway (env_key in config.toml),
+    #        purges legacy plaintext tokens, locks NTFS DACLs, and passes doctor.ps1 in both
+    #        combined (chatgpt+env_key) and API-key-only (env_key) modes.
+    #   12b) Full workspace directory tree traversal and file CRUD (create, read, edit, rename,
+    #        delete) inside the active workspace via codex.cmd, while primary-repo escapes remain
+    #        blocked fail-closed.
+    #   12c) Byte-exact rollback of -GatewayTargetLane 'Lane2' + -ShareAuthToLane2, plus
+    #        verification of -GatewayTargetLane 'Both' (preserving full Desktop authority on Lane 1).
+    # ========================================================================
+    Write-Host "`n=== 12. Desktop Full-Authority Primary Account + CLI Login & API Key (-GatewayTargetLane) + Workspace File CRUD ===" -ForegroundColor Cyan
+    $p12L1   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 lane 1 desktop')
+    $p12L2   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 lane 2 cli')
+    $p12Bin  = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 local bin')
+    $p12Repo = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 repo workspace')
+    New-Item -ItemType Directory -Path (Join-Path $p12L1 'sessions'), $p12L2, $p12Bin, $p12Repo -Force | Out-Null
+    try {
+        # Seed Lane 1 (Codex Desktop = Primary Account / acc chính) with user's custom Desktop config & login.
+        $p12Cfg1 = Join-Path $p12L1 'config.toml'
+        $p12DesktopSeed = @"
+# User Primary Account Desktop Config (must remain 100% untouched by default / Lane2 gateway)
+model = "gpt-5.4"
+
+[tui]
+theme = "solarized"
+"@
+        [System.IO.File]::WriteAllText($p12Cfg1, $p12DesktopSeed, (New-Object System.Text.UTF8Encoding($false)))
+        $p12Cfg1OrigHash = (Get-FileHash -LiteralPath $p12Cfg1 -Algorithm SHA256).Hash
+
+        $p12Auth1 = Join-Path $p12L1 'auth.json'
+        [System.IO.File]::WriteAllText($p12Auth1, $authLane2Json, (New-Object System.Text.UTF8Encoding($false)))
+
+        # Seed Lane 2 (Codex CLI) with a legacy bearer token canary + custom MCP section.
+        $p12Cfg2 = Join-Path $p12L2 'config.toml'
+        $p12CliLegacyCanary = 'sk-CLI-LEGACY-BEARER-MUST-BE-PURGED-998811'
+        $p12CliSeed = @"
+model_provider = "OpenAI"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://old-cli.example.invalid/v1"
+experimental_bearer_token = "$p12CliLegacyCanary"
+
+[mcp_servers.cli_helper]
+command = "node"
+args = ["cli-helper.js"]
+"@
+        [System.IO.File]::WriteAllText($p12Cfg2, $p12CliSeed, (New-Object System.Text.UTF8Encoding($false)))
+        $p12Cfg2OrigHash = (Get-FileHash -LiteralPath $p12Cfg2 -Algorithm SHA256).Hash
+
+        # Initialize p12Repo as a Git repo with nested directory tree for worktree + file CRUD verification.
+        $p12SrcCore  = Join-Path $p12Repo 'src\core'
+        $p12SrcUtils = Join-Path $p12Repo 'src\utils'
+        New-Item -ItemType Directory -Path $p12SrcCore, $p12SrcUtils -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $p12SrcCore 'engine.rs'), "pub fn run() -> i32 { 1 }`n", (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $p12SrcUtils 'helper.rs'), "pub fn help() {}`n", (New-Object System.Text.UTF8Encoding($false)))
+        git -C $p12Repo init -q
+        git -C $p12Repo config user.email 'ci@example.invalid'
+        git -C $p12Repo config user.name 'CI'
+        git -C $p12Repo add .
+        git -C $p12Repo commit -q -m 'init nested workspace tree'
+
+        # Mock codex executable that also supports a 'crud-probe' subcommand to exercise full directory tree
+        # traversal and file create/read/edit/rename/delete inside the active workspace CWD.
+        $p12CrudExe = Join-Path $tmpRoot 'fake-crud-codex.cmd'
+        $p12CrudPs1 = Join-Path $tmpRoot 'fake-crud-worker.ps1'
+        $crudWorkerCode = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$cwd = (Get-Location -PSProvider FileSystem).ProviderPath
+
+# 1. Traverse entire workspace directory tree
+$treeFiles = @(Get-ChildItem -LiteralPath $cwd -Recurse -File | Where-Object { $_.FullName -notlike '*\.git\*' })
+if ($treeFiles.Count -lt 2) { throw "Tree traversal failed: expected >= 2 files, found $($treeFiles.Count)" }
+
+# 2. Read & Edit existing file in nested directory
+$engineFile = Join-Path $cwd 'src\core\engine.rs'
+$origText = [System.IO.File]::ReadAllText($engineFile)
+if ($origText -notmatch 'pub fn run') { throw "Read failed on $engineFile" }
+[System.IO.File]::WriteAllText($engineFile, ($origText + "pub fn edited() -> i32 { 42 }`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+# 3. Create new nested directory and file
+$newDir = Join-Path $cwd 'src\features'
+[void][System.IO.Directory]::CreateDirectory($newDir)
+$newFile = Join-Path $newDir 'created.rs'
+[System.IO.File]::WriteAllText($newFile, "// created by agent`n", (New-Object System.Text.UTF8Encoding($false)))
+
+# 4. Rename/Move a file inside workspace
+$oldHelper = Join-Path $cwd 'src\utils\helper.rs'
+$newHelper = Join-Path $cwd 'src\utils\helper_v2.rs'
+Move-Item -LiteralPath $oldHelper -Destination $newHelper -Force
+
+# 5. Create and Delete a temporary scratch file inside workspace
+$tempScratch = Join-Path $cwd 'src\features\temp_delete_me.txt'
+[System.IO.File]::WriteAllText($tempScratch, 'delete me', (New-Object System.Text.UTF8Encoding($false)))
+Remove-Item -LiteralPath $tempScratch -Force
+if (Test-Path -LiteralPath $tempScratch) { throw "Delete failed on $tempScratch" }
+
+$postTree = @(Get-ChildItem -LiteralPath $cwd -Recurse -File | Where-Object { $_.FullName -notlike '*\.git\*' })
+Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
+'@
+        [System.IO.File]::WriteAllText($p12CrudPs1, ($crudWorkerCode -replace "\r?\n", "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+        $p12CrudBat = @(
+            '@echo off',
+            'if "%~1"=="--version" (echo codex-cli 0.171.0-test & exit /b 0)',
+            'if "%~1"=="features" (echo memories stable true & echo api_key_model_discovery stable true & exit /b 0)',
+            'if "%~1"=="execpolicy" (echo {"decision":"forbidden"} & exit /b 0)',
+            ('if "%~1"=="crud-probe" ("' + $CurrentPsExe + '" -NoProfile -ExecutionPolicy Bypass -File "' + $p12CrudPs1 + '" & exit /b %ERRORLEVEL%)'),
+            'exit /b 0'
+        ) -join "`r`n"
+        [System.IO.File]::WriteAllText($p12CrudExe, $p12CrudBat + "`r`n", [System.Text.Encoding]::ASCII)
+
+        # 12a) Install with -ConfigureGateway -GatewayTargetLane 'Lane2' and -ShareAuthToLane2 + -UseGitWorktree.
+        $resP12Inst = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
+            '-RepoPath', $p12Repo, '-CodexPath', $p12CrudExe,
+            '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin,
+            '-ConfigureGateway', '-GatewayTargetLane', 'Lane2',
+            '-GatewayProviderName', 'OpenAI', '-GatewayBaseUrl', 'https://cli-gw.example.invalid/v1',
+            '-GatewayModel', 'gpt-5.4-codex', '-GatewayApiKeyEnv', 'CODEX_CLI_API_KEY',
+            '-ShareAuthToLane2', '-UseGitWorktree', '-SkipPathUpdate'
+        )
+        Assert-True ($resP12Inst.ExitCode -eq 0) "Test 12a install (-GatewayTargetLane Lane2) failed (exit=$($resP12Inst.ExitCode)):`n$($resP12Inst.Output)"
+
+        # Verify Lane 1 (Codex Desktop Primary Account) config.toml was 100% UNTOUCHED!
+        Assert-True ((Get-FileHash -LiteralPath $p12Cfg1 -Algorithm SHA256).Hash -eq $p12Cfg1OrigHash) 'CRITICAL: Lane 1 Desktop config.toml must remain 100% untouched when -GatewayTargetLane Lane2 is used!'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12L1 'config.backup.toml'))) 'Lane 1 config.backup.toml must not be created when -GatewayTargetLane Lane2 is used!'
+
+        # Verify Lane 2 (Codex CLI) config.toml has BOTH gateway env_key AND preserved custom sections, zero plaintext secrets, and workspace-write sandbox.
+        $p12Merged2 = Get-Content -LiteralPath $p12Cfg2 -Raw -Encoding UTF8
+        Assert-True ($p12Merged2 -match 'model_provider = "OpenAI"') 'Lane 2 config.toml missing model_provider'
+        Assert-True ($p12Merged2 -match 'model = "gpt-5.4-codex"') 'Lane 2 config.toml missing GatewayModel'
+        Assert-True ($p12Merged2 -match 'env_key = "CODEX_CLI_API_KEY"') 'Lane 2 config.toml missing env_key = "CODEX_CLI_API_KEY"'
+        Assert-True ($p12Merged2 -match 'sandbox_mode = "workspace-write"') 'Lane 2 config.toml missing sandbox_mode = "workspace-write"'
+        Assert-True ($p12Merged2 -match 'CODEX_ACTIVE_LANE = "LANE_2"') 'Lane 2 config.toml missing CODEX_ACTIVE_LANE = "LANE_2"'
+        Assert-True ($p12Merged2 -match '\[mcp_servers\.cli_helper\]') 'Lane 2 custom [mcp_servers.cli_helper] section was lost!'
+        Assert-True ($p12Merged2 -notmatch 'experimental_bearer_token') 'Lane 2 config.toml must purge experimental_bearer_token!'
+        Assert-True ($p12Merged2 -notmatch [regex]::Escape($p12CliLegacyCanary)) 'Legacy CLI bearer token leaked into Lane 2 config.toml!'
+        Assert-True (Test-Path -LiteralPath (Join-Path $p12L2 'config.backup.toml') -PathType Leaf) 'Lane 2 config.backup.toml was not created!'
+        Assert-True ([bool](Get-Acl -LiteralPath (Join-Path $p12L2 'config.backup.toml')).AreAccessRulesProtected) 'Lane 2 config.backup.toml DACL not locked!'
+
+        # Verify -ShareAuthToLane2 copied and ACL-locked auth.json into Lane 2 so CLI has BOTH Login and API key ready.
+        $p12Auth2 = Join-Path $p12L2 'auth.json'
+        Assert-True (Test-Path -LiteralPath $p12Auth2 -PathType Leaf) '-ShareAuthToLane2 did not copy auth.json to Lane 2!'
+        Assert-True ([bool](Get-Acl -LiteralPath $p12Auth2).AreAccessRulesProtected) 'Lane 2 shared auth.json DACL not locked!'
+
+        # Verify doctor.ps1 passes with 0 FAILs when Lane 1 Desktop config.toml is untouched and Lane 2 has BOTH Login + env_key!
+        $resP12DocBoth = Invoke-PsScript -ScriptPath $DoctorScript -Arguments @(
+            '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin, '-CodexPath', $p12CrudExe
+        )
+        Assert-True ($resP12DocBoth.ExitCode -eq 0) "doctor.ps1 failed on Desktop-Primary + CLI-Login+APIKey setup (exit=$($resP12DocBoth.ExitCode)):`n$($resP12DocBoth.Output)"
+        Assert-True ($resP12DocBoth.Output -match 'chatgpt\+env_key\(CODEX_CLI_API_KEY\)') "doctor.ps1 did not report combined login+env_key status on Lane 2:`n$($resP12DocBoth.Output)"
+        Assert-True ($resP12DocBoth.Output -match '\[PASS\]\s+Auth & ACL Isolation') "doctor.ps1 did not report [PASS] Auth & ACL Isolation:`n$($resP12DocBoth.Output)"
+
+        # Also verify doctor.ps1 still reports [PASS] Auth & ACL Isolation when Lane 2 uses API Key ONLY (no auth.json)!
+        $p12Auth2Hold = Join-Path $tmpRoot 'p12-held-auth2.json'
+        Move-Item -LiteralPath $p12Auth2 -Destination $p12Auth2Hold -Force
+        try {
+            $resP12DocEnvOnly = Invoke-PsScript -ScriptPath $DoctorScript -Arguments @(
+                '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin, '-CodexPath', $p12CrudExe
+            )
+            Assert-True ($resP12DocEnvOnly.ExitCode -eq 0) "doctor.ps1 failed on CLI API-Key-only setup:`n$($resP12DocEnvOnly.Output)"
+            Assert-True ($resP12DocEnvOnly.Output -match 'Lane 2=env_key\(CODEX_CLI_API_KEY\)') "doctor.ps1 did not report Lane 2=env_key(CODEX_CLI_API_KEY):`n$($resP12DocEnvOnly.Output)"
+            Assert-True ($resP12DocEnvOnly.Output -match '\[PASS\]\s+Auth & ACL Isolation') "doctor.ps1 must PASS Auth & ACL Isolation when Lane 2 is configured via env_key:`n$($resP12DocEnvOnly.Output)"
+        } finally {
+            Move-Item -LiteralPath $p12Auth2Hold -Destination $p12Auth2 -Force
+        }
+
+        # 12b) Verify Full Workspace Directory Tree Traversal & File CRUD (create, read, edit, rename, delete) inside workspace!
+        $p12WtRoot = Get-CanonicalLongPath -Path "$p12Repo-lane2"
+        Push-Location $p12Repo
+        try {
+            $crudOut = (& (Join-Path $p12Bin 'codex.cmd') 'crud-probe' 2>&1) -join "`n"
+            $crudExit = $LASTEXITCODE
+            Assert-True ($crudExit -eq 0 -and $crudOut -match 'CRUD_OK') "Workspace directory tree traversal & file CRUD probe failed (exit=$crudExit):`n$crudOut"
+        } finally { Pop-Location }
+
+        # Confirm all CRUD mutations landed inside the active Lane 2 worktree while primary repo remained untouched!
+        Assert-True (([System.IO.File]::ReadAllText((Join-Path $p12WtRoot 'src\core\engine.rs'))) -match 'pub fn edited') 'File edit did not persist in active workspace!'
+        Assert-True (Test-Path -LiteralPath (Join-Path $p12WtRoot 'src\features\created.rs') -PathType Leaf) 'Newly created file in nested directory missing in workspace!'
+        Assert-True (Test-Path -LiteralPath (Join-Path $p12WtRoot 'src\utils\helper_v2.rs') -PathType Leaf) 'Renamed file missing in workspace!'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12WtRoot 'src\utils\helper.rs'))) 'Old path of renamed file should not exist in workspace!'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12WtRoot 'src\features\temp_delete_me.txt'))) 'Deleted file should not exist in workspace!'
+        Assert-True (-not (([System.IO.File]::ReadAllText((Join-Path $p12Repo 'src\core\engine.rs'))) -match 'pub fn edited')) 'Primary repo engine.rs must remain untouched by Lane 2 CRUD!'
+
+        # 12c) Rollback of -GatewayTargetLane 'Lane2' + -ShareAuthToLane2 restores byte-exact pre-install state!
+        $resP12Rest = Invoke-PsScript -ScriptPath $RestoreScript -Arguments @(
+            '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin, '-SkipPathUpdate'
+        )
+        Assert-True ($resP12Rest.ExitCode -eq 0) "Test 12c rollback failed (exit=$($resP12Rest.ExitCode)):`n$($resP12Rest.Output)"
+        Assert-True ((Get-FileHash -LiteralPath $p12Cfg1 -Algorithm SHA256).Hash -eq $p12Cfg1OrigHash) 'Lane 1 Desktop config.toml hash changed after rollback!'
+        Assert-True ((Get-FileHash -LiteralPath $p12Cfg2 -Algorithm SHA256).Hash -eq $p12Cfg2OrigHash) 'Lane 2 CLI config.toml SHA-256 mismatch after rollback!'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12L2 'config.backup.toml'))) 'Rollback left stray Lane 2 config.backup.toml!'
+        Assert-True (-not (Test-Path -LiteralPath $p12Auth2)) 'Rollback left newly shared Lane 2 auth.json!'
+
+        # Also verify -GatewayTargetLane 'Both' configures both lanes while keeping Lane 1 Desktop free of sandbox_mode/network_access restrictions!
+        $resP12Both = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
+            '-RepoPath', $p12Repo, '-CodexPath', $p12CrudExe,
+            '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin,
+            '-ConfigureGateway', '-GatewayTargetLane', 'Both',
+            '-GatewayProviderName', 'OpenAI', '-GatewayBaseUrl', 'https://both-gw.example.invalid/v1',
+            '-GatewayApiKeyEnv', 'CODEX_BOTH_API_KEY', '-SkipPathUpdate'
+        )
+        Assert-True ($resP12Both.ExitCode -eq 0) "Test 12c (-GatewayTargetLane Both) failed (exit=$($resP12Both.ExitCode)):`n$($resP12Both.Output)"
+        $p12BothCfg1 = Get-Content -LiteralPath $p12Cfg1 -Raw -Encoding UTF8
+        $p12BothCfg2 = Get-Content -LiteralPath $p12Cfg2 -Raw -Encoding UTF8
+        Assert-True ($p12BothCfg1 -match 'env_key = "CODEX_BOTH_API_KEY"' -and $p12BothCfg2 -match 'env_key = "CODEX_BOTH_API_KEY"') '-GatewayTargetLane Both must configure env_key in both Lane 1 and Lane 2!'
+        Assert-True ($p12BothCfg1 -notmatch '(?m)^\s*sandbox_mode\s*=' -and $p12BothCfg1 -notmatch '(?m)^\s*network_access\s*=\s*false') 'Lane 1 Desktop must NEVER have restrictive sandbox_mode or network_access = false injected even under -GatewayTargetLane Both!'
+        Write-Host "    [OK] Desktop Full Authority + CLI Login & API Key (-GatewayTargetLane Lane2|Both, -ShareAuthToLane2) + Full Workspace File CRUD & Tree Mastery verified" -ForegroundColor Green
+    } finally {
+        Remove-TempTreeSafely -RootDir $null -Lane2Dir $p12L2
+        try { git -C $p12Repo worktree remove -f "$p12Repo-lane2" 2>$null } catch {}
+    }
+
+    Write-Host "`n[PASS] All 12 Windows test stages passed cleanly (AST, Python, default.rules, DryRun/WhatIf, TOML/env_key/ACL/8.3/fail-closed worktree, doctor, traversal defense, SHA-256 rollback, interrupted recovery, 3x loop, pre-existing link/exact backup/missing-backup preflight, and Desktop full-authority + CLI Login/API-Key + Workspace File CRUD)!" -ForegroundColor Green
 } finally {
     Remove-TempTreeSafely -RootDir $tmpRoot -Lane2Dir $l2
 }

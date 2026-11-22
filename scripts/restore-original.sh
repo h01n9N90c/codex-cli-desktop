@@ -227,6 +227,7 @@ sha256_file() {
 assert_safe_contained_path() {
   local label="$1"
   local candidate="$2"
+  local allow_leaf_symlink="${3:-0}"
 
   if [ -z "${candidate}" ]; then
     echo "[FAIL] Security violation: empty path for ${label}." >&2
@@ -268,8 +269,12 @@ assert_safe_contained_path() {
     # tests only the leaf component at each step and the loop breaks once the
     # non-symlink root directory itself matches ALLOWED_ROOTS.
     if [ -L "${cur}" ]; then
-      echo "[FAIL] Security violation: symlink rejected for ${label}: '${cur}'" >&2
-      exit 1
+      if [ "${allow_leaf_symlink}" -eq 1 ] && [ "${depth}" -eq 0 ]; then
+        :
+      else
+        echo "[FAIL] Security violation: symlink rejected for ${label}: '${cur}'" >&2
+        exit 1
+      fi
     fi
 
     if [ "${depth}" -ge 1 ]; then
@@ -335,8 +340,8 @@ atomic_restore_verified_file() {
         return 0
       fi
     fi
-    echo "[WARN] Backup file missing or not a regular file: ${bkp} (cannot restore ${target})" >&2
-    return 0
+    echo "[FAIL] Backup file missing or not a regular file: ${bkp} (cannot restore ${target})" >&2
+    exit 1
   fi
 
   local bkp_sha
@@ -418,17 +423,31 @@ atomic_restore_verified_file() {
 
 # Read-only preflight validator for rollback manifests.
 # Runs BEFORE Step 1 touches any symlink, file, or wrapper so a tampered
-# manifest (path traversal, symlink escape, malformed row, invalid mode, or
-# SHA-256 mismatch) fails closed with ZERO disk side effects.
+# manifest OR any missing required file/directory backup (where the target is
+# not already at its exact original state) fails closed with ZERO disk side effects.
+MANIFEST_SCHEMA_VERSION=1
+HAS_LINK_RECORDS=0
+LINK_RECORDS=()
+
 preflight_validate_manifest() {
   local manifest_path="$1"
   local line_num=0
-  local line existed orig_sha target bkp orig_mode extra bkp_sha
+  local line existed orig_sha target bkp orig_mode extra bkp_sha cur_sha
+  MANIFEST_SCHEMA_VERSION=1
+  HAS_LINK_RECORDS=0
+  LINK_RECORDS=()
   while IFS= read -r line || [ -n "${line}" ]; do
     line_num=$((line_num + 1))
     line="${line%$'\r'}"
     [ -z "${line}" ] && continue
     case "${line}" in
+      "# schema_version="*)
+        local ver_val="${line#\# schema_version=}"
+        if printf '%s' "${ver_val}" | grep -Eq '^[0-9]+$'; then
+          MANIFEST_SCHEMA_VERSION="${ver_val}"
+        fi
+        continue
+        ;;
       \#*) continue ;;
     esac
 
@@ -445,10 +464,44 @@ preflight_validate_manifest() {
       exit 1
     fi
 
-    assert_safe_contained_path "manifest target" "${target}"
-
     case "${existed}" in
+      L)
+        HAS_LINK_RECORDS=1
+        case "${orig_sha}" in
+          0|1) ;;
+          *)
+            echo "[FAIL] Invalid created_by_kit flag '${orig_sha}' in link record at ${manifest_path}:${line_num}." >&2
+            exit 1
+            ;;
+        esac
+        case "${orig_mode}" in
+          absent|preexisting_link|preexisting_dir) ;;
+          *)
+            echo "[FAIL] Invalid prior_state '${orig_mode}' in link record at ${manifest_path}:${line_num}." >&2
+            exit 1
+            ;;
+        esac
+        assert_safe_contained_path "manifest shared link" "${target}" 1
+        if [ "${orig_sha}" = "1" ] && [ "${orig_mode}" = "preexisting_dir" ]; then
+          if [ -z "${bkp}" ] || [ "${bkp}" = "-" ]; then
+            echo "[FAIL] Missing directory backup path for preexisting_dir '${target}' at ${manifest_path}:${line_num}." >&2
+            exit 1
+          fi
+          assert_safe_contained_path "manifest dir backup" "${bkp}"
+          if [ ! -d "${bkp}" ] || [ -L "${bkp}" ]; then
+            # Idempotent re-run check: allow only if target is ALREADY restored to a real non-symlink dir.
+            if [ -d "${target}" ] && [ ! -L "${target}" ]; then
+              :
+            else
+              echo "[FAIL] Preflight failed: Required directory backup '${bkp}' for '${target}' is missing and target is not restored to a real directory. Aborting before any disk changes." >&2
+              exit 1
+            fi
+          fi
+        fi
+        LINK_RECORDS+=("$(printf '%s\t%s\t%s\t%s' "${orig_sha}" "${target}" "${bkp}" "${orig_mode}")")
+        ;;
       1)
+        assert_safe_contained_path "manifest target" "${target}"
         orig_sha="$(printf '%s' "${orig_sha}" | awk '{print tolower($0)}')"
         if ! printf '%s' "${orig_sha}" | grep -Eq '^[0-9a-f]{64}$'; then
           echo "[FAIL] Invalid SHA-256 hash in manifest at ${manifest_path}:${line_num}." >&2
@@ -467,9 +520,21 @@ preflight_validate_manifest() {
             echo "[FAIL] SHA-256 mismatch on backup ${bkp}! Expected ${orig_sha}, got ${bkp_sha}." >&2
             exit 1
           fi
+        else
+          # Missing backup file: allow ONLY for idempotent re-runs where target is ALREADY
+          # byte-exact at original SHA-256. Otherwise fail closed BEFORE Step 1 mutates anything!
+          if [ -f "${target}" ] && [ ! -L "${target}" ]; then
+            cur_sha="$(sha256_file "${target}")"
+            if [ "${cur_sha}" = "${orig_sha}" ]; then
+              continue
+            fi
+          fi
+          echo "[FAIL] Preflight failed: Required backup file '${bkp}' for '${target}' is missing and target is not at original SHA-256 (${orig_sha}). Aborting before unlinking any symlinks or modifying any files." >&2
+          exit 1
         fi
         ;;
       0)
+        assert_safe_contained_path "manifest target" "${target}"
         if [ -d "${target}" ]; then
           echo "[FAIL] Refusing to remove directory listed as newly created file: ${target}" >&2
           exit 1
@@ -615,38 +680,92 @@ if [ -n "${MANIFEST_FILE}" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# Step 1: Safely Unlink Shared Symlinks in Lane 2 First
+# Step 1: Safely Unlink Kit-Created Shared Symlinks & Restore Exact Dir Backups
 # ------------------------------------------------------------------------------
-# Critical safety invariant: ALWAYS unlink symlinks with `rm` (never `rm -rf`)
+# Critical safety invariant: ALWAYS unlink kit-created symlinks with `rm` (never `rm -rf`)
 # before any other operation so Lane 1's real sessions/memories/skills are safe.
-echo "[+] Step 1: Unlinking shared symlinks in ${LANE2_HOME}..."
+# Pre-existing user symlinks (`created_by_kit=0`) are preserved untouched, and
+# backed-up directories are restored from the EXACT path recorded in the manifest.
+echo "[+] Step 1: Unlinking kit-created shared symlinks in ${LANE2_HOME}..."
 SHARED_DIRS=(memories memories_v2 sessions archived_sessions skills plugins)
-for d in "${SHARED_DIRS[@]}"; do
-  target="${LANE2_HOME}/${d}"
-  if [ -L "${target}" ]; then
-    if [ "${DRY_RUN}" -eq 0 ]; then
-      rm -- "${target}"
-      if [ -L "${target}" ] || [ -e "${target}" ]; then
-        echo "[FAIL] Failed to unlink symlink ${target}; aborting to protect Lane 1 data." >&2
-        exit 1
+if [ -n "${MANIFEST_FILE}" ] && { [ "${HAS_LINK_RECORDS}" -eq 1 ] || [ "${MANIFEST_SCHEMA_VERSION}" -ge 2 ]; }; then
+  if [ "${#LINK_RECORDS[@]}" -eq 0 ]; then
+    echo "    Manifest records 0 shared link mutations (interrupted before Step 5); pre-existing symlinks left untouched."
+  else
+    for lrec in "${LINK_RECORDS[@]}"; do
+      lr_created=""
+      lr_target=""
+      lr_bkp=""
+      lr_prior=""
+      IFS=$'\t' read -r lr_created lr_target lr_bkp lr_prior <<< "${lrec}"
+      if [ "${lr_created}" != "1" ]; then
+        if [ "${DRY_RUN}" -eq 0 ]; then
+          echo "    Preserved pre-existing symlink (not created by kit): ${lr_target}"
+        else
+          echo "    [DRY-RUN] Would preserve pre-existing symlink (not created by kit): ${lr_target}"
+        fi
+        continue
       fi
-      echo "    Unlinked symlink: ${target} (Lane 1 data untouched)"
-    else
-      echo "    [DRY-RUN] Would unlink symlink: ${target} (Lane 1 data untouched)"
-    fi
-  fi
 
-  latest_dir_bkp="$(find_latest_backup "dir" "${target}")"
-  if [ -n "${latest_dir_bkp}" ] && [ ! -e "${target}" ] && [ ! -L "${target}" ]; then
-    assert_safe_contained_path "directory backup" "${latest_dir_bkp}"
-    if [ "${DRY_RUN}" -eq 0 ]; then
-      mv -- "${latest_dir_bkp}" "${target}"
-      echo "    Restored pre-existing directory: ${latest_dir_bkp} -> ${target}"
-    else
-      echo "    [DRY-RUN] Would restore pre-existing directory: ${latest_dir_bkp} -> ${target}"
-    fi
+      unlinked_or_would_unlink=0
+      if [ -L "${lr_target}" ]; then
+        if [ "${DRY_RUN}" -eq 0 ]; then
+          rm -- "${lr_target}"
+          if [ -L "${lr_target}" ] || [ -e "${lr_target}" ]; then
+            echo "[FAIL] Failed to unlink symlink ${lr_target}; aborting to protect Lane 1 data." >&2
+            exit 1
+          fi
+          echo "    Unlinked kit-created symlink: ${lr_target} (Lane 1 data untouched)"
+        else
+          echo "    [DRY-RUN] Would unlink kit-created symlink: ${lr_target} (Lane 1 data untouched)"
+        fi
+        unlinked_or_would_unlink=1
+      fi
+
+      if [ "${lr_prior}" = "preexisting_dir" ] && [ -n "${lr_bkp}" ] && [ "${lr_bkp}" != "-" ]; then
+        if [ -d "${lr_bkp}" ] && [ ! -L "${lr_bkp}" ]; then
+          if [ "${unlinked_or_would_unlink}" -eq 1 ] || { [ ! -e "${lr_target}" ] && [ ! -L "${lr_target}" ]; }; then
+            assert_safe_contained_path "directory backup" "${lr_bkp}"
+            if [ "${DRY_RUN}" -eq 0 ]; then
+              mv -- "${lr_bkp}" "${lr_target}"
+              echo "    Restored exact pre-existing directory from manifest: ${lr_bkp} -> ${lr_target}"
+            else
+              echo "    [DRY-RUN] Would restore exact pre-existing directory from manifest: ${lr_bkp} -> ${lr_target}"
+            fi
+          fi
+        fi
+      fi
+    done
   fi
-done
+else
+  # Legacy v1 manifest without `L` link records, or manifest-less emergency fallback.
+  for d in "${SHARED_DIRS[@]}"; do
+    target="${LANE2_HOME}/${d}"
+    if [ -L "${target}" ]; then
+      if [ "${DRY_RUN}" -eq 0 ]; then
+        rm -- "${target}"
+        if [ -L "${target}" ] || [ -e "${target}" ]; then
+          echo "[FAIL] Failed to unlink symlink ${target}; aborting to protect Lane 1 data." >&2
+          exit 1
+        fi
+        echo "    Unlinked symlink: ${target} (Lane 1 data untouched)"
+      else
+        echo "    [DRY-RUN] Would unlink symlink: ${target} (Lane 1 data untouched)"
+      fi
+    fi
+
+    latest_dir_bkp="$(find_latest_backup "dir" "${target}")"
+    if [ -n "${latest_dir_bkp}" ] && [ ! -e "${target}" ] && [ ! -L "${target}" ]; then
+      assert_safe_contained_path "directory backup" "${latest_dir_bkp}"
+      if [ "${DRY_RUN}" -eq 0 ]; then
+        mv -- "${latest_dir_bkp}" "${target}"
+        echo "    Restored pre-existing directory (legacy fallback): ${latest_dir_bkp} -> ${target}"
+      else
+        echo "    [DRY-RUN] Would restore pre-existing directory (legacy fallback): ${latest_dir_bkp} -> ${target}"
+      fi
+    fi
+  done
+fi
 
 # Confirm primary Lane 1 directories remain intact after unlinking Lane 2.
 for d in sessions memories; do
@@ -700,6 +819,11 @@ if [ -n "${MANIFEST_FILE}" ]; then
     if [ -n "${extra}" ] || [ -z "${existed}" ] || [ -z "${target}" ]; then
       echo "[FAIL] Malformed manifest entry at ${MANIFEST_FILE}:${line_num}." >&2
       exit 1
+    fi
+
+    if [ "${existed}" = "L" ]; then
+      # Shared link records are validated in preflight and processed in Step 1.
+      continue
     fi
 
     # Validate target containment & anti-symlink BEFORE inspecting anything else.

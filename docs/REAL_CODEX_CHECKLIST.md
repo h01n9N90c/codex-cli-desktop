@@ -5,9 +5,9 @@
 
 ---
 
-## 1. Kiểm chứng Không lưu Plaintext API Key trong `config.toml` & Bản sao lưu
+## 1. Kiểm chứng Không lưu Plaintext API Key trong `config.toml` & Bản sao lưu (Linh hoạt Luồng 2 CLI & Luồng 1 Desktop)
 
-Khi dùng `-ConfigureGateway`, bộ kit dùng thuộc tính `env_key = "CODEX_GATEWAY_API_KEY"` của Codex (đọc từ biến môi trường User) thay vì ghi trực tiếp key vào `config.toml`:
+Khi dùng `-ConfigureGateway` (kèm `-GatewayTargetLane Lane2|Lane1|Both` trên Windows hoặc `--configure-gateway --gateway-target-lane lane2|lane1|both` trên Unix), bộ kit dùng thuộc tính `env_key = "<TEN_BIEN_MOI_TRUONG>"` của Codex (đọc từ biến môi trường User) thay vì ghi trực tiếp key vào `config.toml` — đồng thời mặc định giữ nguyên 100% `~/.codex/config.toml` để **Codex Desktop (`~/.codex`, Luồng 1 — `acc chính`) được toàn quyền như trước**:
 
 **Windows (PowerShell):**
 ```powershell
@@ -47,10 +47,13 @@ codex execpolicy check --rules $rules -- git push --force
 codex execpolicy check --rules $rules -- git push
 codex execpolicy check --rules $rules -- git reset --hard
 
-# Lệnh vô hại phải trả về matchedRules rỗng ([]):
+# Nhóm lệnh duyệt cây thư mục & thao tác file CRUD trong workspace phải trả về matchedRules rỗng ([] — được phép 100%):
 codex execpolicy check --rules $rules -- git status
+codex execpolicy check --rules $rules -- rg --files
+codex execpolicy check --rules $rules -- Get-ChildItem -Recurse
+codex execpolicy check --rules $rules -- Remove-Item .\scratch.tmp
 ```
-* **Kỳ vọng:** 9 lệnh đầu trả về `"decision":"forbidden"`, 2 lệnh `git push` / `git reset --hard` trả về `"decision":"prompt"`, và `git status` trả về `{"matchedRules":[]}`.
+* **Kỳ vọng:** 9 lệnh đầu trả về `"decision":"forbidden"`, 2 lệnh `git push` / `git reset --hard` trả về `"decision":"prompt"`, và toàn bộ nhóm lệnh duyệt cây thư mục & thao tác file CRUD (`git status`, `rg --files`, `Get-ChildItem`, `Remove-Item`, `rm`, `mv`, `cp`, `mkdir`) trả về `{"matchedRules":[]}` (hoàn toàn không bị cản trở trong workspace).
 * **Giới hạn kỹ thuật cần nhớ:** `prefix_rule` kiểm khớp chính xác theo tiền tố lệnh trực tiếp (`argv[0]`), không phân tích hết chuỗi lồng trong `powershell -Command "..."` hay `bash -c "..."`. Các chuỗi lồng nhau được kiểm soát bởi **Lớp 1 OS Sandbox (`workspace-write` + `network_access = false`)**, **`approval_policy = "on-request"`** và **Lớp 4 `AGENTS.md`**.
 
 ---
@@ -96,14 +99,14 @@ ls -la ~/.codex/config.toml ~/.codex/auth.json ~/.codex-official/config.toml ~/.
 
 ---
 
-## 5. Kiểm chứng Merge `config.toml`, Đường dẫn 8.3, Worktree Fail-Closed, Khôi phục Ngắt Giữa Chừng & Vòng lặp 3x
+## 5. Kiểm chứng Merge `config.toml`, `-GatewayTargetLane` (CLI Login + API Key), Đường dẫn 8.3, Worktree Fail-Closed, Quyền Sở hữu Link & Preflight Fail-Closed (v1.3.1)
 
-Chạy bộ test tích hợp 10 pha trên Windows (không đụng tới `~/.codex*` thật của bạn, dùng thư mục tạm cô lập):
+Chạy bộ test tích hợp 11+ pha trên Windows (không đụng tới `~/.codex*` thật của bạn, dùng thư mục tạm cô lập):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1
 ```
-* **Kỳ vọng:** Cả 10 pha kiểm tra đều báo `[PASS]`: cú pháp AST & CRLF, unit test Python, Starlark `default.rules`, `-DryRun`/`-WhatIf`, TOML merge giữ nguyên `[mcp_servers.*]`/`[tui]`/`[projects.*]`, cô lập `env_key`, UTF-8 không BOM, khóa ACL 2 bước & `-ReapplyAclOnly`, chuẩn hóa đường dẫn ngắn 8.3 (`RUNNER~1`/`PROGRA~1` qua `GetLongPathNameW` + `%%~fs`), worktree fail-closed cứng (từ chối chạy khi worktree bị xóa/thay bằng tệp thường/lỗi `cd`, chỉ tắt auto-cd với `CODEX_NO_AUTO_WORKTREE_CD=1` trong khi vẫn chặn `-C`/`-C<path>`/`--cd`/`--add-dir`), `doctor.ps1`, chống path-traversal, khôi phục SHA-256, phục hồi cài đặt bị ngắt giữa chừng (`.rollback/latest.json` `Completed=false`) và vòng lặp cài đặt + khôi phục 3 lần liên tiếp (0 tệp backup rác, 0 mất dữ liệu Luồng 1).
+* **Kỳ vọng:** Toàn bộ các pha kiểm tra đều báo `[PASS]`: cú pháp AST & CRLF, unit test Python, Starlark `default.rules`, `-DryRun`/`-WhatIf`, TOML merge giữ nguyên `[mcp_servers.*]`/`[tui]`/`[projects.*]`, cô lập `env_key` & `-GatewayTargetLane` (giữ `~/.codex/config.toml` của Desktop nguyên vẹn khi cấu hình `Lane2`, hỗ trợ CLI dùng cả Login lẫn API Key), UTF-8 không BOM, khóa ACL 2 bước & `-ReapplyAclOnly`, chuẩn hóa đường dẫn ngắn 8.3 (`RUNNER~1`/`PROGRA~1` qua `GetLongPathNameW` + `%%~fs`), worktree fail-closed cứng (từ chối chạy khi worktree bị xóa/thay bằng tệp thường/lỗi `cd`, chỉ tắt auto-cd với `CODEX_NO_AUTO_WORKTREE_CD=1` trong khi vẫn chặn `-C`/`-C<path>`/`--cd`/`--add-dir`), `doctor.ps1`, chống path-traversal, khôi phục SHA-256, phục hồi cài đặt bị ngắt giữa chừng (`.rollback/latest.json` `Completed=false`), vòng lặp cài đặt + khôi phục 3 lần liên tiếp (0 tệp backup rác, 0 mất dữ liệu Luồng 1), bảo toàn Junction/symlink có từ trước của người dùng (`SharedLinkRecords`), khôi phục thư mục từ đúng đường dẫn backup trong manifest (chống decoy backup), và kiểm tra preflight fail-closed khi thiếu backup (0 thay đổi trên đĩa).
 
 ---
 

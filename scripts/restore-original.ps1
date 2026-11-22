@@ -379,13 +379,18 @@ function Assert-NoReparsePointInPath {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$CandidatePath,
-        [Parameter(Mandatory = $true)][string[]]$AllowedRoots
+        [Parameter(Mandatory = $true)][string[]]$AllowedRoots,
+        [switch]$AllowRootMatch
     )
     $full = (Resolve-CanonicalLongPath -PathValue $CandidatePath).TrimEnd('\')
     $matchedRoot = $null
     foreach ($root in $AllowedRoots) {
         if ([string]::IsNullOrWhiteSpace($root)) { continue }
         $rFull = (Resolve-CanonicalLongPath -PathValue $root).TrimEnd('\')
+        if ($AllowRootMatch -and [string]::Equals($full, $rFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $matchedRoot = $rFull
+            break
+        }
         if ($full.StartsWith("$rFull\", [System.StringComparison]::OrdinalIgnoreCase)) {
             $matchedRoot = $rFull
             break
@@ -393,6 +398,20 @@ function Assert-NoReparsePointInPath {
     }
     if (-not $matchedRoot) {
         throw "Security violation: Path '$CandidatePath' is outside allowed Codex directories!"
+    }
+
+    if ([string]::Equals($full, $matchedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        try {
+            $attrs = [System.IO.File]::GetAttributes($full)
+            if ($attrs -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Security violation: Refusing to follow reparse point / symlink at '$full' during restore!"
+            }
+        } catch [System.IO.FileNotFoundException] {
+            # Non-existent path is safe
+        } catch [System.IO.DirectoryNotFoundException] {
+            # Non-existent intermediate directory is safe
+        }
+        return
     }
 
     $cursor = $full
@@ -645,8 +664,53 @@ if ($manifest) {
 # Preflight Security & Integrity Gate (Strictly Read-Only BEFORE Step 1)
 # ============================================================================
 # WHY: Validate ALL manifest entries (path containment, reparse-point checks, SHA-256 format,
-# and backup SHA-256 hashes) BEFORE detaching a single NTFS Junction in Step 1. If a manifest
-# has been tampered with or corrupted, rollback fails closed with ZERO disk side effects!
+# backup file/directory existence, and backup SHA-256 hashes) BEFORE detaching a single NTFS
+# Junction in Step 1. If a manifest is tampered with OR any required backup is missing while
+# the target is not already at its original state, rollback fails closed with ZERO disk side effects!
+$hasSharedLinkRecordsProp = ($null -ne $manifest) -and ($null -ne $manifest.PSObject.Properties['SharedLinkRecords'])
+$manifestLinkRecords = if ($hasSharedLinkRecordsProp) { @((Get-JsonProp -Obj $manifest -Name 'SharedLinkRecords') | Where-Object { $null -ne $_ }) } else { @() }
+$hasSharedJunctionsProp = ($null -ne $manifest) -and ($null -ne $manifest.PSObject.Properties['SharedJunctions'])
+$manifestJunctionNames = if ($hasSharedJunctionsProp) { @((Get-JsonProp -Obj $manifest -Name 'SharedJunctions') | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) } else { @() }
+
+if ($hasSharedLinkRecordsProp -and $manifestLinkRecords.Count -gt 0) {
+    foreach ($lr in $manifestLinkRecords) {
+        $lrPath = [string](Get-JsonProp -Obj $lr -Name 'LinkPath')
+        $lrPrior = [string](Get-JsonProp -Obj $lr -Name 'PriorState')
+        $lrCreated = [bool](Get-JsonProp -Obj $lr -Name 'CreatedByKit')
+        $lrBkp = [string](Get-JsonProp -Obj $lr -Name 'BackupDirPath')
+
+        if ([string]::IsNullOrWhiteSpace($lrPath) -or -not (Test-PathInsideAllowedRoots -CandidatePath $lrPath -AllowedRoots $allowedRestoreRoots)) {
+            throw "Security violation: Snapshot link path '$lrPath' is outside allowed Codex directories!"
+        }
+        $lrParent = Split-Path -Parent $lrPath
+        if ($lrParent) {
+            Assert-NoReparsePointInPath -CandidatePath $lrParent -AllowedRoots $allowedRestoreRoots -AllowRootMatch
+        }
+        if ($lrPrior -notin @('absent', 'preexisting_link', 'preexisting_dir')) {
+            throw "Integrity violation: Snapshot link record for '$lrPath' has invalid PriorState '$lrPrior'."
+        }
+        if ($lrCreated -and $lrPrior -eq 'preexisting_dir') {
+            if ([string]::IsNullOrWhiteSpace($lrBkp) -or -not (Test-PathInsideAllowedRoots -CandidatePath $lrBkp -AllowedRoots $allowedRestoreRoots)) {
+                throw "Security violation: Snapshot directory backup path '$lrBkp' for '$lrPath' is missing or outside allowed Codex directories!"
+            }
+            Assert-NoReparsePointInPath -CandidatePath $lrBkp -AllowedRoots $allowedRestoreRoots
+            if (-not (Test-Path -LiteralPath $lrBkp -PathType Container)) {
+                # Idempotent re-run check: allow only if the target is ALREADY restored to a real non-reparse directory.
+                $alreadyRestoredDir = $false
+                try {
+                    $tAttrs = [System.IO.File]::GetAttributes($lrPath)
+                    if (($tAttrs -band [System.IO.FileAttributes]::Directory) -and -not ($tAttrs -band [System.IO.FileAttributes]::ReparsePoint)) {
+                        $alreadyRestoredDir = $true
+                    }
+                } catch {}
+                if (-not $alreadyRestoredDir) {
+                    throw "Preflight failed: Required directory backup '$lrBkp' for '$lrPath' is missing and target is not restored to a real directory. Aborting before any disk changes."
+                }
+            }
+        }
+    }
+}
+
 $manifestFiles = if ($manifest) { @(Get-JsonProp -Obj $manifest -Name 'Files') } else { @() }
 $manifestFiles = @($manifestFiles | Where-Object { $null -ne $_ })
 if ($manifest -and $manifestFiles.Count -gt 0) {
@@ -672,61 +736,135 @@ if ($manifest -and $manifestFiles.Count -gt 0) {
                 if (-not $pfActualHash.Equals($pfSha, [System.StringComparison]::OrdinalIgnoreCase)) {
                     throw "SHA-256 mismatch on backup '$pfBkp'! Expected $pfSha, got $pfActualHash. Aborting before any disk changes."
                 }
+            } else {
+                # Missing backup file: allow ONLY for idempotent re-runs where target is ALREADY byte-exact
+                # at OriginalSha256. Otherwise fail closed BEFORE Step 1 detaches any Junction or changes disk!
+                $alreadyOriginalFile = $false
+                if (Test-Path -LiteralPath $pfTarget -PathType Leaf) {
+                    $pfTargetHash = Get-FileSha256 $pfTarget
+                    if ($pfTargetHash.Equals($pfSha, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $alreadyOriginalFile = $true
+                    }
+                }
+                if (-not $alreadyOriginalFile) {
+                    throw "Preflight failed: Required backup file '$pfBkp' for '$pfTarget' is missing and target is not at original SHA-256 ($pfSha). Aborting before detaching any Junctions or modifying any files."
+                }
             }
         }
     }
 }
 
 # ============================================================================
-# Step 1: Safely Detach All 6 NTFS Directory Junctions FIRST
+# Step 1: Safely Detach Kit-Created NTFS Directory Junctions & Restore Exact Dir Backups
 # ============================================================================
-# WHY: Always remove NTFS Junction reparse points via Win32 RemoveDirectoryW
+# WHY: Always remove kit-created NTFS Junction reparse points via Win32 RemoveDirectoryW
 # (`[System.IO.Directory]::Delete($jPath, $false)`) BEFORE any file restore or directory
 # deletion so Lane 1's shared sessions/memories/skills/plugins are 100% untouched.
-Write-Step "Step 1: Safely detaching NTFS Directory Junctions in $Lane2Home..."
+# Pre-existing user links (`CreatedByKit=$false`) are preserved intact, and directory backups
+# are restored using the EXACT BackupDirPath recorded in the manifest (never wildcard guessing).
+Write-Step "Step 1: Safely detaching kit-created NTFS Directory Junctions in $Lane2Home..."
 $sharedDirs = @('memories', 'memories_v2', 'sessions', 'archived_sessions', 'skills', 'plugins')
-foreach ($name in $sharedDirs) {
-    $jPath = Join-Path $Lane2Home $name
-    $junctionDetachedOrWouldDetach = $false
+if ($hasSharedLinkRecordsProp) {
+    if ($manifestLinkRecords.Count -eq 0) {
+        Write-Host "    Manifest records 0 shared link mutations (interrupted before Step 6); pre-existing links left untouched." -ForegroundColor DarkGray
+    }
+    foreach ($lr in $manifestLinkRecords) {
+        $jPath = Resolve-CanonicalLongPath -PathValue ([string](Get-JsonProp -Obj $lr -Name 'LinkPath'))
+        $lrPrior = [string](Get-JsonProp -Obj $lr -Name 'PriorState')
+        $lrCreated = [bool](Get-JsonProp -Obj $lr -Name 'CreatedByKit')
+        $lrBkpRaw = [string](Get-JsonProp -Obj $lr -Name 'BackupDirPath')
 
-    if (Test-Path -LiteralPath $jPath) {
-        $item = Get-Item -LiteralPath $jPath -Force
-        if ($item.LinkType -eq 'Junction' -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-            if (-not $script:IsDryRun) {
-                try {
-                    # Non-recursive Win32 RemoveDirectoryW: detaches ONLY the Junction reparse point,
-                    # works natively with spaces/'&'/'%'/Unicode, and avoids cmd.exe shell parsing.
-                    [System.IO.Directory]::Delete($jPath, $false)
-                } catch {
-                    throw "Failed to detach NTFS Junction at '$jPath' ($($_.Exception.Message)). Aborting to protect Lane 1 data."
-                }
-                if (Test-Path -LiteralPath $jPath) {
-                    throw "Failed to detach NTFS Junction at '$jPath'. Aborting to protect Lane 1 data."
-                }
-            }
-            $junctionDetachedOrWouldDetach = $true
+        if (-not $lrCreated) {
             if ($script:IsDryRun) {
-                Write-Host "    [DRY-RUN] Would detach NTFS Junction: $jPath (Lane 1 target untouched)"
+                Write-Host "    [DRY-RUN] Would preserve pre-existing Junction/link (not created by kit): $jPath" -ForegroundColor DarkGray
             } else {
-                Write-Host "    Detached NTFS Junction: $jPath (Lane 1 target untouched)"
+                Write-Host "    Preserved pre-existing Junction/link (not created by kit): $jPath" -ForegroundColor DarkGray
             }
-        } else {
-            Write-Host "    Skipped non-junction directory: $jPath" -ForegroundColor DarkGray
+            continue
+        }
+
+        $junctionDetachedOrWouldDetach = $false
+        if (Test-Path -LiteralPath $jPath) {
+            $item = Get-Item -LiteralPath $jPath -Force
+            if ($item.LinkType -eq 'Junction' -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                if (-not $script:IsDryRun) {
+                    try {
+                        [System.IO.Directory]::Delete($jPath, $false)
+                    } catch {
+                        throw "Failed to detach NTFS Junction at '$jPath' ($($_.Exception.Message)). Aborting to protect Lane 1 data."
+                    }
+                    if (Test-Path -LiteralPath $jPath) {
+                        throw "Failed to detach NTFS Junction at '$jPath'. Aborting to protect Lane 1 data."
+                    }
+                }
+                $junctionDetachedOrWouldDetach = $true
+                if ($script:IsDryRun) {
+                    Write-Host "    [DRY-RUN] Would detach kit-created NTFS Junction: $jPath (Lane 1 target untouched)"
+                } else {
+                    Write-Host "    Detached kit-created NTFS Junction: $jPath (Lane 1 target untouched)"
+                }
+            } else {
+                Write-Host "    Skipped non-junction directory (already restored or real dir): $jPath" -ForegroundColor DarkGray
+            }
+        }
+
+        if ($lrPrior -eq 'preexisting_dir' -and -not [string]::IsNullOrWhiteSpace($lrBkpRaw)) {
+            $exactDirBackup = Resolve-CanonicalLongPath -PathValue $lrBkpRaw
+            $targetVacantAfterDetach = $junctionDetachedOrWouldDetach -or (-not (Test-Path -LiteralPath $jPath))
+            if ((Test-Path -LiteralPath $exactDirBackup -PathType Container) -and $targetVacantAfterDetach) {
+                Assert-NoReparsePointInPath -CandidatePath $exactDirBackup -AllowedRoots $allowedRestoreRoots
+                if (-not $script:IsDryRun) {
+                    Move-Item -LiteralPath $exactDirBackup -Destination $jPath -Force
+                    Write-Host "    Restored exact pre-existing directory from manifest: $exactDirBackup -> $jPath" -ForegroundColor Green
+                } else {
+                    Write-Host "    [DRY-RUN] Would restore exact pre-existing directory from manifest: $exactDirBackup -> $jPath" -ForegroundColor Green
+                }
+            }
         }
     }
+} else {
+    # Legacy v1 manifest (SharedJunctions name list only) or manifest-less fallback.
+    $dirsToCheck = if ($hasSharedJunctionsProp) { $manifestJunctionNames } else { $sharedDirs }
+    foreach ($name in $dirsToCheck) {
+        $jPath = Join-Path $Lane2Home $name
+        $junctionDetachedOrWouldDetach = $false
 
-    # If setup-dual-lane.ps1 moved a pre-existing real directory aside (.backup-*), restore it now.
-    if (Test-Path -LiteralPath $Lane2Home -PathType Container) {
-        $dirBackups = @(Get-ChildItem -LiteralPath $Lane2Home -Filter "$name.backup-*" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
-        $targetVacantAfterDetach = $junctionDetachedOrWouldDetach -or (-not (Test-Path -LiteralPath $jPath))
-        if ($dirBackups.Count -gt 0 -and $targetVacantAfterDetach) {
-            $latestDirBackup = $dirBackups[0].FullName
-            Assert-NoReparsePointInPath -CandidatePath $latestDirBackup -AllowedRoots $allowedRestoreRoots
-            if (-not $script:IsDryRun) {
-                Move-Item -LiteralPath $latestDirBackup -Destination $jPath -Force
-                Write-Host "    Restored pre-existing directory: $latestDirBackup -> $jPath"
+        if (Test-Path -LiteralPath $jPath) {
+            $item = Get-Item -LiteralPath $jPath -Force
+            if ($item.LinkType -eq 'Junction' -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                if (-not $script:IsDryRun) {
+                    try {
+                        [System.IO.Directory]::Delete($jPath, $false)
+                    } catch {
+                        throw "Failed to detach NTFS Junction at '$jPath' ($($_.Exception.Message)). Aborting to protect Lane 1 data."
+                    }
+                    if (Test-Path -LiteralPath $jPath) {
+                        throw "Failed to detach NTFS Junction at '$jPath'. Aborting to protect Lane 1 data."
+                    }
+                }
+                $junctionDetachedOrWouldDetach = $true
+                if ($script:IsDryRun) {
+                    Write-Host "    [DRY-RUN] Would detach NTFS Junction: $jPath (Lane 1 target untouched)"
+                } else {
+                    Write-Host "    Detached NTFS Junction: $jPath (Lane 1 target untouched)"
+                }
             } else {
-                Write-Host "    [DRY-RUN] Would restore pre-existing directory: $latestDirBackup -> $jPath"
+                Write-Host "    Skipped non-junction directory: $jPath" -ForegroundColor DarkGray
+            }
+        }
+
+        if (Test-Path -LiteralPath $Lane2Home -PathType Container) {
+            $dirBackups = @(Get-ChildItem -LiteralPath $Lane2Home -Filter "$name.backup-*" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+            $targetVacantAfterDetach = $junctionDetachedOrWouldDetach -or (-not (Test-Path -LiteralPath $jPath))
+            if ($dirBackups.Count -gt 0 -and $targetVacantAfterDetach) {
+                $latestDirBackup = $dirBackups[0].FullName
+                Assert-NoReparsePointInPath -CandidatePath $latestDirBackup -AllowedRoots $allowedRestoreRoots
+                if (-not $script:IsDryRun) {
+                    Move-Item -LiteralPath $latestDirBackup -Destination $jPath -Force
+                    Write-Host "    Restored pre-existing directory (legacy fallback): $latestDirBackup -> $jPath"
+                } else {
+                    Write-Host "    [DRY-RUN] Would restore pre-existing directory (legacy fallback): $latestDirBackup -> $jPath"
+                }
             }
         }
     }
@@ -788,7 +926,7 @@ if ($manifest) {
                         continue
                     }
                 }
-                $script:WarningCount++
+                $script:ErrorCount++
                 Write-Warning "Backup file missing: $bkp (cannot restore $target; original file left untouched)"
                 continue
             }
