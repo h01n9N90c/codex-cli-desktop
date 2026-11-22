@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Deterministic, SHA-256 verified rollback & recovery tool for Codex Dual-Lane & Security Kit on Windows.
 
@@ -131,14 +131,30 @@ function Resolve-CanonicalLongPath {
     )
     if ([string]::IsNullOrWhiteSpace($PathValue)) { return '' }
 
-    $inputPath = $PathValue
-    if (-not [System.IO.Path]::IsPathRooted($inputPath)) {
-        try {
-            $psCwd = (Get-Location -PSProvider FileSystem).ProviderPath
-            if (-not [string]::IsNullOrEmpty($psCwd)) {
-                $inputPath = [System.IO.Path]::Combine($psCwd, $inputPath)
+    $inputPath = $PathValue.Trim().Replace('/', '\')
+    $psCwd = ''
+    try {
+        $psCwd = (Get-Location -PSProvider FileSystem).ProviderPath
+    } catch {
+        $psCwd = [System.Environment]::CurrentDirectory
+    }
+    if (-not [string]::IsNullOrEmpty($psCwd)) {
+        if ($inputPath -match '^[A-Za-z]:([^\\].*)?$') {
+            $drivePrefix = $inputPath.Substring(0, 2)
+            $rest = $inputPath.Substring(2)
+            if ($psCwd.StartsWith($drivePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $inputPath = [System.IO.Path]::Combine($psCwd, $rest)
+            } else {
+                $inputPath = $drivePrefix + '\' + $rest
             }
-        } catch {}
+        } elseif ($inputPath.StartsWith('\') -and (-not $inputPath.StartsWith('\\'))) {
+            $cwdRoot = [System.IO.Path]::GetPathRoot($psCwd)
+            if (-not [string]::IsNullOrEmpty($cwdRoot)) {
+                $inputPath = [System.IO.Path]::Combine($cwdRoot, $inputPath.TrimStart('\'))
+            }
+        } elseif (-not [System.IO.Path]::IsPathRooted($inputPath)) {
+            $inputPath = [System.IO.Path]::Combine($psCwd, $inputPath)
+        }
     }
 
     $full = [System.IO.Path]::GetFullPath($inputPath)
@@ -1006,7 +1022,7 @@ if ($manifest) {
 # Step 3: Reconcile CLI Wrappers (Restore Pre-Existing or Remove Newly Created) & Clean User PATH
 # ============================================================================
 Write-Step "Step 3: Reconciling CLI wrappers in $LocalBin..."
-foreach ($w in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd')) {
+foreach ($w in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd', 'codex', 'codex-official', 'codex-t3')) {
     $wp = Resolve-CanonicalLongPath -PathValue (Join-Path $LocalBin $w)
     # If Step 2 already restored (ExistedPrior=$true) or removed (ExistedPrior=$false) this wrapper
     # from the rollback manifest, do not touch it again in Step 3.

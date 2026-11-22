@@ -75,17 +75,20 @@ usage() {
 Usage: ./scripts/setup-dual-lane.sh [REPO_PATH] [OPTIONS]
 
 Options:
-  --repo PATH                 Target repository directory (default: current directory)
+  --repo, --repo-path PATH    Target repository directory (default: current directory; accepts relative paths like .)
   --approval-policy MODE      'on-request' (default, secure) or 'never' (unattended)
   --allow-sandbox-network     Enable network_access=true inside [sandbox_workspace_write]
   --use-git-worktree          Create an isolated Git worktree (<repo>-lane2) for OS-level file isolation
   --worktree-path PATH        Custom worktree path when using --use-git-worktree
   --configure-gateway         Configure custom API key / gateway provider via env_key (zero plaintext secrets)
+  --configure-cli-gateway     Configure custom API key / gateway on Lane 2 CLI only (leaves Lane 1 Desktop config.toml untouched)
   --gateway-target-lane LANE  Target lane for gateway/API key config: 'lane1' (default), 'lane2' (CLI), or 'both'
   --gateway-provider NAME     Provider identifier for [model_providers."<NAME>"] (default: OpenAI)
   --gateway-base-url URL      Absolute http(s) base URL for the gateway (required with --configure-gateway)
   --gateway-model SLUG        Optional default model and review_model slug for the gateway lane
   --gateway-api-key-env VAR   Environment variable referenced by env_key (default: CODEX_GATEWAY_API_KEY)
+  --cli-api-key-env VAR       Alias for --gateway-api-key-env
+  --share-auth-to-lane2       Read-only copy Lane 1 Desktop auth.json to Lane 2 CLI with 0600 perms & rollback tracking (alias: --share-official-auth)
   --install-bridge            Copy templates/DUAL_LANE_BRIDGE.md into <repo>/artifacts/dual-lane/
   --sync-sessions             Run scripts/sync-sessions.py after install (requires python3)
   --pinned-only               With --sync-sessions, only sync pinned threads
@@ -465,11 +468,13 @@ USE_GIT_WORKTREE=0
 LANE2_WORKTREE_PATH=""
 LANE2_BRANCH="${CODEX_LANE2_BRANCH:-dual-lane-2}"
 CONFIGURE_GATEWAY=0
+CONFIGURE_CLI_GATEWAY=0
 GATEWAY_TARGET_LANE="${CODEX_GATEWAY_TARGET_LANE:-lane1}"
 GATEWAY_PROVIDER="${CODEX_GATEWAY_PROVIDER:-OpenAI}"
 GATEWAY_BASE_URL="${CODEX_GATEWAY_BASE_URL:-}"
 GATEWAY_MODEL="${CODEX_GATEWAY_MODEL:-}"
 GATEWAY_API_KEY_ENV="${CODEX_GATEWAY_API_KEY_ENV:-CODEX_GATEWAY_API_KEY}"
+SHARE_AUTH_TO_LANE2=0
 INSTALL_BRIDGE=0
 SYNC_SESSIONS=0
 PINNED_ONLY=0
@@ -477,7 +482,7 @@ DRY_RUN=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --repo)
+    --repo|--repo-path)
       require_arg "$1" "$#"
       REPO_PATH="$2"
       shift 2
@@ -504,6 +509,11 @@ while [ "$#" -gt 0 ]; do
       CONFIGURE_GATEWAY=1
       shift
       ;;
+    --configure-cli-gateway)
+      CONFIGURE_GATEWAY=1
+      CONFIGURE_CLI_GATEWAY=1
+      shift
+      ;;
     --gateway-target-lane)
       require_arg "$1" "$#"
       GATEWAY_TARGET_LANE="$2"
@@ -525,10 +535,14 @@ while [ "$#" -gt 0 ]; do
       GATEWAY_MODEL="$2"
       shift 2
       ;;
-    --gateway-api-key-env)
+    --gateway-api-key-env|--cli-api-key-env)
       require_arg "$1" "$#"
       GATEWAY_API_KEY_ENV="$2"
       shift 2
+      ;;
+    --share-auth-to-lane2|--share-official-auth)
+      SHARE_AUTH_TO_LANE2=1
+      shift
       ;;
     --install-bridge)
       INSTALL_BRIDGE=1
@@ -590,6 +604,12 @@ case "${SANDBOX_NETWORK}" in
 esac
 
 # Validate gateway target lane and gateway parameters when gateway mode is active.
+if [ "${CONFIGURE_CLI_GATEWAY}" -eq 1 ]; then
+  CONFIGURE_GATEWAY=1
+  if [ "$(printf '%s' "${GATEWAY_TARGET_LANE}" | awk '{print tolower($0)}')" != "both" ]; then
+    GATEWAY_TARGET_LANE="lane2"
+  fi
+fi
 GATEWAY_TARGET_LOWER="$(printf '%s' "${GATEWAY_TARGET_LANE}" | awk '{print tolower($0)}')"
 GATEWAY_ON_LANE1=0
 GATEWAY_ON_LANE2=0
@@ -648,6 +668,10 @@ if [ ! -d "${REPO_PATH}" ]; then
   exit 1
 fi
 REPO_PATH="$(cd -P -- "${REPO_PATH}" && pwd -P)"
+if [[ "${REPO_PATH}" != /* ]]; then
+  echo "[FAIL] REPO_PATH must resolve to an absolute path: ${REPO_PATH}" >&2
+  exit 1
+fi
 REPO_PATH="$(validate_path_value "REPO_PATH" "${REPO_PATH}")"
 
 LANE1_HOME="$(validate_path_value "LANE1_HOME" "${LANE1_HOME}")"
@@ -876,6 +900,29 @@ backup_and_copy "${KIT_ROOT}/templates/default.rules" "${LANE2_HOME}/rules/defau
 backup_and_copy "${KIT_ROOT}/templates/AGENTS.lane1.md" "${LANE1_HOME}/AGENTS.md" 600
 backup_and_copy "${KIT_ROOT}/templates/AGENTS.lane2.md" "${LANE2_HOME}/AGENTS.md" 600
 
+# Optional: Share / Harvest OAuth Login (`auth.json`) from Lane 1 (Desktop) to Lane 2 (CLI)
+# Read-only on Lane 1: safely backs up any pre-existing Lane 2 auth.json into MANIFEST_ROWS,
+# atomically copies Lane 1 auth.json to Lane 2 auth.json with chmod 600, and records
+# Lane 2 auth.json in MANIFEST_ROWS so restore-original.sh restores/removes it deterministically
+# while leaving Lane 1 auth.json 100% untouched.
+if [ "${SHARE_AUTH_TO_LANE2}" -eq 1 ]; then
+  LANE1_AUTH="${LANE1_HOME}/auth.json"
+  LANE2_AUTH="${LANE2_HOME}/auth.json"
+  if [ -L "${LANE1_AUTH}" ]; then
+    echo "[FAIL] Security refusal: '${LANE1_AUTH}' is a symlink; refusing to harvest auth.json." >&2
+    exit 1
+  fi
+  if [ -L "${LANE2_AUTH}" ]; then
+    echo "[FAIL] Security refusal: destination '${LANE2_AUTH}' is a symlink; refusing to overwrite." >&2
+    exit 1
+  fi
+  if [ -f "${LANE1_AUTH}" ]; then
+    backup_and_copy "${LANE1_AUTH}" "${LANE2_AUTH}" 600
+  else
+    echo "[WARN] --share-auth-to-lane2 specified, but '${LANE1_AUTH}' does not exist; skipping auth copy." >&2
+  fi
+fi
+
 # ------------------------------------------------------------------------------
 # 7. Non-Destructively Merge & Atomically Write Lane 2 (and Optional Lane 1 Gateway) config.toml
 # ------------------------------------------------------------------------------
@@ -1052,6 +1099,111 @@ has_project_section_in() {
     || printf '%s\n' "${preserved_sections}" | grep -Fq -e "[projects.'${raw_p}']"
 }
 
+# Read-only harvest of trusted [projects."..."] tables from Lane 1 (Codex Desktop)
+# into Lane 2 (Codex CLI), excluding any project table already present in Lane 2
+# (REPO_PATH, EFFECTIVE_LANE2_REPO, or PRESERVED_USER_SECTIONS).
+extract_harvested_lane1_projects() {
+  local lane1_cfg="$1"
+  local existing_sections="$2"
+  if [ ! -f "${lane1_cfg}" ] || [ -L "${lane1_cfg}" ]; then
+    return 0
+  fi
+  AWK_EXISTING_SECTIONS="${existing_sections}" \
+  AWK_REPO_RAW="${REPO_PATH}" \
+  AWK_REPO_ESC="${ESC_REPO}" \
+  AWK_WT_RAW="${EFFECTIVE_LANE2_REPO}" \
+  AWK_WT_ESC="${ESC_LANE2_REPO}" \
+  awk '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    function extract_sec_header(line,    clean, sec) {
+      sub(/\r$/, "", line)
+      clean = strip_comment(line)
+      if (clean !~ /^[[:space:]]*\[.*\][[:space:]]*$/) {
+        return ""
+      }
+      sec = clean
+      sub(/^[[:space:]]*\[/, "", sec)
+      sub(/\][[:space:]]*$/, "", sec)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
+      return sec
+    }
+    function norm_proj_key(sec,    k, q) {
+      k = sec
+      sub(/^projects\.[[:space:]]*/, "", k)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      q = substr(k, 1, 1)
+      if ((q == "\"" || q == "\047") && substr(k, length(k), 1) == q && length(k) >= 2) {
+        k = substr(k, 2, length(k) - 2)
+        if (q == "\"") {
+          gsub(/\\"/, "\"", k)
+          gsub(/\\\\/, "\\", k)
+        }
+      }
+      return k
+    }
+    BEGIN {
+      if (ENVIRON["AWK_REPO_RAW"] != "") seen_proj[ENVIRON["AWK_REPO_RAW"]] = 1
+      if (ENVIRON["AWK_REPO_ESC"] != "") seen_proj[ENVIRON["AWK_REPO_ESC"]] = 1
+      if (ENVIRON["AWK_WT_RAW"] != "")   seen_proj[ENVIRON["AWK_WT_RAW"]] = 1
+      if (ENVIRON["AWK_WT_ESC"] != "")   seen_proj[ENVIRON["AWK_WT_ESC"]] = 1
+      n = split(ENVIRON["AWK_EXISTING_SECTIONS"], lines, "\n")
+      for (i = 1; i <= n; i++) {
+        s = extract_sec_header(lines[i])
+        if (s ~ /^projects\./) {
+          seen_proj[norm_proj_key(s)] = 1
+          seen_sec[s] = 1
+        }
+      }
+      keep = 0
+    }
+    {
+      sub(/\r$/, "", $0)
+      clean = strip_comment($0)
+      sec = extract_sec_header($0)
+      if (sec != "") {
+        if (sec ~ /^projects\./) {
+          pk = norm_proj_key(sec)
+          if (!(pk in seen_proj) && !(sec in seen_sec)) {
+            keep = 1
+            seen_proj[pk] = 1
+            seen_sec[sec] = 1
+          } else {
+            keep = 0
+          }
+        } else {
+          keep = 0
+        }
+      }
+    }
+    keep == 1 {
+      if (clean ~ /^[[:space:]]*(experimental_bearer_token|api_key)[[:space:]]*=/) {
+        next
+      }
+      print $0
+    }
+  ' "${lane1_cfg}" || true
+}
+
 CFG2="${LANE2_HOME}/config.toml"
 PRESERVED_TOP_KEYS=""
 PRESERVED_USER_SECTIONS=""
@@ -1124,6 +1276,13 @@ render_lane2_config() {
   if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}" "${ESC_LANE2_REPO}"; then
     printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
     printf 'trust_level = "trusted"\n\n'
+  fi
+  if [ -f "${LANE1_HOME}/config.toml" ] && [ ! -L "${LANE1_HOME}/config.toml" ]; then
+    local harvested_l1_projects=""
+    harvested_l1_projects="$(extract_harvested_lane1_projects "${LANE1_HOME}/config.toml" "${PRESERVED_USER_SECTIONS}")"
+    if [ -n "${harvested_l1_projects}" ]; then
+      printf '# Inherited trusted projects from Lane 1 (Codex Desktop)\n%s\n\n' "${harvested_l1_projects}"
+    fi
   fi
   printf '[features]\n'
   [ "${HAS_DAEMON_FLAG}" -eq 1 ] && printf 'daemon_auto_start = false\n'

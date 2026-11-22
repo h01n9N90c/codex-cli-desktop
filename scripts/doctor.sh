@@ -36,10 +36,11 @@ Usage: ./scripts/doctor.sh [OPTIONS]
 Read-only compatibility, health, and behavioral security diagnostic.
 
 Options:
-  --lane1 PATH        Primary CODEX_HOME to inspect (default: $CODEX_LANE1_HOME or ~/.codex)
-  --lane2 PATH        Secondary CODEX_HOME to inspect (default: $CODEX_LANE2_HOME or ~/.codex-official)
-  --local-bin PATH    CLI wrapper directory to inspect (default: $CODEX_LOCAL_BIN or ~/.local/bin)
-  -h, --help          Show this help message
+  --repo, --repo-path PATH  Target repository directory to inspect (optional; accepts relative paths like .)
+  --lane1 PATH              Primary CODEX_HOME to inspect (default: $CODEX_LANE1_HOME or ~/.codex)
+  --lane2 PATH              Secondary CODEX_HOME to inspect (default: $CODEX_LANE2_HOME or ~/.codex-official)
+  --local-bin PATH          CLI wrapper directory to inspect (default: $CODEX_LOCAL_BIN or ~/.local/bin)
+  -h, --help                Show this help message
 EOF
 }
 
@@ -139,12 +140,18 @@ report() {
 # ------------------------------------------------------------------------------
 # CLI Argument Parsing
 # ------------------------------------------------------------------------------
+REPO_PATH=""
 LANE1_HOME="${CODEX_LANE1_HOME:-${HOME}/.codex}"
 LANE2_HOME="${CODEX_LANE2_HOME:-${HOME}/.codex-official}"
 LOCAL_BIN="${CODEX_LOCAL_BIN:-${HOME}/.local/bin}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --repo|--repo-path)
+      require_arg "$1" "$#"
+      REPO_PATH="$2"
+      shift 2
+      ;;
     --lane1)
       require_arg "$1" "$#"
       LANE1_HOME="$2"
@@ -172,12 +179,37 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ -n "${REPO_PATH}" ]; then
+  if printf '%s' "${REPO_PATH}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    echo "[FAIL] REPO_PATH contains unsupported control characters." >&2
+    exit 1
+  fi
+  if [ ! -d "${REPO_PATH}" ]; then
+    echo "[FAIL] Target repository directory does not exist: ${REPO_PATH}" >&2
+    exit 1
+  fi
+  REPO_PATH="$(cd -P -- "${REPO_PATH}" && pwd -P)"
+  if [[ "${REPO_PATH}" != /* ]]; then
+    echo "[FAIL] REPO_PATH must resolve to an absolute path: ${REPO_PATH}" >&2
+    exit 1
+  fi
+  REPO_PATH="$(strip_trailing_slashes "${REPO_PATH}")"
+  if [ "${REPO_PATH}" = "/" ]; then
+    echo "[FAIL] Refusing filesystem root '/' for REPO_PATH." >&2
+    exit 1
+  fi
+fi
+
 LANE1_HOME="$(strip_trailing_slashes "${LANE1_HOME}")"
 LANE2_HOME="$(strip_trailing_slashes "${LANE2_HOME}")"
 LOCAL_BIN="$(strip_trailing_slashes "${LOCAL_BIN}")"
 
-LANE1_CANON="$(canonicalize_dir_if_exists "${LANE1_HOME}")"
-LOCAL_BIN_CANON="$(canonicalize_dir_if_exists "${LOCAL_BIN}")"
+LANE1_HOME="$(canonicalize_dir_if_exists "${LANE1_HOME}")"
+LANE2_HOME="$(canonicalize_dir_if_exists "${LANE2_HOME}")"
+LOCAL_BIN="$(canonicalize_dir_if_exists "${LOCAL_BIN}")"
+
+LANE1_CANON="${LANE1_HOME}"
+LOCAL_BIN_CANON="${LOCAL_BIN}"
 
 echo "=== Codex Dual-Lane System Doctor (Unix / macOS / WSL Diagnostics) ==="
 
@@ -320,8 +352,10 @@ check_lane() {
   local cfg="${dir}/config.toml"
   local rules="${dir}/rules/default.rules"
   local agents="${dir}/AGENTS.md"
+  local has_cfg=0
+  [ -f "${cfg}" ] && has_cfg=1
 
-  if [ -f "${cfg}" ] && [ -f "${rules}" ] && [ -s "${agents}" ]; then
+  if { [ "${has_cfg}" -eq 1 ] || [ "${label}" = "Lane 1" ]; } && [ -f "${rules}" ] && [ -s "${agents}" ]; then
     local symlink_warn=""
     if [ -L "${cfg}" ] || [ -L "${rules}" ] || [ -L "${agents}" ]; then
       symlink_warn=" | symlink-detected"
@@ -334,14 +368,16 @@ check_lane() {
       static_ok=1
     fi
 
-    local net_label="sandbox_net=enabled"
-    if is_sandbox_network_restricted "${cfg}"; then
-      net_label="sandbox_net=restricted"
-    fi
-
+    local net_label="desktop_cfg=untouched(default)"
     local secret_warn=0
-    if has_plaintext_api_key "${cfg}"; then
-      secret_warn=1
+    if [ "${has_cfg}" -eq 1 ]; then
+      net_label="sandbox_net=enabled"
+      if is_sandbox_network_restricted "${cfg}"; then
+        net_label="sandbox_net=restricted"
+      fi
+      if has_plaintext_api_key "${cfg}"; then
+        secret_warn=1
+      fi
     fi
 
     local probe_note="engine_probe=skipped(no-codex)"

@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Real-time, strictly read-only compatibility, health & behavioral security diagnostic for
     Codex Dual-Lane & Security Kit on Windows.
@@ -35,12 +35,17 @@
     CODEX_HOME directory for Lane 2 (Official CLI). Default: %USERPROFILE%\.codex-official.
 
 .PARAMETER LocalBin
-    Directory containing installed CLI wrappers (`codex.cmd`, `codex-official.cmd`, `codex-t3.cmd`).
+    Directory containing installed CLI wrappers (`codex.cmd`, `codex-official.cmd`, `codex-t3.cmd`
+    and extensionless Git Bash POSIX shims `codex`, `codex-official`, `codex-t3`).
     Default: %USERPROFILE%\.local\bin.
 
 .PARAMETER CodexPath
     Optional explicit path to `codex.exe` or `codex.cmd` for live `execpolicy check` probes.
     When omitted, auto-discovers WindowsApps MSIX, PATH, and common fallback locations.
+
+.PARAMETER RepoPath
+    Optional target repository path (alias: -ProjectRoot; supports relative paths such as `.` or `.\sub`)
+    to normalize and verify alongside lane diagnostics.
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\doctor.ps1
@@ -59,7 +64,9 @@ param(
     [string]$Lane1Home = (Join-Path $env:USERPROFILE '.codex'),
     [string]$Lane2Home = (Join-Path $env:USERPROFILE '.codex-official'),
     [string]$LocalBin  = (Join-Path $env:USERPROFILE '.local\bin'),
-    [string]$CodexPath = ''
+    [string]$CodexPath = '',
+    [Alias('ProjectRoot')]
+    [string]$RepoPath  = ''
 )
 
 Set-StrictMode -Version Latest
@@ -97,14 +104,30 @@ function Resolve-CanonicalLongPath {
     )
     if ([string]::IsNullOrWhiteSpace($PathValue)) { return '' }
 
-    $inputPath = $PathValue
-    if (-not [System.IO.Path]::IsPathRooted($inputPath)) {
-        try {
-            $psCwd = (Get-Location -PSProvider FileSystem).ProviderPath
-            if (-not [string]::IsNullOrEmpty($psCwd)) {
-                $inputPath = [System.IO.Path]::Combine($psCwd, $inputPath)
+    $inputPath = $PathValue.Trim().Replace('/', '\')
+    $psCwd = ''
+    try {
+        $psCwd = (Get-Location -PSProvider FileSystem).ProviderPath
+    } catch {
+        $psCwd = [System.Environment]::CurrentDirectory
+    }
+    if (-not [string]::IsNullOrEmpty($psCwd)) {
+        if ($inputPath -match '^[A-Za-z]:([^\\].*)?$') {
+            $drivePrefix = $inputPath.Substring(0, 2)
+            $rest = $inputPath.Substring(2)
+            if ($psCwd.StartsWith($drivePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $inputPath = [System.IO.Path]::Combine($psCwd, $rest)
+            } else {
+                $inputPath = $drivePrefix + '\' + $rest
             }
-        } catch {}
+        } elseif ($inputPath.StartsWith('\') -and (-not $inputPath.StartsWith('\\'))) {
+            $cwdRoot = [System.IO.Path]::GetPathRoot($psCwd)
+            if (-not [string]::IsNullOrEmpty($cwdRoot)) {
+                $inputPath = [System.IO.Path]::Combine($cwdRoot, $inputPath.TrimStart('\'))
+            }
+        } elseif (-not [System.IO.Path]::IsPathRooted($inputPath)) {
+            $inputPath = [System.IO.Path]::Combine($psCwd, $inputPath)
+        }
     }
 
     $full = [System.IO.Path]::GetFullPath($inputPath)
@@ -471,8 +494,17 @@ $Lane1Home = Get-NormalizedFullPath $Lane1Home
 $Lane2Home = Get-NormalizedFullPath $Lane2Home
 $LocalBin  = Get-NormalizedFullPath $LocalBin
 if ($CodexPath) { $CodexPath = Get-NormalizedFullPath $CodexPath }
+if ($RepoPath)  { $RepoPath  = Get-NormalizedFullPath $RepoPath }
 
 Write-Host "=== Codex Dual-Lane System Doctor (Real Host Diagnostics, Read-Only) ===" -ForegroundColor Cyan
+
+if ($PSBoundParameters.ContainsKey('RepoPath')) {
+    if (-not [string]::IsNullOrWhiteSpace($RepoPath) -and (Test-Path -LiteralPath $RepoPath -PathType Container)) {
+        Report 'PASS' 'Target Repository' $RepoPath
+    } else {
+        Report 'FAIL' 'Target Repository' "Specified -RepoPath does not exist or is not a directory: $RepoPath"
+    }
+}
 
 # ============================================================================
 # Check 1: Operating System & PowerShell Runtime
@@ -506,6 +538,10 @@ if ($homeDrive -notmatch '^[A-Za-z]$') {
 # Check 3: Codex CLI Launcher Resolution & PATH Precedence
 # ============================================================================
 $normBin = $LocalBin.TrimEnd('\').ToLowerInvariant()
+$hasPosixShims = (Test-Path -LiteralPath (Join-Path $LocalBin 'codex') -PathType Leaf) -and
+                 (Test-Path -LiteralPath (Join-Path $LocalBin 'codex-official') -PathType Leaf) -and
+                 (Test-Path -LiteralPath (Join-Path $LocalBin 'codex-t3') -PathType Leaf)
+$posixShimNote = if ($hasPosixShims) { ' [+.cmd & Git Bash shims]' } else { '' }
 $codexCmd = Get-Command codex -ErrorAction SilentlyContinue
 if ($codexCmd -and $codexCmd.Source) {
     $ver = 'unknown'
@@ -518,14 +554,14 @@ if ($codexCmd -and $codexCmd.Source) {
     } catch {}
     $parent = (Get-NormalizedFullPath (Split-Path -Parent $codexCmd.Source)).TrimEnd('\').ToLowerInvariant()
     if ($parent -eq $normBin) {
-        Report 'PASS' 'codex CLI in PATH' "$($codexCmd.Source) ($ver)"
+        Report 'PASS' 'codex CLI in PATH' "$($codexCmd.Source) ($ver)$posixShimNote"
     } else {
-        Report 'WARN' 'codex CLI in PATH' "Resolved to $($codexCmd.Source) instead of $LocalBin\codex.cmd (reopen terminal or put $LocalBin first in PATH)"
+        Report 'WARN' 'codex CLI in PATH' "Resolved to $($codexCmd.Source) instead of $LocalBin\codex.cmd (reopen terminal or put $LocalBin first in PATH)$posixShimNote"
     }
 } else {
     $localFallback = Join-Path $LocalBin 'codex.cmd'
     if (Test-Path -LiteralPath $localFallback -PathType Leaf) {
-        Report 'WARN' 'codex CLI in PATH' "Wrapper exists at $localFallback but is not yet in PATH (reopen terminal)"
+        Report 'WARN' 'codex CLI in PATH' "Wrapper exists at $localFallback$posixShimNote but is not yet in PATH (reopen terminal)"
     } else {
         Report 'WARN' 'codex CLI in PATH' 'Not found in PATH. Run setup-dual-lane.ps1 and reopen terminal.'
     }
@@ -535,12 +571,12 @@ $codexT3Cmd = Get-Command codex-t3 -ErrorAction SilentlyContinue
 if ($codexT3Cmd -and $codexT3Cmd.Source) {
     $t3Parent = (Get-NormalizedFullPath (Split-Path -Parent $codexT3Cmd.Source)).TrimEnd('\').ToLowerInvariant()
     if ($t3Parent -eq $normBin) {
-        Report 'PASS' 'codex-t3 CLI in PATH' $codexT3Cmd.Source
+        Report 'PASS' 'codex-t3 CLI in PATH' "$($codexT3Cmd.Source)$posixShimNote"
     } else {
-        Report 'WARN' 'codex-t3 CLI in PATH' "Resolved to $($codexT3Cmd.Source) instead of $LocalBin\codex-t3.cmd"
+        Report 'WARN' 'codex-t3 CLI in PATH' "Resolved to $($codexT3Cmd.Source) instead of $LocalBin\codex-t3.cmd$posixShimNote"
     }
 } elseif (Test-Path -LiteralPath (Join-Path $LocalBin 'codex-t3.cmd') -PathType Leaf) {
-    Report 'WARN' 'codex-t3 CLI in PATH' "Wrapper exists at $(Join-Path $LocalBin 'codex-t3.cmd') (reopen terminal for PATH)"
+    Report 'WARN' 'codex-t3 CLI in PATH' "Wrapper exists at $(Join-Path $LocalBin 'codex-t3.cmd')$posixShimNote (reopen terminal for PATH)"
 } else {
     Report 'WARN' 'codex-t3 CLI in PATH' 'Not found in PATH'
 }

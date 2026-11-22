@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Universal, hardware-adaptive, security-hardened installer for Codex Dual-Lane & Security Kit on Windows.
 
@@ -60,7 +60,8 @@
     Directory Junctions and must not equal or overlap Lane1Home. Default: %USERPROFILE%\.codex-official.
 
 .PARAMETER LocalBin
-    Directory where self-healing CLI wrappers (codex.cmd, codex-official.cmd, codex-t3.cmd) are
+    Directory where self-healing CLI wrappers (codex.cmd, codex-official.cmd, codex-t3.cmd and
+    extensionless Git Bash / MSYS2 POSIX shims codex, codex-official, codex-t3) are
     installed. Default: %USERPROFILE%\.local\bin.
 
 .PARAMETER CargoTargetDir
@@ -100,27 +101,35 @@
 .PARAMETER ConfigureGateway
     Configures an OpenAI-compatible API key / gateway provider in config.toml using `env_key` ONLY
     (never writing plaintext API keys to disk). Use -GatewayTargetLane to target Lane 1, Lane 2 (CLI),
-    or Both.
+    or Both, or pass -ConfigureCliGateway to target Lane 2 CLI directly while leaving Lane 1 Desktop untouched.
+
+.PARAMETER ConfigureCliGateway
+    Convenience switch for Codex CLI API key / gateway configuration: automatically enables
+    -ConfigureGateway and sets -GatewayTargetLane to 'Lane2' (unless -GatewayTargetLane 'Both' was
+    explicitly specified), leaving Lane 1 (`~/.codex/config.toml`, Codex Desktop Primary Account)
+    100% untouched.
 
 .PARAMETER GatewayTargetLane
     Selects which lane(s) receive the `[model_providers."<Name>"]` (`env_key`) gateway configuration
-    when -ConfigureGateway is enabled:
-      - 'Lane1' (default, backward-compatible): Lane 1 (`~/.codex`)
-      - 'Lane2': Lane 2 CLI (`~/.codex-official`), leaving Lane 1 Desktop on your Primary Account (`acc chính`)
-        while Lane 2 CLI supports both OAuth Login (`auth.json`) and API Key (`env_key`)
+    when -ConfigureGateway (or -ConfigureCliGateway) is enabled:
+      - 'Lane1' (default for -ConfigureGateway): Lane 1 (`~/.codex`)
+      - 'Lane2' (default for -ConfigureCliGateway): Lane 2 CLI (`~/.codex-official`), leaving Lane 1 Desktop
+        on your Primary Account (`acc chính`) while Lane 2 CLI supports both OAuth Login (`auth.json`)
+        and API Key (`env_key`)
       - 'Both' : Configures both Lane 1 and Lane 2 with `env_key`
 
 .PARAMETER GatewayProviderName
     TOML provider identifier for [model_providers."<Name>"] when -ConfigureGateway is set. Default: OpenAI.
 
 .PARAMETER GatewayBaseUrl
-    Absolute http(s) base URL for the gateway (required with -ConfigureGateway).
+    Absolute http(s) base URL for the gateway (required with -ConfigureGateway / -ConfigureCliGateway).
 
 .PARAMETER GatewayModel
     Optional default model and review_model slug for the target gateway lane(s) when -ConfigureGateway is set.
 
 .PARAMETER GatewayApiKeyEnv
-    Environment variable name referenced by `env_key` in the target lane's config.toml. Default: CODEX_GATEWAY_API_KEY.
+    Environment variable name (alias: -CliApiKeyEnv) referenced by `env_key` in the target lane's
+    config.toml. Default: CODEX_GATEWAY_API_KEY.
 
 .PARAMETER GatewayApiKey
     (Legacy compatibility) Stores the provided API key in the User environment variable named by
@@ -200,11 +209,13 @@ param(
     [string]$Lane2WorktreePath = '',
     [string]$Lane2Branch = 'dual-lane-2',
     [switch]$ConfigureGateway,
+    [switch]$ConfigureCliGateway,
     [ValidateSet('Lane1', 'Lane2', 'Both')]
     [string]$GatewayTargetLane = 'Lane1',
     [string]$GatewayProviderName = 'OpenAI',
     [string]$GatewayBaseUrl = '',
     [string]$GatewayModel = '',
+    [Alias('CliApiKeyEnv')]
     [string]$GatewayApiKeyEnv = 'CODEX_GATEWAY_API_KEY',
     [string]$GatewayApiKey = '',
     [switch]$PromptGatewayApiKey,
@@ -269,14 +280,30 @@ function Resolve-CanonicalLongPath {
 
     # Respect PowerShell's current FileSystem location for relative paths (System.IO.Path.GetFullPath
     # uses process Environment.CurrentDirectory which does not track PowerShell Push-Location).
-    $inputPath = $PathValue
-    if (-not [System.IO.Path]::IsPathRooted($inputPath)) {
-        try {
-            $psCwd = (Get-Location -PSProvider FileSystem).ProviderPath
-            if (-not [string]::IsNullOrEmpty($psCwd)) {
-                $inputPath = [System.IO.Path]::Combine($psCwd, $inputPath)
+    $inputPath = $PathValue.Trim().Replace('/', '\')
+    $psCwd = ''
+    try {
+        $psCwd = (Get-Location -PSProvider FileSystem).ProviderPath
+    } catch {
+        $psCwd = [System.Environment]::CurrentDirectory
+    }
+    if (-not [string]::IsNullOrEmpty($psCwd)) {
+        if ($inputPath -match '^[A-Za-z]:([^\\].*)?$') {
+            $drivePrefix = $inputPath.Substring(0, 2)
+            $rest = $inputPath.Substring(2)
+            if ($psCwd.StartsWith($drivePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $inputPath = [System.IO.Path]::Combine($psCwd, $rest)
+            } else {
+                $inputPath = $drivePrefix + '\' + $rest
             }
-        } catch {}
+        } elseif ($inputPath.StartsWith('\') -and (-not $inputPath.StartsWith('\\'))) {
+            $cwdRoot = [System.IO.Path]::GetPathRoot($psCwd)
+            if (-not [string]::IsNullOrEmpty($cwdRoot)) {
+                $inputPath = [System.IO.Path]::Combine($cwdRoot, $inputPath.TrimStart('\'))
+            }
+        } elseif (-not [System.IO.Path]::IsPathRooted($inputPath)) {
+            $inputPath = [System.IO.Path]::Combine($psCwd, $inputPath)
+        }
     }
 
     $full = [System.IO.Path]::GetFullPath($inputPath)
@@ -997,12 +1024,16 @@ function Get-SupportedCodexFeatures([string]$ExePath, [string]$ProbeHome) {
 function Get-ExistingTrustedProjects([string[]]$ConfigPaths) {
     <#
     .SYNOPSIS
-        Harvests all existing [projects."..."] and [projects.'...'] trust entries across prior
-        Lane 1 and Lane 2 config.toml files so upgrading or installing never loses trusted repos.
+        Strictly read-only harvest of all existing [projects."..."] and [projects.'...'] trust
+        entries across prior Lane 2 and Lane 1 (Codex Desktop) config.toml files so upgrading or
+        installing never loses trusted repos and Codex CLI automatically trusts projects already
+        trusted in Codex Desktop without modifying a single byte of Lane 1's config.toml.
     #>
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $list = New-Object 'System.Collections.Generic.List[string]'
     foreach ($cfg in $ConfigPaths) {
+        if ([string]::IsNullOrWhiteSpace($cfg)) { continue }
+        Assert-NotReparsePoint -PathValue $cfg -Label 'config.toml trusted project harvest'
         if (-not (Test-Path -LiteralPath $cfg -PathType Leaf)) { continue }
         # Explicit UTF-8 read avoids PowerShell 5.1 ANSI/Windows-1252 mojibake on UTF-8 no-BOM files with Unicode paths.
         $content = Get-Content -LiteralPath $cfg -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
@@ -1015,7 +1046,10 @@ function Get-ExistingTrustedProjects([string[]]$ConfigPaths) {
                 # Unescape TOML basic-string escapes back to a native Windows path before re-escaping on write.
                 $m.Groups[2].Value.Replace('\"', '"').Replace('\\', '\')
             }
-            if ($raw -and $seen.Add($raw)) {
+            if (-not $raw -or ($raw -match '[\x00-\x1F\x7F]')) { continue }
+            $dedupKey = try { (Resolve-CanonicalLongPath -PathValue $raw).TrimEnd('\', '/') } catch { $raw.TrimEnd('\', '/') }
+            if ([string]::IsNullOrWhiteSpace($dedupKey)) { $dedupKey = $raw }
+            if ($seen.Add($dedupKey)) {
                 $list.Add($raw)
             }
         }
@@ -1258,7 +1292,17 @@ function Merge-CodexConfigToml {
 
 $KitRoot = Resolve-CanonicalLongPath -PathValue (Join-Path $PSScriptRoot '..')
 
-# Validate and normalize all path parameters upfront (including Win32 8.3 long-path expansion).
+# Convenience CLI gateway flag: -ConfigureCliGateway automatically enables gateway configuration
+# targeting Lane 2 (Codex CLI) unless -GatewayTargetLane was explicitly passed as 'Both',
+# guaranteeing Lane 1 (~/.codex/config.toml, Codex Desktop Primary Account) stays 100% untouched.
+if ($ConfigureCliGateway.IsPresent) {
+    $ConfigureGateway = [switch]$true
+    if ($GatewayTargetLane -ne 'Both') {
+        $GatewayTargetLane = 'Lane2'
+    }
+}
+
+# Validate and normalize all path parameters upfront (including relative paths, forward/trailing slashes, and Win32 8.3 long-path expansion).
 $RepoPath       = Assert-SafeWindowsPath -PathValue $RepoPath       -ParamName 'RepoPath'
 $CodexPath      = Assert-SafeWindowsPath -PathValue $CodexPath      -ParamName 'CodexPath' -AllowEmpty
 $Lane1Home      = Assert-SafeWindowsPath -PathValue $Lane1Home      -ParamName 'Lane1Home' -DisallowRootOrProfile
@@ -1276,7 +1320,7 @@ if ($repoItem.PSProvider.Name -ne 'FileSystem') {
     throw "Target -RepoPath must be a local filesystem directory: $RepoPath"
 }
 # Re-canonicalize via GetLongPathNameW because PowerShell's Resolve-Path preserves 8.3 short names.
-$RepoPath = Resolve-CanonicalLongPath -PathValue (Resolve-Path -LiteralPath $RepoPath).Path
+$RepoPath = Resolve-CanonicalLongPath -PathValue (Resolve-Path -LiteralPath $RepoPath).ProviderPath
 
 # Lane 1 and Lane 2 homes must be distinct, non-overlapping paths to prevent circular NTFS Junctions.
 if (Test-PathsOverlap -PathA $Lane1Home -PathB $Lane2Home) {
@@ -1714,7 +1758,10 @@ if ($configureGatewayLane2) {
 }
 $lane2ConfigPath = Join-Path $Lane2Home 'config.toml'
 Assert-NotReparsePoint -PathValue $lane2ConfigPath -Label 'Lane 2 config.toml'
-$trustedProjects = Get-ExistingTrustedProjects -ConfigPaths @((Join-Path $Lane1Home 'config.toml'), $lane2ConfigPath)
+# Strictly read-only harvest of trusted [projects."..."] from Lane 2 and Lane 1 (Codex Desktop)
+# so every project already trusted in Codex Desktop is automatically trusted in Codex CLI without
+# modifying a single byte of Lane 1's config.toml.
+$trustedProjects = Get-ExistingTrustedProjects -ConfigPaths @($lane2ConfigPath, (Join-Path $Lane1Home 'config.toml'))
 foreach ($rp in @($RepoPath, $effectiveLane2Repo)) {
     $rpCanon = Resolve-CanonicalLongPath -PathValue $rp
     $alreadyTrusted = @($trustedProjects | Where-Object {
@@ -2008,7 +2055,7 @@ $suppliedSecretForGuard = ''
 # ============================================================================
 # Step 11: Install Self-Healing CLI Wrappers into LocalBin & Update User PATH
 # ============================================================================
-Write-Step "Installing codex.cmd, codex-official.cmd, and codex-t3.cmd into $LocalBin..."
+Write-Step "Installing codex.cmd, codex-official.cmd, codex-t3.cmd and Git Bash POSIX shims (codex, codex-official, codex-t3) into $LocalBin..."
 
 # For Microsoft Store / MSIX installs, the versioned WindowsApps directory changes after updates;
 # this self-healing fallback re-queries Get-AppxPackage automatically when the cached path disappears.
@@ -2224,12 +2271,32 @@ exit /b %ERRORLEVEL%
 $officialWrapper = ($officialWrapper -replace "\r?\n", "`r`n").TrimEnd("`r", "`n") + "`r`n"
 $t3Wrapper       = ($t3Wrapper       -replace "\r?\n", "`r`n").TrimEnd("`r", "`n") + "`r`n"
 
+function New-PosixWrapperShim([string]$CmdFileName) {
+    <#
+    .SYNOPSIS
+        Generates an extensionless POSIX shell shim (with strict LF line endings) for Git Bash /
+        MSYS2 / Cygwin on Windows that delegates to the sibling .cmd wrapper via cmd.exe.
+    #>
+    $lines = @(
+        '#!/usr/bin/env sh',
+        'basedir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"',
+        'if command -v cygpath >/dev/null 2>&1; then',
+        '  basedir="$(cygpath -w "$basedir")"',
+        'fi',
+        ('MSYS2_ARG_CONV_EXCL="/d;/c" exec cmd.exe /d /c call "${basedir}\\' + $CmdFileName + '" "$@"')
+    )
+    return (($lines -join "`n") + "`n")
+}
+
 # Back up, write, and checkpoint each launcher individually so even an interruption mid-Step 11
 # preserves pre-existing user launchers and tracks every newly written wrapper cleanly.
 $wrapperSpecs = @(
     @{ Name = 'codex.cmd';          Content = $officialWrapper },
     @{ Name = 'codex-official.cmd'; Content = $officialWrapper },
-    @{ Name = 'codex-t3.cmd';       Content = $t3Wrapper }
+    @{ Name = 'codex-t3.cmd';       Content = $t3Wrapper },
+    @{ Name = 'codex';              Content = (New-PosixWrapperShim -CmdFileName 'codex.cmd') },
+    @{ Name = 'codex-official';     Content = (New-PosixWrapperShim -CmdFileName 'codex-official.cmd') },
+    @{ Name = 'codex-t3';           Content = (New-PosixWrapperShim -CmdFileName 'codex-t3.cmd') }
 )
 foreach ($spec in $wrapperSpecs) {
     $wrapperFullPath = Resolve-CanonicalLongPath -PathValue (Join-Path $LocalBin $spec.Name)

@@ -6,6 +6,22 @@ The format follows semantic versioning (`MAJOR.MINOR.PATCH`).
 
 ---
 
+## [1.3.2] — 2026-11-23 (Zero-Intrusion Desktop Harvesting & Cross-Shell Compatibility)
+
+### Added
+- **Zero-Intrusion Codex Desktop (`~/.codex`) Read-Only Harvesting**:
+  - By default, `~/.codex` (`config.toml` and `auth.json` of Codex Desktop / Primary Account `acc chính`) remains 100% untouched while `scripts/setup-dual-lane.ps1` and `scripts/setup-dual-lane.sh` **read-only harvest** already-trusted `[projects."..."]` entries from `~/.codex/config.toml` into `~/.codex-official/config.toml`. Every repository trusted in Codex Desktop is automatically trusted across its directory tree in Codex CLI (`~/.codex-official`) with zero modifications to `~/.codex/config.toml`.
+  - Shares `memories`, `memories_v2`, `sessions`, `archived_sessions`, `skills`, and `plugins` read/write context via NTFS Directory Junctions (Windows) and symlinks (Unix), and supports `-ShareAuthToLane2` (alias `-ShareOfficialAuth`) on Windows and `--share-auth-to-lane2` (alias `--share-official-auth`) on Unix to atomically copy `~/.codex/auth.json` into `~/.codex-official/auth.json` with strict ACL / `chmod 600` protection and deterministic rollback tracking — leaving `~/.codex/auth.json` 100% untouched.
+- **One-Flag CLI API Key + Login Configuration (`-ConfigureCliGateway` / `--configure-cli-gateway`)**:
+  - Added `-ConfigureCliGateway` and `-CliApiKeyEnv` (alias for `-GatewayApiKeyEnv`) to `scripts/setup-dual-lane.ps1`, and `--configure-cli-gateway` and `--cli-api-key-env <VAR>` to `scripts/setup-dual-lane.sh`.
+  - Automatically targets Lane 2 (`~/.codex-official`, Codex CLI) for `env_key` API key / custom provider routing (unless `Both` / `both` is explicitly selected), allowing Codex CLI to use **both OAuth Login and API Key** while guaranteeing Lane 1 (`~/.codex`, Codex Desktop) stays 100% untouched.
+- **Cross-Shell Windows Launchers (`.cmd` + Extensionless POSIX Shims) & Relative `--repo-path` Support**:
+  - On Windows, `scripts/setup-dual-lane.ps1` now generates both `.cmd` launchers (`codex.cmd`, `codex-official.cmd`, `codex-t3.cmd`) and extensionless LF POSIX shell shims (`codex`, `codex-official`, `codex-t3`) in `~/.local/bin`, enabling seamless invocation from **PowerShell, CMD, Git Bash, and MSYS2** (with full rollback tracking and pre-existing shim backup/restore in `restore-original.ps1` and health checks in `doctor.ps1`).
+  - Added relative repository path normalization (`-RepoPath .` / `--repo-path .` / `./sub`) across `setup-dual-lane.ps1`, `doctor.ps1`, `setup-dual-lane.sh`, and `doctor.sh`.
+  - Expanded Windows regression suite (`tests/test-kit.ps1` Stage 12) and Unix CI smoke suite (`.github/workflows/ci.yml` Section 9e) to verify read-only `[projects."..."]` harvesting (with bit-identical Lane 1 `config.toml` SHA-256), `-ConfigureCliGateway` / `--configure-cli-gateway`, `--share-auth-to-lane2`, relative `--repo-path .`, and extensionless Git Bash shims.
+
+---
+
 ## [1.3.1] — 2026-11-22 (Flexible Dual-Lane Auth, Full Workspace File CRUD Mastery & Deterministic Link Ownership)
 
 ### Added

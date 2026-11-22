@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Comprehensive automated security, integrity, AST, and end-to-end smoke test suite for
     Codex Dual-Lane & Security Kit on Windows.
@@ -1097,6 +1097,9 @@ theme = "light"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $l2 'AGENTS.md'))) 'Newly created Lane 2 AGENTS.md should have been removed by rollback'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex.cmd'))) 'Newly created wrapper codex.cmd should have been removed by rollback'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-official.cmd'))) 'Newly created wrapper codex-official.cmd should have been removed by rollback'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex'))) 'Newly created extensionless POSIX shim codex should have been removed by rollback'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-official'))) 'Newly created extensionless POSIX shim codex-official should have been removed by rollback'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-t3'))) 'Newly created extensionless POSIX shim codex-t3 should have been removed by rollback'
     Assert-True (Test-Path -LiteralPath $preExistingLauncher -PathType Leaf) 'Pre-existing user launcher codex-t3.cmd MUST be restored by rollback (not deleted!)'
     $restoredLauncherHash = (Get-FileHash -LiteralPath $preExistingLauncher -Algorithm SHA256).Hash
     Assert-True ($restoredLauncherHash -eq $origLauncherHash) "Rollback SHA-256 mismatch on pre-existing codex-t3.cmd! Expected $origLauncherHash, got $restoredLauncherHash"
@@ -1296,6 +1299,9 @@ theme = "light"
             Assert-True ((Get-FileHash -LiteralPath $loopSess -Algorithm SHA256).Hash -eq $loopSessHash) "Cycle $cycle CRITICAL: Lane 1 session file drift!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex.cmd'))) "Cycle $cycle left behind codex.cmd!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex-official.cmd'))) "Cycle $cycle left behind codex-official.cmd!"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex'))) "Cycle $cycle left behind extensionless codex shim!"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex-official'))) "Cycle $cycle left behind extensionless codex-official shim!"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex-t3'))) "Cycle $cycle left behind extensionless codex-t3 shim!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopL2 'AGENTS.md'))) "Cycle $cycle left behind Lane 2 AGENTS.md!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopL2 'rules\default.rules'))) "Cycle $cycle left behind Lane 2 default.rules!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopL1 'config.backup.toml'))) "Cycle $cycle left behind stray config.backup.toml!"
@@ -1426,32 +1432,39 @@ theme = "light"
     }
 
     # ========================================================================
-    # TEST 12: Desktop Primary Account (Full Authority) + CLI Login & API Key (-GatewayTargetLane Lane2|Both) + Full Workspace File CRUD & Tree Mastery
-    # WHAT: Verifies the v1.3.1 workflow & workspace capabilities:
+    # TEST 12: Desktop Primary Account (Full Authority & Read-Only Trusted Project Harvesting) + CLI Login & API Key (-ConfigureCliGateway / -CliApiKeyEnv) + Relative -RepoPath + Git Bash POSIX Shims + Full Workspace File CRUD
+    # WHAT: Verifies v1.3.2 zero-intrusion Desktop harvesting, cross-shell compatibility, and workspace mastery:
     #   12a) Lane 1 (~/.codex, Codex Desktop) remains 100% untouched (full native authority,
-    #        SHA-256 identical) when -ConfigureGateway -GatewayTargetLane 'Lane2' is used, while
-    #        Lane 2 (~/.codex-official, Codex CLI) supports BOTH OAuth Login (auth.json via
-    #        -ShareAuthToLane2 or codex login) AND API Key / Gateway (env_key in config.toml),
-    #        purges legacy plaintext tokens, locks NTFS DACLs, and passes doctor.ps1 in both
-    #        combined (chatgpt+env_key) and API-key-only (env_key) modes.
+    #        SHA-256 identical) when -ConfigureCliGateway and -CliApiKeyEnv are used with a relative
+    #        -RepoPath (`.`), while Lane 2 (~/.codex-official, Codex CLI) read-only harvests
+    #        pre-existing `[projects."..."]` trust entries from Lane 1's config.toml, configures
+    #        both OAuth Login (auth.json via -ShareAuthToLane2) and API Key / Gateway (env_key),
+    #        purges legacy plaintext tokens, generates both `.cmd` and extensionless Git Bash POSIX
+    #        shims (`codex`, `codex-official`, `codex-t3` with strict LF line endings), and passes
+    #        doctor.ps1 (including relative -RepoPath `.`) in both combined and env_key-only modes.
     #   12b) Full workspace directory tree traversal and file CRUD (create, read, edit, rename,
     #        delete) inside the active workspace via codex.cmd, while primary-repo escapes remain
     #        blocked fail-closed.
-    #   12c) Byte-exact rollback of -GatewayTargetLane 'Lane2' + -ShareAuthToLane2, plus
-    #        verification of -GatewayTargetLane 'Both' (preserving full Desktop authority on Lane 1).
+    #   12c) Byte-exact rollback of -ConfigureCliGateway + -ShareAuthToLane2 (removing newly created
+    #        `.cmd` and extensionless POSIX shims while restoring any pre-existing shim byte-for-byte),
+    #        plus verification of -GatewayTargetLane 'Both'.
     # ========================================================================
-    Write-Host "`n=== 12. Desktop Full-Authority Primary Account + CLI Login & API Key (-GatewayTargetLane) + Workspace File CRUD ===" -ForegroundColor Cyan
+    Write-Host "`n=== 12. Zero-Intrusion Desktop Harvesting + -ConfigureCliGateway + Relative -RepoPath + Git Bash Shims + Workspace File CRUD ===" -ForegroundColor Cyan
     $p12L1   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 lane 1 desktop')
     $p12L2   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 lane 2 cli')
     $p12Bin  = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 local bin')
     $p12Repo = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p12 repo workspace')
     New-Item -ItemType Directory -Path (Join-Path $p12L1 'sessions'), $p12L2, $p12Bin, $p12Repo -Force | Out-Null
     try {
-        # Seed Lane 1 (Codex Desktop = Primary Account / acc chính) with user's custom Desktop config & login.
+        # Seed Lane 1 (Codex Desktop = Primary Account / acc chính) with user's custom Desktop config,
+        # pre-existing trusted Desktop project `[projects."c:\\desktop\\trusted-from-lane1"]`, & login.
         $p12Cfg1 = Join-Path $p12L1 'config.toml'
         $p12DesktopSeed = @"
-# User Primary Account Desktop Config (must remain 100% untouched by default / Lane2 gateway)
+# User Primary Account Desktop Config (must remain 100% untouched by default / -ConfigureCliGateway)
 model = "gpt-5.4"
+
+[projects."c:\\desktop\\trusted-from-lane1"]
+trust_level = "trusted"
 
 [tui]
 theme = "solarized"
@@ -1461,6 +1474,12 @@ theme = "solarized"
 
         $p12Auth1 = Join-Path $p12L1 'auth.json'
         [System.IO.File]::WriteAllText($p12Auth1, $authLane2Json, (New-Object System.Text.UTF8Encoding($false)))
+
+        # Seed a pre-existing extensionless `codex-t3` shim in LocalBin (while leaving `codex` and `codex-official`
+        # absent) to prove extensionless POSIX shims are backed up and restored byte-for-byte on rollback!
+        $p12PrePosixT3 = Join-Path $p12Bin 'codex-t3'
+        [System.IO.File]::WriteAllText($p12PrePosixT3, "#!/usr/bin/env sh`necho PRE_EXISTING_POSIX_T3`n", (New-Object System.Text.UTF8Encoding($false)))
+        $p12PrePosixT3OrigHash = (Get-FileHash -LiteralPath $p12PrePosixT3 -Algorithm SHA256).Hash
 
         # Seed Lane 2 (Codex CLI) with a legacy bearer token canary + custom MCP section.
         $p12Cfg2 = Join-Path $p12L2 'config.toml'
@@ -1542,44 +1561,86 @@ Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
         ) -join "`r`n"
         [System.IO.File]::WriteAllText($p12CrudExe, $p12CrudBat + "`r`n", [System.Text.Encoding]::ASCII)
 
-        # 12a) Install with -ConfigureGateway -GatewayTargetLane 'Lane2' and -ShareAuthToLane2 + -UseGitWorktree.
-        $resP12Inst = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
-            '-RepoPath', $p12Repo, '-CodexPath', $p12CrudExe,
-            '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin,
-            '-ConfigureGateway', '-GatewayTargetLane', 'Lane2',
-            '-GatewayProviderName', 'OpenAI', '-GatewayBaseUrl', 'https://cli-gw.example.invalid/v1',
-            '-GatewayModel', 'gpt-5.4-codex', '-GatewayApiKeyEnv', 'CODEX_CLI_API_KEY',
-            '-ShareAuthToLane2', '-UseGitWorktree', '-SkipPathUpdate'
-        )
-        Assert-True ($resP12Inst.ExitCode -eq 0) "Test 12a install (-GatewayTargetLane Lane2) failed (exit=$($resP12Inst.ExitCode)):`n$($resP12Inst.Output)"
+        # 12a) Install from inside $p12Repo using relative `-RepoPath .`, `-ConfigureCliGateway`, `-CliApiKeyEnv`, `-ShareAuthToLane2`, and `-UseGitWorktree`.
+        Push-Location $p12Repo
+        try {
+            $resP12Inst = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
+                '-RepoPath', '.', '-CodexPath', $p12CrudExe,
+                '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin,
+                '-ConfigureCliGateway',
+                '-GatewayProviderName', 'OpenAI', '-GatewayBaseUrl', 'https://cli-gw.example.invalid/v1',
+                '-GatewayModel', 'gpt-5.4-codex', '-CliApiKeyEnv', 'CODEX_CLI_API_KEY',
+                '-ShareAuthToLane2', '-UseGitWorktree', '-SkipPathUpdate'
+            )
+        } finally {
+            Pop-Location
+        }
+        Assert-True ($resP12Inst.ExitCode -eq 0) "Test 12a install (-ConfigureCliGateway -RepoPath .) failed (exit=$($resP12Inst.ExitCode)):`n$($resP12Inst.Output)"
 
         # Verify Lane 1 (Codex Desktop Primary Account) config.toml was 100% UNTOUCHED!
-        Assert-True ((Get-FileHash -LiteralPath $p12Cfg1 -Algorithm SHA256).Hash -eq $p12Cfg1OrigHash) 'CRITICAL: Lane 1 Desktop config.toml must remain 100% untouched when -GatewayTargetLane Lane2 is used!'
-        Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12L1 'config.backup.toml'))) 'Lane 1 config.backup.toml must not be created when -GatewayTargetLane Lane2 is used!'
+        Assert-True ((Get-FileHash -LiteralPath $p12Cfg1 -Algorithm SHA256).Hash -eq $p12Cfg1OrigHash) 'CRITICAL: Lane 1 Desktop config.toml must remain 100% untouched when -ConfigureCliGateway is used!'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12L1 'config.backup.toml'))) 'Lane 1 config.backup.toml must not be created when -ConfigureCliGateway is used!'
 
-        # Verify Lane 2 (Codex CLI) config.toml has BOTH gateway env_key AND preserved custom sections, zero plaintext secrets, and workspace-write sandbox.
+        # Verify Lane 2 (Codex CLI) config.toml has BOTH gateway env_key, read-only harvested [projects."..."] from Lane 1 Desktop,
+        # canonicalized relative -RepoPath, preserved custom sections, zero plaintext secrets, and workspace-write sandbox.
         $p12Merged2 = Get-Content -LiteralPath $p12Cfg2 -Raw -Encoding UTF8
         Assert-True ($p12Merged2 -match 'model_provider = "OpenAI"') 'Lane 2 config.toml missing model_provider'
         Assert-True ($p12Merged2 -match 'model = "gpt-5.4-codex"') 'Lane 2 config.toml missing GatewayModel'
         Assert-True ($p12Merged2 -match 'env_key = "CODEX_CLI_API_KEY"') 'Lane 2 config.toml missing env_key = "CODEX_CLI_API_KEY"'
         Assert-True ($p12Merged2 -match 'sandbox_mode = "workspace-write"') 'Lane 2 config.toml missing sandbox_mode = "workspace-write"'
         Assert-True ($p12Merged2 -match 'CODEX_ACTIVE_LANE = "LANE_2"') 'Lane 2 config.toml missing CODEX_ACTIVE_LANE = "LANE_2"'
+        Assert-True ($p12Merged2 -match 'c:\\\\desktop\\\\trusted-from-lane1') 'Lane 2 config.toml did not read-only harvest trusted [projects."c:\\desktop\\trusted-from-lane1"] from Lane 1 Desktop config.toml!'
+        $p12RepoEscapedForRegex = [regex]::Escape(($p12Repo.Replace('\', '\\')))
+        Assert-True ($p12Merged2 -match $p12RepoEscapedForRegex) "Lane 2 config.toml did not record canonicalized path for relative -RepoPath '.' ($p12Repo)!"
         Assert-True ($p12Merged2 -match '\[mcp_servers\.cli_helper\]') 'Lane 2 custom [mcp_servers.cli_helper] section was lost!'
         Assert-True ($p12Merged2 -notmatch 'experimental_bearer_token') 'Lane 2 config.toml must purge experimental_bearer_token!'
         Assert-True ($p12Merged2 -notmatch [regex]::Escape($p12CliLegacyCanary)) 'Legacy CLI bearer token leaked into Lane 2 config.toml!'
         Assert-True (Test-Path -LiteralPath (Join-Path $p12L2 'config.backup.toml') -PathType Leaf) 'Lane 2 config.backup.toml was not created!'
         Assert-True ([bool](Get-Acl -LiteralPath (Join-Path $p12L2 'config.backup.toml')).AreAccessRulesProtected) 'Lane 2 config.backup.toml DACL not locked!'
 
+        # Verify both .cmd wrappers and extensionless Git Bash POSIX shims exist in $p12Bin with strict LF line endings on the POSIX shims!
+        foreach ($cmdName in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd')) {
+            Assert-True (Test-Path -LiteralPath (Join-Path $p12Bin $cmdName) -PathType Leaf) "Expected .cmd wrapper $cmdName in $p12Bin"
+        }
+        foreach ($posixName in @('codex', 'codex-official', 'codex-t3')) {
+            $posixFile = Join-Path $p12Bin $posixName
+            Assert-True (Test-Path -LiteralPath $posixFile -PathType Leaf) "Expected extensionless Git Bash POSIX shim '$posixName' in $p12Bin"
+            $posixBytes = [System.IO.File]::ReadAllBytes($posixFile)
+            Assert-True (-not ($posixBytes.Length -ge 3 -and $posixBytes[0] -eq 0xEF -and $posixBytes[1] -eq 0xBB -and $posixBytes[2] -eq 0xBF)) "Extensionless POSIX shim '$posixName' must not contain UTF-8 BOM"
+            $crCount = @($posixBytes | Where-Object { $_ -eq 0x0D }).Count
+            Assert-True ($crCount -eq 0) "Extensionless POSIX shim '$posixName' must use strict LF line endings (found $crCount CR bytes)"
+            $posixText = [System.IO.File]::ReadAllText($posixFile)
+            Assert-True ($posixText.StartsWith("#!/usr/bin/env sh`n") -and $posixText.Contains("$posixName.cmd")) "Extensionless POSIX shim '$posixName' missing expected delegation to $posixName.cmd"
+        }
+        $gitBashExe = 'C:\Program Files\Git\bin\bash.exe'
+        if (Test-Path -LiteralPath $gitBashExe -PathType Leaf) {
+            $prevBashPref = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $bashShimOut = (& $gitBashExe (Join-Path $p12Bin 'codex') '--version' 2>&1) -join "`n"
+                $bashShimExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prevBashPref
+            }
+            Assert-True ($bashShimExit -eq 0 -and $bashShimOut -match 'codex-cli 0\.171\.0-test') "Extensionless Git Bash shim 'codex --version' failed under Git Bash (exit=$bashShimExit):`n$bashShimOut"
+        }
+
         # Verify -ShareAuthToLane2 copied and ACL-locked auth.json into Lane 2 so CLI has BOTH Login and API key ready.
         $p12Auth2 = Join-Path $p12L2 'auth.json'
         Assert-True (Test-Path -LiteralPath $p12Auth2 -PathType Leaf) '-ShareAuthToLane2 did not copy auth.json to Lane 2!'
         Assert-True ([bool](Get-Acl -LiteralPath $p12Auth2).AreAccessRulesProtected) 'Lane 2 shared auth.json DACL not locked!'
 
-        # Verify doctor.ps1 passes with 0 FAILs when Lane 1 Desktop config.toml is untouched and Lane 2 has BOTH Login + env_key!
-        $resP12DocBoth = Invoke-PsScript -ScriptPath $DoctorScript -Arguments @(
-            '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin, '-CodexPath', $p12CrudExe
-        )
+        # Verify doctor.ps1 passes with 0 FAILs (including relative `-RepoPath .`) when Lane 1 Desktop config.toml is untouched and Lane 2 has BOTH Login + env_key!
+        Push-Location $p12Repo
+        try {
+            $resP12DocBoth = Invoke-PsScript -ScriptPath $DoctorScript -Arguments @(
+                '-RepoPath', '.', '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin, '-CodexPath', $p12CrudExe
+            )
+        } finally {
+            Pop-Location
+        }
         Assert-True ($resP12DocBoth.ExitCode -eq 0) "doctor.ps1 failed on Desktop-Primary + CLI-Login+APIKey setup (exit=$($resP12DocBoth.ExitCode)):`n$($resP12DocBoth.Output)"
+        Assert-True ($resP12DocBoth.Output -match '\[PASS\]\s+Target Repository') "doctor.ps1 did not report [PASS] Target Repository for relative -RepoPath '.':`n$($resP12DocBoth.Output)"
         Assert-True ($resP12DocBoth.Output -match 'chatgpt\+env_key\(CODEX_CLI_API_KEY\)') "doctor.ps1 did not report combined login+env_key status on Lane 2:`n$($resP12DocBoth.Output)"
         Assert-True ($resP12DocBoth.Output -match '\[PASS\]\s+Auth & ACL Isolation') "doctor.ps1 did not report [PASS] Auth & ACL Isolation:`n$($resP12DocBoth.Output)"
 
@@ -1614,7 +1675,7 @@ Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12WtRoot 'src\features\temp_delete_me.txt'))) 'Deleted file should not exist in workspace!'
         Assert-True (-not (([System.IO.File]::ReadAllText((Join-Path $p12Repo 'src\core\engine.rs'))) -match 'pub fn edited')) 'Primary repo engine.rs must remain untouched by Lane 2 CRUD!'
 
-        # 12c) Rollback of -GatewayTargetLane 'Lane2' + -ShareAuthToLane2 restores byte-exact pre-install state!
+        # 12c) Rollback of -ConfigureCliGateway + -ShareAuthToLane2 restores byte-exact pre-install state (including extensionless POSIX shims)!
         $resP12Rest = Invoke-PsScript -ScriptPath $RestoreScript -Arguments @(
             '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin, '-SkipPathUpdate'
         )
@@ -1623,27 +1684,32 @@ Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
         Assert-True ((Get-FileHash -LiteralPath $p12Cfg2 -Algorithm SHA256).Hash -eq $p12Cfg2OrigHash) 'Lane 2 CLI config.toml SHA-256 mismatch after rollback!'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12L2 'config.backup.toml'))) 'Rollback left stray Lane 2 config.backup.toml!'
         Assert-True (-not (Test-Path -LiteralPath $p12Auth2)) 'Rollback left newly shared Lane 2 auth.json!'
+        foreach ($removedShim in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd', 'codex', 'codex-official')) {
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12Bin $removedShim))) "Rollback left behind newly created launcher '$removedShim'!"
+        }
+        Assert-True (Test-Path -LiteralPath $p12PrePosixT3 -PathType Leaf) 'Pre-existing extensionless POSIX shim codex-t3 MUST be restored on rollback!'
+        Assert-True ((Get-FileHash -LiteralPath $p12PrePosixT3 -Algorithm SHA256).Hash -eq $p12PrePosixT3OrigHash) 'Pre-existing extensionless POSIX shim codex-t3 SHA-256 mismatch after rollback!'
 
         # Also verify -GatewayTargetLane 'Both' configures both lanes while keeping Lane 1 Desktop free of sandbox_mode/network_access restrictions!
         $resP12Both = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
             '-RepoPath', $p12Repo, '-CodexPath', $p12CrudExe,
             '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin,
-            '-ConfigureGateway', '-GatewayTargetLane', 'Both',
+            '-ConfigureCliGateway', '-GatewayTargetLane', 'Both',
             '-GatewayProviderName', 'OpenAI', '-GatewayBaseUrl', 'https://both-gw.example.invalid/v1',
-            '-GatewayApiKeyEnv', 'CODEX_BOTH_API_KEY', '-SkipPathUpdate'
+            '-CliApiKeyEnv', 'CODEX_BOTH_API_KEY', '-SkipPathUpdate'
         )
         Assert-True ($resP12Both.ExitCode -eq 0) "Test 12c (-GatewayTargetLane Both) failed (exit=$($resP12Both.ExitCode)):`n$($resP12Both.Output)"
         $p12BothCfg1 = Get-Content -LiteralPath $p12Cfg1 -Raw -Encoding UTF8
         $p12BothCfg2 = Get-Content -LiteralPath $p12Cfg2 -Raw -Encoding UTF8
         Assert-True ($p12BothCfg1 -match 'env_key = "CODEX_BOTH_API_KEY"' -and $p12BothCfg2 -match 'env_key = "CODEX_BOTH_API_KEY"') '-GatewayTargetLane Both must configure env_key in both Lane 1 and Lane 2!'
         Assert-True ($p12BothCfg1 -notmatch '(?m)^\s*sandbox_mode\s*=' -and $p12BothCfg1 -notmatch '(?m)^\s*network_access\s*=\s*false') 'Lane 1 Desktop must NEVER have restrictive sandbox_mode or network_access = false injected even under -GatewayTargetLane Both!'
-        Write-Host "    [OK] Desktop Full Authority + CLI Login & API Key (-GatewayTargetLane Lane2|Both, -ShareAuthToLane2) + Full Workspace File CRUD & Tree Mastery verified" -ForegroundColor Green
+        Write-Host "    [OK] Zero-Intrusion Desktop Harvesting + -ConfigureCliGateway/-CliApiKeyEnv + Relative -RepoPath + Git Bash POSIX Shims + Full Workspace File CRUD verified" -ForegroundColor Green
     } finally {
         Remove-TempTreeSafely -RootDir $null -Lane2Dir $p12L2
         try { git -C $p12Repo worktree remove -f "$p12Repo-lane2" 2>$null } catch {}
     }
 
-    Write-Host "`n[PASS] All 12 Windows test stages passed cleanly (AST, Python, default.rules, DryRun/WhatIf, TOML/env_key/ACL/8.3/fail-closed worktree, doctor, traversal defense, SHA-256 rollback, interrupted recovery, 3x loop, pre-existing link/exact backup/missing-backup preflight, and Desktop full-authority + CLI Login/API-Key + Workspace File CRUD)!" -ForegroundColor Green
+    Write-Host "`n[PASS] All 12 Windows test stages passed cleanly (AST, Python, default.rules, DryRun/WhatIf, TOML/env_key/ACL/8.3/fail-closed worktree, doctor, traversal defense, SHA-256 rollback, interrupted recovery, 3x loop, pre-existing link/exact backup/missing-backup preflight, and Zero-Intrusion Desktop Harvesting + CLI Login/API-Key + Relative RepoPath + Git Bash Shims + Workspace File CRUD)!" -ForegroundColor Green
 } finally {
     Remove-TempTreeSafely -RootDir $tmpRoot -Lane2Dir $l2
 }

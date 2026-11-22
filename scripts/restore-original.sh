@@ -862,7 +862,7 @@ if [ -n "${MANIFEST_FILE}" ]; then
 else
   echo "    No rollback manifest found; falling back to latest timestamped .backup-* files."
   for home_dir in "${LANE1_HOME}" "${LANE2_HOME}"; do
-    for rel in "config.toml" "AGENTS.md" "rules/default.rules"; do
+    for rel in "config.toml" "auth.json" "AGENTS.md" "rules/default.rules"; do
       target_file="${home_dir}/${rel}"
       bkp_file="$(find_latest_backup "file" "${target_file}")"
       if [ -n "${bkp_file}" ]; then
