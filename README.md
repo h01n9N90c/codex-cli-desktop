@@ -69,6 +69,7 @@ flowchart LR
 ```text
 codex-dual-lane-kit/
 ├── README.md                     # Hướng dẫn tổng hợp (tệp bạn đang đọc)
+├── CHANGELOG.md                  # Lịch sử phát hành & thay đổi (v1.0.0 -> v1.3.0)
 ├── LICENSE                       # Giấy phép Apache License 2.0
 ├── NOTICE                        # Khai báo bản quyền tác giả (Apache-2.0)
 ├── SECURITY.md                   # Chính sách bảo mật & báo cáo lỗ hổng (tab Security trên GitHub)
