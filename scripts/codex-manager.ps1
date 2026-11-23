@@ -3032,29 +3032,129 @@ function Format-ByteSize([int64]$Bytes) {
     return "$Bytes B"
 }
 
+function Save-RecentProjectPath([string]$ProjectPath) {
+    if ($script:IsDryRun -or [string]::IsNullOrWhiteSpace($ProjectPath)) { return }
+    if (-not (Test-Path -LiteralPath $Lane2Home -PathType Container) -or (Test-IsReparsePoint $Lane2Home)) { return }
+    $recentFile = Join-Path $Lane2Home '.recent_projects.txt'
+    if (Test-IsReparsePoint $recentFile) { return }
+    $list = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $canon = Resolve-CanonicalLongPath -PathValue $ProjectPath
+    if (-not [string]::IsNullOrWhiteSpace($canon) -and $seen.Add($canon)) {
+        $list.Add($canon)
+    }
+    if (Test-Path -LiteralPath $recentFile -PathType Leaf) {
+        foreach ($ln in @(Get-Content -LiteralPath $recentFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            $t = if ($null -ne $ln) { $ln.Trim() } else { '' }
+            if (-not [string]::IsNullOrWhiteSpace($t) -and (Test-Path -LiteralPath $t -PathType Container)) {
+                $c = Resolve-CanonicalLongPath -PathValue $t
+                if (-not [string]::IsNullOrWhiteSpace($c) -and $seen.Add($c)) {
+                    $list.Add($c)
+                    if ($list.Count -ge 10) { break }
+                }
+            }
+        }
+    }
+    try {
+        Write-Utf8NoBom -FilePath $recentFile -Text (($list.ToArray() -join "`r`n") + "`r`n")
+    } catch {}
+}
+
+function Invoke-WindowsFolderBrowserDialog([string]$InitialDir = '') {
+    <#
+    .SYNOPSIS
+        Opens a native Windows GUI Folder Picker dialog (in a dedicated STA process with a TopMost
+        owner form so it always appears in front of the terminal window) and returns the selected path.
+    #>
+    $staCode = @'
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+$dlg.Description = 'Chon thu muc du an (Project Directory) de chay Codex CLI:'
+$dlg.ShowNewFolderButton = $true
+if ($args.Count -ge 1 -and -not [string]::IsNullOrWhiteSpace($args[0]) -and (Test-Path -LiteralPath $args[0] -PathType Container)) {
+    $dlg.SelectedPath = $args[0]
+}
+$topForm = New-Object System.Windows.Forms.Form
+$topForm.TopMost = $true
+$topForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$topForm.Width = 1
+$topForm.Height = 1
+$topForm.ShowInTaskbar = $false
+$topForm.Opacity = 0
+$null = $topForm.Show()
+$topForm.Activate()
+$res = $dlg.ShowDialog($topForm)
+$topForm.Close()
+$topForm.Dispose()
+if ($res -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($dlg.SelectedPath)) {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    Write-Output $dlg.SelectedPath
+}
+'@
+    $prevPref = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $outLines = @(& $script:CurrentPsExe -NoProfile -Sta -ExecutionPolicy Bypass -Command $staCode -args @($InitialDir) 2>$null)
+        $picked = ($outLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
+        if ($null -ne $picked) { return ([string]$picked).Trim() }
+        return ''
+    } catch {
+        return ''
+    } finally {
+        $ErrorActionPreference = $prevPref
+        $global:LASTEXITCODE = 0
+    }
+}
+
 function Get-DiscoveredProjects {
     <#
     .SYNOPSIS
-        Extracts known [projects."..."] paths and trust_level values from Lane 2 and Lane 1
-        config.toml without auto-promoting trust, plus current working directory if valid.
+        Extracts known project directories in priority order:
+          1. Recent projects saved in Sandbox 2 (.recent_projects.txt)
+          2. [projects."..."] entries from Sandbox 2 and GPT 1 config.toml (without auto-promoting trust)
+          3. Current working directory ($PWD) -- placed at the end if $PWD is the kit installation root.
     #>
     $projects = New-Object 'System.Collections.Generic.List[object]'
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     $cwdPath = ''
     try { $cwdPath = (Get-Location -PSProvider FileSystem).ProviderPath } catch {}
-    if (-not [string]::IsNullOrWhiteSpace($cwdPath) -and (Test-Path -LiteralPath $cwdPath -PathType Container)) {
-        $canonCwd = Resolve-CanonicalLongPath -PathValue $cwdPath
-        if (-not [string]::IsNullOrWhiteSpace($canonCwd) -and $seen.Add($canonCwd)) {
-            $projects.Add([PSCustomObject]@{
-                Path       = $canonCwd
-                TrustLevel = 'current-cwd'
-                Source     = 'Current Directory ($PWD)'
-                Exists     = $true
-            })
+    $canonCwd = if (-not [string]::IsNullOrWhiteSpace($cwdPath) -and (Test-Path -LiteralPath $cwdPath -PathType Container)) {
+        Resolve-CanonicalLongPath -PathValue $cwdPath
+    } else { '' }
+    $cwdIsKitRoot = (-not [string]::IsNullOrWhiteSpace($canonCwd)) -and (-not [string]::IsNullOrWhiteSpace($script:KitRoot)) -and ($canonCwd.TrimEnd('\').Equals($script:KitRoot.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase))
+
+    # If user ran codex-manage from inside an actual project folder (NOT the kit repo folder), put $PWD first!
+    if (-not [string]::IsNullOrWhiteSpace($canonCwd) -and (-not $cwdIsKitRoot) -and $seen.Add($canonCwd)) {
+        $projects.Add([PSCustomObject]@{
+            Path       = $canonCwd
+            TrustLevel = 'current-cwd'
+            Source     = 'Current Directory ($PWD)'
+            Exists     = $true
+        })
+    }
+
+    # 1) Recent projects remembered on this machine (.recent_projects.txt)
+    $recentFile = Join-Path $Lane2Home '.recent_projects.txt'
+    if ((Test-Path -LiteralPath $recentFile -PathType Leaf) -and (-not (Test-IsReparsePoint $recentFile))) {
+        foreach ($ln in @(Get-Content -LiteralPath $recentFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            $t = if ($null -ne $ln) { $ln.Trim() } else { '' }
+            if (-not [string]::IsNullOrWhiteSpace($t) -and (Test-Path -LiteralPath $t -PathType Container)) {
+                $c = Resolve-CanonicalLongPath -PathValue $t
+                if (-not [string]::IsNullOrWhiteSpace($c) -and $seen.Add($c)) {
+                    $projects.Add([PSCustomObject]@{
+                        Path       = $c
+                        TrustLevel = 'recent'
+                        Source     = 'Recent Project'
+                        Exists     = $true
+                    })
+                }
+            }
         }
     }
 
+    # 2) [projects."..."] from Sandbox 2 and GPT 1 config.toml
     foreach ($srcInfo in @(
         @{ Label = 'Sandbox 2'; Path = (Join-Path $Lane2Home 'config.toml') },
         @{ Label = 'GPT 1';     Path = (Join-Path $Lane1Home 'config.toml') }
@@ -3110,6 +3210,16 @@ function Get-DiscoveredProjects {
             }
         }
     }
+
+    # 3) If $PWD was the kit installation directory itself, list it last so real user projects come first at [1]!
+    if (-not [string]::IsNullOrWhiteSpace($canonCwd) -and $cwdIsKitRoot -and $seen.Add($canonCwd)) {
+        $projects.Add([PSCustomObject]@{
+            Path       = $canonCwd
+            TrustLevel = 'kit-root'
+            Source     = 'Kit Folder ($PWD)'
+            Exists     = $true
+        })
+    }
     return @($projects.ToArray())
 }
 
@@ -3117,7 +3227,8 @@ function Select-MandatoryProjectDirectory([AllowEmptyString()][string]$InitialRe
     <#
     .SYNOPSIS
         Enforces mandatory project directory selection & validation (must exist on disk,
-        must be a directory, and must not be a symlink/reparse escape).
+        must be a directory, and must not be a symlink/reparse escape). Supports Windows
+        GUI Folder Browser dialog ([B]), drag-and-drop/manual path ([N]), and numbered history.
     #>
     if (-not [string]::IsNullOrWhiteSpace($InitialRepoPath)) {
         $cand = Resolve-CanonicalLongPath -PathValue $InitialRepoPath
@@ -3126,6 +3237,7 @@ function Select-MandatoryProjectDirectory([AllowEmptyString()][string]$InitialRe
             throw "Project directory does not exist: '$cand'. Please provide a valid existing project directory via -RepoPath."
         }
         Assert-NotReparsePoint -PathValue $cand -Label '-RepoPath'
+        Save-RecentProjectPath -ProjectPath $cand
         return $cand
     }
 
@@ -3141,32 +3253,48 @@ function Select-MandatoryProjectDirectory([AllowEmptyString()][string]$InitialRe
             $p = $discovered[$i]
             Write-Host ("    [{0}] {1}  (trust={2}, from={3})" -f ($i + 1), $p.Path, $p.TrustLevel, $p.Source) -ForegroundColor White
         }
-        Write-Host "    [N] Nhap duong dan thu muc du an moi (vd: D:\my-project)" -ForegroundColor Yellow
+        Write-Host "    [B] Chon thu muc bang chuot (Mo cua so Browse Folder Windows)" -ForegroundColor Green
+        Write-Host "    [N] Nhap hoac Keo-Tha duong dan thu muc du an moi (vd: D:\my-project)" -ForegroundColor Yellow
         Write-Host "    [0] Huy (Cancel)" -ForegroundColor DarkGray
-        $defaultHint = if ($discovered.Count -ge 1) { ' [Enter = 1]' } else { '' }
-        $pick = Read-Host ("Chon so thu tu du an hoac go truc tiep duong dan$defaultHint")
+        $defaultHint = if ($discovered.Count -ge 1) { ' [Enter = 1, B = Browse]' } else { ' [Enter = B (Browse)]' }
+        $pick = Read-Host ("Chon so thu tu, B (chon bang chuot), hoac dan duong dan$defaultHint")
         if ($null -eq $pick) { return '' }
         $trimmed = $pick.Trim().Trim('"').Trim("'")
         if ($trimmed -eq '0' -or $trimmed -match '^(q|quit|cancel)$') {
             return ''
         }
-        if ([string]::IsNullOrWhiteSpace($trimmed) -and $discovered.Count -ge 1) {
-            $chosen = $discovered[0].Path
-            Assert-NotReparsePoint -PathValue $chosen -Label 'Selected project directory'
-            return $chosen
+        if ([string]::IsNullOrWhiteSpace($trimmed)) {
+            if ($discovered.Count -ge 1) {
+                $chosen = $discovered[0].Path
+                Assert-NotReparsePoint -PathValue $chosen -Label 'Selected project directory'
+                Save-RecentProjectPath -ProjectPath $chosen
+                return $chosen
+            } else {
+                $trimmed = 'B'
+            }
         }
         if ($trimmed -match '^\d+$') {
             $idx = [int]$trimmed
             if ($idx -ge 1 -and $idx -le $discovered.Count) {
                 $chosen = $discovered[$idx - 1].Path
                 Assert-NotReparsePoint -PathValue $chosen -Label 'Selected project directory'
+                Save-RecentProjectPath -ProjectPath $chosen
                 return $chosen
             }
             Write-WarnLine "So thu tu khong hop le: $trimmed"
             continue
         }
-        if ($trimmed -ieq 'N') {
-            $manual = Read-Host 'Nhap duong dan day du toi thu muc du an (vd: D:\my-project)'
+        if ($trimmed -ieq 'B' -or $trimmed -ieq 'BROWSE') {
+            Write-Info 'Dang mo cua so Chon Thu Muc (Windows Folder Picker)...'
+            $startDir = if ($discovered.Count -ge 1) { $discovered[0].Path } else { '' }
+            $browsed = Invoke-WindowsFolderBrowserDialog -InitialDir $startDir
+            if ([string]::IsNullOrWhiteSpace($browsed)) {
+                Write-WarnLine 'Chua chon thu muc nao tu cua so Browse. Vui long chon lai hoac nhap duong dan.'
+                continue
+            }
+            $trimmed = $browsed.Trim().Trim('"').Trim("'")
+        } elseif ($trimmed -ieq 'N') {
+            $manual = Read-Host 'Nhap hoac Keo-Tha thu muc du an vao day (vd: D:\my-project)'
             if ([string]::IsNullOrWhiteSpace($manual)) { continue }
             $trimmed = $manual.Trim().Trim('"').Trim("'")
         }
@@ -3177,6 +3305,7 @@ function Select-MandatoryProjectDirectory([AllowEmptyString()][string]$InitialRe
                 continue
             }
             Assert-NotReparsePoint -PathValue $cand -Label 'Selected project directory'
+            Save-RecentProjectPath -ProjectPath $cand
             return $cand
         } catch {
             Write-WarnLine "Duong dan khong hop le: $($_.Exception.Message)"
