@@ -1463,7 +1463,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 opener = urllib.request.build_opener(_NoRedirect())
 req = urllib.request.Request(
     url,
-    headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "codex-dual-lane-manager/1.4.1"},
+    headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "codex-dual-lane-manager/1.4"},
     method="GET",
 )
 try:

@@ -6,9 +6,9 @@ The format follows semantic versioning (`MAJOR.MINOR.PATCH`).
 
 ---
 
-## [1.4.1] — 2026-11-23 (Online API Probe HTTPS/No-Redirect Hardening & Explicit Opt-In Project Trust)
+## [1.4] — 2026-11-23 (Interactive Sandbox 2 Control Center, HTTPS/No-Redirect Probe Hardening, Explicit Opt-In Project Trust & History-Preserving CLI Uninstall)
 
-### Fixed
+### Security Fixes
 - **Fixed (Security — High): Online API Key Probe HTTPS-Only & No-Redirect Enforcement (`scripts/codex-manager.sh` & `scripts/codex-manager.ps1`):**
   - Enforced **HTTPS-only** for all remote `/models` probe URLs (plain `http://` is permitted strictly on loopback `127.0.0.1` / `localhost` / `::1` for local mock testing; any non-loopback `http://` URL or URL containing embedded `user:pass@` credentials is refused fail-closed with `REFUSED (https_required...)` BEFORE building an HTTP request).
   - Disabled automatic HTTP redirect following while carrying the `Authorization: Bearer ...` header (`_NoRedirect` `HTTPRedirectHandler` in Python `urllib` on Unix; `$req.AllowAutoRedirect = $false` in .NET `HttpWebRequest` on Windows), blocking `3xx` redirects (`REDIRECT_BLOCKED`) so an attacker-controlled or misconfigured endpoint can never redirect an API key to another host.
@@ -17,15 +17,9 @@ The format follows semantic versioning (`MAJOR.MINOR.PATCH`).
   - Added explicit opt-in switch `-TrustRepoPath` (Windows) / `--trust-repo-path` (Unix), default OFF, for users who deliberately want setup to record `-RepoPath` as `trust_level = "trusted"`.
 
 ### Added
-- **Regression Tests (Windows Stage 12d / 13d2 & Unix CI Section 9f / 10d):**
+- **Security Regression Tests (Windows Stage 12d / 13d2 & Unix CI Section 9f / 10d):**
   - Verified remote plain-HTTP probe refusal (`REFUSED (https_required...)`) and two-endpoint loopback `302`/`307` redirect leak tests confirming the redirect target receives `0` requests and `0` `Authorization` headers on both Windows and Unix.
   - Verified pre-existing `untrusted` `-RepoPath` stays `untrusted`, absent `-RepoPath` is not auto-trusted, and explicit `-TrustRepoPath` / `--trust-repo-path` is required to record `trust_level = "trusted"`.
-
----
-
-## [1.4.0] — 2026-11-23 (Interactive Sandbox 2 Control Center, API/Account Checkers & History-Preserving CLI Uninstall)
-
-### Added
 - **Interactive & Scriptable Sandbox 2 Control Center (`scripts/codex-manager.ps1`, `scripts/codex-manager.sh`, and `codex-manage` launcher in `~/.local/bin/`):**
   - Integrated `codex-manage` quick launcher (`codex-manage.cmd` + extensionless POSIX shim `codex-manage` on Windows; `codex-manage` on macOS/Linux/WSL) into `scripts/setup-dual-lane.*` and `scripts/restore-original.*` with full incremental rollback manifest tracking.
   - Supports both an interactive Vietnamese/English menu (`-Action Menu` / `--action menu`, default) and direct scriptable flags (`ApiGpt`/`api-gpt`, `ApiOther`/`api-other`, `Login`/`login`, `CheckApiKey`/`check-api-key`, `CheckAccounts`/`check-accounts`, `SyncHistory`/`sync-history`, `RemoveSandbox2`/`remove-sandbox2`) without ever accepting plaintext API keys on CLI argv:

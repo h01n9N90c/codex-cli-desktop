@@ -850,7 +850,7 @@ jobs:
           [ ! -e "${P9_BIN}/codex-manage" ]
           [ -L "${P9_L2}/skills" ]
 
-          # 9f) v1.4.1 explicit-consent project trust (--trust-repo-path): trust is NEVER raised implicitly.
+          # 9f) v1.4 explicit-consent project trust (--trust-repo-path): trust is NEVER raised implicitly.
           cat > "${P9_L2}/config.toml" <<EOF
           model = "p9-original"
           

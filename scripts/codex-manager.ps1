@@ -1867,7 +1867,7 @@ function Invoke-OnlineModelsProbe {
         $req.Timeout = 10000
         $req.ReadWriteTimeout = 10000
         $req.Accept = 'application/json'
-        $req.UserAgent = 'codex-dual-lane-kit/1.4.1'
+        $req.UserAgent = 'codex-dual-lane-kit/1.4'
         # SECURITY: never follow redirects while carrying the Authorization header.
         $req.AllowAutoRedirect = $false
         $req.Headers['Authorization'] = "Bearer $ApiKey"
