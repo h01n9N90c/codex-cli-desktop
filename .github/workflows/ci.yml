@@ -1124,16 +1124,28 @@ jobs:
                       self.end_headers()
                       self.wfile.write(b'{"error":"invalid_api_key"}')
 
-          srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-          with open(port_file, "w", encoding="utf-8") as fh:
+          class FastHTTPServer(http.server.HTTPServer):
+              # Avoid macOS mDNS/reverse-DNS blocking inside HTTPServer.server_bind() -> socket.getfqdn().
+              def server_bind(self):
+                  http.server.socketserver.TCPServer.server_bind(self)
+                  host, port = self.server_address[:2]
+                  self.server_name = str(host)
+                  self.server_port = int(port)
+
+          srv = FastHTTPServer(("127.0.0.1", 0), Handler)
+          tmp_port_file = port_file + ".tmp"
+          with open(tmp_port_file, "w", encoding="utf-8") as fh:
               fh.write(str(srv.server_address[1]))
+          os.replace(tmp_port_file, port_file)
           srv.serve_forever()
           PY
           P10_MOCK_PID=$!
 
-          for _wait_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+          _wait_i=0
+          while [ "${_wait_i}" -lt 40 ]; do
             [ -s "${P10_PORT_FILE}" ] && break
             sleep 0.25
+            _wait_i=$((_wait_i + 1))
           done
           [ -s "${P10_PORT_FILE}" ] || { echo "[FAIL] Section 10d: mock HTTP server failed to bind port!" >&2; exit 1; }
           P10_MOCK_PORT="$(cat "${P10_PORT_FILE}")"

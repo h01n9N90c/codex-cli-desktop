@@ -1864,7 +1864,7 @@ if sys.version_info >= (3, 11):
     New-Item -ItemType Directory -Path (Join-Path $p13L1 'sessions'), $p13L2, $p13Bin, $p13Repo -Force | Out-Null
 
     $invokePsWithStdin = {
-        param([string]$ScriptPath, [string[]]$Arguments, [string]$StdinLine)
+        param([string]$ScriptPath, [string[]]$Arguments, [string]$StdinLine, [switch]$PrependBom)
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $CurrentPsExe
         $quotedArgs = New-Object 'System.Collections.Generic.List[string]'
@@ -1892,8 +1892,14 @@ if sys.version_info >= (3, 11):
             [void]$p.Start()
             $outTask = $p.StandardOutput.ReadToEndAsync()
             $errTask = $p.StandardError.ReadToEndAsync()
-            $p.StandardInput.WriteLine($StdinLine)
-            $p.StandardInput.Flush()
+            $utf8Enc = New-Object System.Text.UTF8Encoding([bool]$PrependBom)
+            $payloadBytes = $utf8Enc.GetBytes($StdinLine + "`n")
+            if ($PrependBom) {
+                $bomPrefix = [byte[]]@(0xEF, 0xBB, 0xBF)
+                $p.StandardInput.BaseStream.Write($bomPrefix, 0, $bomPrefix.Length)
+            }
+            $p.StandardInput.BaseStream.Write($payloadBytes, 0, $payloadBytes.Length)
+            $p.StandardInput.BaseStream.Flush()
             $p.StandardInput.Close()
             $p.WaitForExit()
             return [PSCustomObject]@{
@@ -1926,7 +1932,22 @@ if ($cmd -eq 'login') {
         exit 2
     }
     if ($sub -eq '--with-api-key') {
-        $inKey = [Console]::In.ReadLine()
+        $inStream = [Console]::OpenStandardInput()
+        $rawBytes = New-Object 'System.Collections.Generic.List[byte]'
+        try {
+            while ($true) {
+                $b = $inStream.ReadByte()
+                if ($b -lt 0 -or $b -eq 0x0A) { break }
+                if ($b -eq 0x0D) { continue }
+                $rawBytes.Add([byte]$b)
+            }
+        } finally { $inStream.Dispose() }
+        $arr = $rawBytes.ToArray()
+        if ($arr.Length -ge 3 -and $arr[0] -eq 0xEF -and $arr[1] -eq 0xBB -and $arr[2] -eq 0xBF) {
+            Write-Error 'BUG: Received UTF-8 BOM prefix on codex login --with-api-key stdin!'
+            exit 4
+        }
+        $inKey = (New-Object System.Text.UTF8Encoding($false)).GetString($arr)
         if ([string]::IsNullOrWhiteSpace($inKey)) { Write-Error 'Missing stdin API key'; exit 3 }
         $inKey = $inKey.Trim()
         if (-not (Test-Path -LiteralPath $codexHome)) { [void][System.IO.Directory]::CreateDirectory($codexHome) }
@@ -2108,6 +2129,17 @@ print(json.dumps({"threads": threads, "goals": goals, "index": idx_ids}))
         Assert-True ([bool](Get-Acl -LiteralPath $p13Auth2Path).AreAccessRulesProtected) 'ApiGpt did not lock NTFS DACL on Lane2\auth.json!'
         $p13Auth2Obj = Get-Content -LiteralPath $p13Auth2Path -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert-True ($p13Auth2Obj.OPENAI_API_KEY -eq $gptKeyCanary) 'ApiGpt did not pipe exact API key via stdin to mock codex!'
+
+        # Also verify BOM-prefixed stdin (e.g. PS 5.1 CP65001/UTF-8 console) is stripped cleanly before piping!
+        $res13aBom = & $invokePsWithStdin $ManagerScript @(
+            '-Action', 'ApiGpt', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-CodexPath', $p13MockCmd, '-ApiKeyFromStdin', '-NonInteractive'
+        ) $gptKeyCanary -PrependBom
+        Assert-True ($res13aBom.ExitCode -eq 0) "Test 13a ApiGpt (BOM-prefixed stdin) failed (exit=$($res13aBom.ExitCode)):`n$($res13aBom.Output)"
+        Assert-True ($res13aBom.Output -match 'sk-\.\.\.4455 \(len=34\)') "ApiGpt did not strip UTF-8 BOM from stdin:`n$($res13aBom.Output)"
+        Assert-True (-not $res13aBom.Output.Contains($gptKeyCanary)) 'CRITICAL: ApiGpt (BOM stdin) leaked plaintext API key canary!'
+        $p13Auth2BomObj = Get-Content -LiteralPath $p13Auth2Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-True ($p13Auth2BomObj.OPENAI_API_KEY -eq $gptKeyCanary) 'ApiGpt did not strip UTF-8 BOM before piping key to codex!'
 
         # Verify bidirectional sync converged BOTH Lane 1 and Lane 2 after ApiGpt.
         $l1State13a = ($p13QueryDbPy | & $py -B - $p13L1) | ConvertFrom-Json

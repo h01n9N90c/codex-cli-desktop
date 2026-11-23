@@ -600,6 +600,37 @@ function Redact-SecretsFromText {
     return $out
 }
 
+function Read-SingleLineFromStdinNoBom {
+    <#
+    .SYNOPSIS
+        Reads a single line from Standard Input as raw bytes (avoiding PowerShell 5.1 / .NET
+        Console.InputEncoding UTF-8 BOM corruption on CP65001 terminals), strips any leading
+        UTF-8 BOM (0xEF 0xBB 0xBF or U+FEFF), and decodes as UTF-8 without BOM.
+    #>
+    $inStream = [Console]::OpenStandardInput()
+    $bytes = New-Object 'System.Collections.Generic.List[byte]'
+    try {
+        while ($true) {
+            $b = $inStream.ReadByte()
+            if ($b -lt 0) { break }
+            if ($b -eq 0x0A) { break }
+            if ($b -eq 0x0D) { continue }
+            $bytes.Add([byte]$b)
+            if ($bytes.Count -ge 65536) { break }
+        }
+    } finally {
+        $inStream.Dispose()
+    }
+    if ($bytes.Count -eq 0) { return '' }
+    $arr = $bytes.ToArray()
+    $offset = 0
+    if ($arr.Length -ge 3 -and $arr[0] -eq 0xEF -and $arr[1] -eq 0xBB -and $arr[2] -eq 0xBF) {
+        $offset = 3
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    return ($utf8NoBom.GetString($arr, $offset, ($arr.Length - $offset))).TrimStart([char]0xFEFF)
+}
+
 function ConvertFrom-SecureStringPlain([System.Security.SecureString]$Sec) {
     if ($null -eq $Sec) { return '' }
     $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Sec)
@@ -767,8 +798,12 @@ function Invoke-CodexProcess {
 
         if ($null -ne $StdinText) {
             try {
-                $proc.StandardInput.WriteLine($StdinText)
-                $proc.StandardInput.Flush()
+                # Write UTF-8 without BOM directly to BaseStream so .NET Framework / PS 5.1
+                # does not prepend 0xEF 0xBB 0xBF when Console.InputEncoding is UTF-8 (CP65001).
+                $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+                $inBytes = $utf8NoBom.GetBytes($StdinText + "`n")
+                $proc.StandardInput.BaseStream.Write($inBytes, 0, $inBytes.Length)
+                $proc.StandardInput.BaseStream.Flush()
             } finally {
                 $proc.StandardInput.Close()
             }
@@ -1457,7 +1492,7 @@ function Invoke-ActionApiGpt {
             $plainKey = ConvertFrom-SecureStringPlain $ApiKeySecure
         } elseif ($ApiKeyFromStdin) {
             if (-not $script:IsDryRun -or [Console]::IsInputRedirected) {
-                $stdinLine = [Console]::In.ReadLine()
+                $stdinLine = Read-SingleLineFromStdinNoBom
                 if ($null -ne $stdinLine) { $plainKey = $stdinLine }
             }
         } elseif (-not $NonInteractive) {
