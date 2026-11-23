@@ -6,6 +6,35 @@ The format follows semantic versioning (`MAJOR.MINOR.PATCH`).
 
 ---
 
+## [1.5] — 2026-11-23 (1-Touch Launchers, Mandatory Project Picker, 3rd-Party API Wizard, Interactive Paste & Fast RAM/ROM Compaction)
+
+### Added
+- **Root 1-Click Launchers (`START-CODEX.cmd` & `start-codex.sh`):**
+  - Double-clicking `START-CODEX.cmd` opens the Control Center directly, propagates non-zero CLI exit codes accurately when invoked with arguments, safely handles `&` and spaces in project paths via `EnableDelayedExpansion`, and drops into an interactive PowerShell terminal already locked at the selected project directory upon exiting the menu (`0`).
+- **Mandatory Project Directory Selection & Windows GUI Folder Browser (`[B]` / `[P]`):**
+  - Requires selecting/confirming a project directory on Menu startup, remembers recently used projects in `.recent_projects.txt` (prioritizing user projects above the kit root), and supports the native Windows Folder Browser Dialog (`Invoke-WindowsFolderBrowserDialog` using `-EncodedCommand` + `CODEX_FOLDER_PICKER_INIT` for full `&`/metacharacter safety).
+- **1-Touch 3rd-Party API Wizard (`[1c]` `QuickThirdParty` / `quick-third-party`):**
+  - 3-line guided wizard (Base URL, Model, Masked API Key) that writes `env_key` (zero plaintext key in `config.toml`), backs up and removes stale `Lane2\auth.json` so ChatGPT OAuth quota is never consumed accidentally, sets `daemon_auto_start = false`, locks NTFS DACL / `chmod 600`, and runs bidirectional history sync.
+- **Reliable Masked Paste Input (`Read-MaskedSecretInteractive`):**
+  - Replaced Windows PowerShell 5.1's `Read-Host -AsSecureString` (which truncated pasted keys to 1 character in Windows Terminal) with `[Console]::ReadKey($true)` + full `Ctrl+V` clipboard and Right-Click paste support.
+- **RAM / ROM Storage Management (`[8]` `CleanupStorage` / `cleanup-storage` / `sync-sessions.py --compact-storage [--fast]`):**
+  - Bounded `PRAGMA cache_size = -8192`, 1 MiB streaming JSONL line cap, rollback-aware backup rotation (protecting `.rollback/latest.json`, `manifest.env`, and Unix `latest.tsv`), `.tmp` cleanup, and SQLite WAL checkpoint / `VACUUM` with schema-drift tolerance.
+  - Fast non-blocking `--fast` mode used automatically by `QuickThirdParty` and `Launch` (completing in `< 1s` without blocking on multi-hundred-MiB `thread_history_*.sqlite` databases), while skipping unnecessary `VACUUM` when `DELETE` removes `0` rows.
+
+### Fixed
+- Fixed PowerShell 5.1 empty/single-item `HashSet` unrolling bug in `Get-ProtectedRollbackBackupNames` (`return ,$protected`) that caused `Rotate-FileBackups` to fail on fresh `Lane2Home` directories without `.rollback\latest.json`.
+- Updated `scripts/codex-manager.sh` `usage()` help output to document `quick-third-party`, `cleanup-storage`, `launch`, and `--max-backups`.
+
+---
+
+## [1.4.1] — 2026-11-23 (Fail-Closed Sync Reconciliation & Strict Pre-Uninstall Rescue)
+
+### Fixed
+- Added explicit sync status reporting (`SUCCESS`, `PARTIAL`, `FAILED`, `SKIPPED`), before/after reconciliation of thread counts, thread IDs, Pinned, and Goals, plus `--strict`, `--busy-timeout`, and `--json` flags in `scripts/sync-sessions.py`.
+- Hardened `RemoveSandbox2` (`codex-manager.ps1` / `codex-manager.sh`) to run `--strict --rescue-shared-files --backup-target` and abort fail-closed on non-zero exit, `PARTIAL`/`FAILED`, or `reconcile=MISMATCH`.
+
+---
+
 ## [1.4] — 2026-11-23 (Interactive Sandbox 2 Control Center, Native-Parity CLI Containment & 3 Permission Modes, HTTPS/No-Redirect Probe Hardening, Explicit Opt-In Project Trust & History-Preserving CLI Uninstall)
 
 ### Resource & Crash-Prevention Hardening
