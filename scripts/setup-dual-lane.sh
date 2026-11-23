@@ -711,6 +711,10 @@ for tpl in \
     exit 1
   fi
 done
+if [ ! -f "${KIT_ROOT}/scripts/codex-manager.sh" ]; then
+  echo "[FAIL] Missing required manager script: ${KIT_ROOT}/scripts/codex-manager.sh" >&2
+  exit 1
+fi
 if [ "${INSTALL_BRIDGE}" -eq 1 ] && [ ! -f "${KIT_ROOT}/templates/DUAL_LANE_BRIDGE.md" ]; then
   echo "[FAIL] Missing bridge template: ${KIT_ROOT}/templates/DUAL_LANE_BRIDGE.md" >&2
   exit 1
@@ -1694,7 +1698,7 @@ if [ "${DRY_RUN}" -eq 0 ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 8. Install Shell-Safe CLI Launchers (`codex`, `codex-official`, `codex-t3`)
+# 8. Install Shell-Safe CLI Launchers (`codex`, `codex-official`, `codex-t3`, `codex-manage`)
 # ------------------------------------------------------------------------------
 # Single-quote every embedded path so spaces, `$`, backticks, quotes, or `&` in
 # directory names can NEVER be evaluated as shell code when users run `codex`.
@@ -1702,8 +1706,10 @@ fi
 # and recorded in MANIFEST_ROWS so rollback restores them instead of deleting.
 Q_LANE1_HOME="$(shell_quote "${LANE1_HOME}")"
 Q_LANE2_HOME="$(shell_quote "${LANE2_HOME}")"
+Q_LOCAL_BIN="$(shell_quote "${LOCAL_BIN}")"
 Q_CARGO_TARGET="$(shell_quote "${CARGO_TARGET_LANE2}")"
 Q_CODEX_BIN="$(shell_quote "${CODEX_BIN}")"
+Q_MANAGER_SCRIPT="$(shell_quote "${KIT_ROOT}/scripts/codex-manager.sh")"
 Q_PRIMARY_REPO="$(shell_quote "${REPO_PATH}")"
 Q_LANE2_REPO="$(shell_quote "${EFFECTIVE_LANE2_REPO}")"
 
@@ -1855,6 +1861,16 @@ render_lane1_wrapper() {
   printf 'exec %s "$@"\n' "${Q_CODEX_BIN}"
 }
 
+render_manage_wrapper() {
+  printf '#!/usr/bin/env bash\n'
+  printf '# Codex Dual-Lane wrapper: launches Sandbox 2 Control Center (codex-manager.sh)\n'
+  printf '[ -n "${CODEX_LANE1_HOME:-}" ] || export CODEX_LANE1_HOME=%s\n' "${Q_LANE1_HOME}"
+  printf '[ -n "${CODEX_LANE2_HOME:-}" ] || export CODEX_LANE2_HOME=%s\n' "${Q_LANE2_HOME}"
+  printf '[ -n "${CODEX_LOCAL_BIN:-}" ] || export CODEX_LOCAL_BIN=%s\n' "${Q_LOCAL_BIN}"
+  printf '[ -n "${CODEX_REAL_BIN:-}" ] || export CODEX_REAL_BIN=%s\n' "${Q_CODEX_BIN}"
+  printf 'exec bash %s "$@"\n' "${Q_MANAGER_SCRIPT}"
+}
+
 for name in codex codex-official; do
   record_target_for_rollback "${LOCAL_BIN}/${name}" preserve
   if [ "${DRY_RUN}" -eq 0 ]; then
@@ -1867,9 +1883,15 @@ record_target_for_rollback "${LOCAL_BIN}/codex-t3" preserve
 if [ "${DRY_RUN}" -eq 0 ]; then
   atomic_write_from_stdin "${LOCAL_BIN}/codex-t3" 700 < <(render_lane1_wrapper)
   flush_rollback_manifest
-  echo "    Installed wrappers in: ${LOCAL_BIN}"
+fi
+
+record_target_for_rollback "${LOCAL_BIN}/codex-manage" preserve
+if [ "${DRY_RUN}" -eq 0 ]; then
+  atomic_write_from_stdin "${LOCAL_BIN}/codex-manage" 700 < <(render_manage_wrapper)
+  flush_rollback_manifest
+  echo "    Installed wrappers in: ${LOCAL_BIN} (codex, codex-official, codex-t3, codex-manage)"
 else
-  echo "    [DRY-RUN] Would install wrappers in: ${LOCAL_BIN}"
+  echo "    [DRY-RUN] Would install wrappers in: ${LOCAL_BIN} (codex, codex-official, codex-t3, codex-manage)"
 fi
 
 # ------------------------------------------------------------------------------
@@ -1939,5 +1961,5 @@ echo "[OK] Setup completed!"
 echo "Ensure ${LOCAL_BIN} precedes ${CODEX_BIN%/*} in your PATH (e.g. export PATH=\"${LOCAL_BIN}:\$PATH\")."
 echo "Next steps:"
 echo "  1. ./scripts/doctor.sh"
-echo "  2. codex login"
+echo "  2. codex-manage          (Interactive Sandbox 2 Control Center: API key / login / check / sync / safe uninstall)"
 echo "  3. codex"

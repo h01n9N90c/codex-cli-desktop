@@ -14,7 +14,8 @@
 | **3. Cần agent nắm toàn bộ cây thư mục và tự do đọc/ghi/sửa/xóa file code mà vẫn chặn tuyệt đối lệnh phá hoại & mã độc** | Sợ bật bảo mật quá chặt làm agent không đọc được cây thư mục hoặc không tạo/sửa/xóa được file dự án, nhưng mở toang lại sợ lệnh phá hệ thống, sửa ACL hay chạy nhầm file mẫu lỗ hổng. | Kết hợp `sandbox_mode = "workspace-write"` + tường lửa `default.rules` + `AGENTS.md`: cho phép agent **tự do 100% nắm bắt toàn bộ cây thư mục** (`rg --files`, `git status`, `Get-ChildItem`, `find`) và **đọc, tạo, sửa, di chuyển, xóa file** trong workspace dự án, trong khi chặn cứng (`forbidden`) lệnh ransomware/hệ thống/ACL và khóa **`Static-Analysis-Only`** (chỉ cấm thực thi file mẫu/payload bên thứ 3, không bao giờ cản trở thao tác sửa/xóa code bình thường). |
 | **4. Máy chỉ có 1 ổ `C:\`, cấu hình khác nhau hoặc dùng Codex bản `npm`/standalone** | Các script cứng đường dẫn `D:\`, `E:\` hay ghi đè mất cấu hình cũ trong `config.toml` sẽ lỗi trên máy khác. | Tự dò thực tế mọi nguồn cài đặt (`WindowsApps`, `PATH`, `npm`, `-CodexPath`), tự dò feature flags bằng `codex features list`, **merge `config.toml` không phá hủy** (giữ nguyên `[mcp_servers]`, `[tui]`, `[plugins]` cũ), tự kiểm tra ổ đĩa NTFS & dung lượng trống. |
 | **5. Dự án Rust bị kẹt `Blocking waiting for file lock` khi 2 agent cùng test** | Hai agent cùng chạy `cargo test` tranh nhau khóa `target/.cargo-lock`. | Tự tách `CARGO_TARGET_DIR` riêng cho Luồng 2 (mặc định `%TEMP%\codex-lane2-target` trên Windows hoặc `${TMPDIR:-/tmp}/codex-lane2-target` trên Unix, tùy chỉnh qua `-CargoTargetDir` / `CODEX_CARGO_TARGET_DIR`) $\rightarrow$ biên dịch song song không khóa nhau. |
-| **6. Dùng CLI từ Windows Desktop gặp lỗi `--no-daemon`, mất task ghim (`Pinned`), hoặc lo rủi ro lộ API key** | Báo lỗi `this CLI has no complete local package`, mất danh sách `Pinned` khi DB mới chưa có dòng `threads`, hoặc lộ API key trong `config.toml`. | Tự động tắt `daemon_auto_start = false` khi có hỗ trợ, kèm `sync-sessions.py` thực hiện **UPSERT (`INSERT` + `UPDATE`)** theo schema động (đọc nguồn chỉ-đọc `?mode=ro`), dùng `env_key` để **không bao giờ lưu plaintext API key vào `config.toml`**, mặc định `approval_policy = "on-request"`, và phòng thủ 4 lớp (`workspace-write` + `network_access = false`, lọc `*KEY*/*TOKEN*` & khóa ACL/chmod, `default.rules`, `AGENTS.md`). |
+| **6. Dùng CLI từ Windows Desktop gặp lỗi `--no-daemon`, mất task ghim (`Pinned`), hoặc lo rủi ro lộ API key** | Báo lỗi `this CLI has no complete local package`, mất danh sách `Pinned` khi DB mới chưa có dòng `threads`, hoặc lộ API key trong `config.toml`. | Tự động tắt `daemon_auto_start = false` khi có hỗ trợ, kèm `sync-sessions.py` thực hiện **UPSERT (`INSERT` + `UPDATE`)** theo schema động (đọc nguồn chỉ-đọc `?mode=ro`, hỗ trợ `--bidirectional --backup-target --rescue-shared-files`), dùng `env_key` để **không bao giờ lưu plaintext API key vào `config.toml`**, mặc định `approval_policy = "on-request"`, và phòng thủ 4 lớp (`workspace-write` + `network_access = false`, lọc `*KEY*/*TOKEN*` & khóa ACL/chmod, `default.rules`, `AGENTS.md`). |
+| **7. Muốn 1 bảng điều khiển tương tác (`codex-manage`) để đổi API Key/Login, kiểm tra Key sống/chết, kiểm tra cả 2 tài khoản, đồng bộ 2 chiều và xóa Sandbox 2 mà KHÔNG mất lịch sử chat** | Phải nhớ nhiều cờ dòng lệnh khi chuyển đổi giữa OpenAI API Key, cổng API bên thứ 3 (`config.toml`) và đăng nhập chính thức; sợ xóa Sandbox 2 (`~/.codex-official`) bị mất các cuộc chat vừa tạo bên CLI. | Gõ **`codex-manage`** (hoặc chạy `scripts/codex-manager.ps1` / `scripts/codex-manager.sh`): menu trực quan & hỗ trợ cờ dòng lệnh đầy đủ để nhập ẩn **OpenAI API Key** (`ApiGpt`/`api-gpt`), mở thẳng `config.toml` cho **Bên thứ 3** (`ApiOther`/`api-other`), nhảy thẳng **Đăng nhập chính thức** (`Login`/`login`), **Check API Key** (mask an toàn + probe sống `/models` tùy chọn), **Check Tài khoản Hiện có** chỉ-đọc cả GPT 1 lẫn Sandbox 2, **Đồng bộ 2 chiều** và **Xóa Sandbox 2 bảo toàn 100% lịch sử chat về GPT 1 (`RemoveSandbox2`/`remove-sandbox2`)**. |
 
 ---
 
@@ -48,7 +49,10 @@ flowchart LR
 ## Đảm bảo tương thích thực tế & Ranh giới Bảo mật Minh bạch
 
 * **Tương thích mọi bố cục ổ đĩa:** Hoạt động mượt trên cả laptop **chỉ có 1 ổ `C:\`** lẫn PC nhiều ổ (`C:\`, `D:\`, `E:\`). Tự động kiểm tra định dạng NTFS và báo cảnh báo nếu ổ build còn dưới 10 GB trống (cho phép chỉ định `-CargoTargetDir` sang bất kỳ ổ nào).
-* **Tương thích mọi cách cài đặt Codex & mọi Shell (PowerShell / CMD / Git Bash / MSYS2 / WSL / Unix):** Tự dò theo thứ tự: `-CodexPath` $\rightarrow$ `WindowsApps` (`OpenAI.Codex`) $\rightarrow$ `PATH` *(tự loại trừ wrapper của chính nó để tránh lặp vô hạn)* $\rightarrow$ `%APPDATA%\npm\codex.cmd` / `%LOCALAPPDATA%\Programs\Codex\codex.exe`. Trên Windows, bộ cài sinh đồng thời cả bộ `.cmd` (`codex.cmd`, `codex-official.cmd`, `codex-t3.cmd`) lẫn POSIX shim không đuôi (`codex`, `codex-official`, `codex-t3` chuẩn LF) trong `~/.local/bin` giúp gõ `codex` chạy mượt ngay trong **Git Bash / MSYS2 / PowerShell / CMD**, đồng thời hỗ trợ truyền đường dẫn tương đối (`-RepoPath .` / `--repo-path .`).
+* **Tương thích mọi cách cài đặt Codex & mọi Shell (PowerShell / CMD / Git Bash / MSYS2 / WSL / Unix):** Tự dò theo thứ tự: `-CodexPath` $\rightarrow$ `WindowsApps` (`OpenAI.Codex`) $\rightarrow$ `PATH` *(tự loại trừ wrapper của chính nó để tránh lặp vô hạn)* $\rightarrow$ `%APPDATA%\npm\codex.cmd` / `%LOCALAPPDATA%\Programs\Codex\codex.exe`. Trên Windows, bộ cài sinh đồng thời cả bộ `.cmd` (`codex.cmd`, `codex-official.cmd`, `codex-t3.cmd`, `codex-manage.cmd`) lẫn POSIX shim không đuôi (`codex`, `codex-official`, `codex-t3`, `codex-manage` chuẩn LF) trong `~/.local/bin` giúp gõ `codex` hay `codex-manage` chạy mượt ngay trong **Git Bash / MSYS2 / PowerShell / CMD**, đồng thời hỗ trợ truyền đường dẫn tương đối (`-RepoPath .` / `--repo-path .`).
+* **Trung tâm Điều khiển Tương tác Sandbox 2 (`codex-manage`), Đồng bộ Lịch sử 2 Chiều & Gỡ CLI Không Mất Lịch Sử (v1.4.0):**
+  * Gõ `codex-manage` (gọi `scripts/codex-manager.ps1` trên Windows hoặc `scripts/codex-manager.sh` trên macOS/Linux/WSL) để mở menu tương tác hoặc chạy trực tiếp qua cờ CLI cho 6 tác vụ: **API Key OpenAI/GPT** (`ApiGpt`/`api-gpt`, nhập ẩn 1 key duy nhất qua stdin, dọn `model_provider` bên thứ 3, khóa ACL/`0600`), **API Key Bên thứ 3** (`ApiOther`/`api-other`, sao lưu & mở thẳng `~/.codex-official/config.toml`, kiểm tra cú pháp TOML, cảnh báo plaintext, khóa lại ACL/`0600`), **Đăng nhập chính thức** (`Login`/`login`, hỗ trợ `--device-auth`), **Check API Key** (hiển thị mask an toàn `sk-...xxxx` + tùy chọn probe sống `GET <base_url>/models` với `-OnlineCheck`/`--online-check` không lộ key ra argv/log), **Check Tài khoản Hiện có** (chỉ-đọc 100% cả GPT 1 lẫn Sandbox 2), **Đồng bộ Lịch sử 2 chiều** (`SyncHistory`/`sync-history`) và **Xóa Sandbox 2 không mất lịch sử chat** (`RemoveSandbox2`/`remove-sandbox2`).
+  * `scripts/sync-sessions.py --bidirectional --backup-target --rescue-shared-files` đồng bộ 2 chiều an toàn `session_index.jsonl`, `state_*.sqlite` (threads & Pinned) và `goals_*.sqlite` giữa **GPT 1 (`~/.codex`)** và **Sandbox 2 (`~/.codex-official`)** (tạo backup SQLite trước khi ghi, bảo toàn `is_pinned = 1`, không bao giờ ghi đè metadata `updated_at` mới hơn của GPT 1). Khi bạn chọn xóa Sandbox 2 (`RemoveSandbox2` / `remove-sandbox2`), công cụ **bắt buộc cứu hộ & đồng bộ ngược 100% lịch sử chat, Pinned, Goals và mọi tệp rollout/memory cục bộ (nếu không phải Junction/symlink) về GPT 1 trước** (fail-closed — dừng ngay nếu bước cứu hộ lỗi) rồi mới gọi `restore-original.*` tháo sạch Junction/symlink và xóa `~/.codex-official`.
 * **Tương thích mọi phiên bản Codex & mọi gói tài khoản:**
   * Không hardcode model hay `service_tier` vào `config.toml` trừ khi bạn truyền `-OfficialModel` / `-OfficialServiceTier` — tránh lỗi trên tài khoản không có model đó.
   * Tự chạy `codex features list` thật để chỉ bật các flag mà phiên bản Codex trên máy bạn thực sự hỗ trợ.
@@ -63,7 +67,7 @@ flowchart LR
   * **Ranh giới `execpolicy`, Hard Fail-Closed Worktree & Phạm vi CI (Mock `codex`) vs. Codex Thật:**
     * `default.rules` kiểm khớp tiền tố lệnh trực tiếp (`argv[0]`, đã kiểm chứng sống **13/13** probe trên `codex-cli 0.171.0-alpha.13`), không phân tích hết chuỗi lồng trong `powershell -Command "..."` — vì vậy luôn giữ đủ 4 lớp phòng thủ.
     * Khi dùng `-UseGitWorktree` / `--use-git-worktree`, wrapper Luồng 2 (`codex`, `codex-official`) cưỡng chế **ranh giới worktree fail-closed cứng**: tự động chuyển `cwd` từ thư mục gốc dự án **và mọi thư mục con bên trong** sang thư mục tương ứng trong worktree, hậu kiểm `cwd` sau khi `cd`, và **từ chối chạy (`exit 1`, không khởi chạy `codex`)** nếu thư mục worktree bị xóa/thiếu/bị thay bằng tệp thường/symlink hoặc lệnh `cd` thất bại — **tuyệt đối không âm thầm fallback về repo chính**. Đồng thời Guard 2 luôn chặn mọi biến thể `-C`, `-C=`, `-C<path>`, `--cd`, `--cd=`, `--add-dir`, `--add-dir=` trỏ ngược về repo chính (kể cả qua đường dẫn 8.3 ngắn). Chỉ khi đặt `CODEX_NO_AUTO_WORKTREE_CD=1` mới tắt bước tự động `cd` (phục vụ mục đích kiểm thử hoặc khi người dùng chủ động điều khiển thư mục làm việc), trong khi Guard 2 chặn đối số truy cập repo chính vẫn luôn hoạt động fail-closed.
-    * **Ranh giới minh bạch CI vs. Codex Runtime thật:** **4/4 job xanh trên GitHub Actions CI** (`hygiene-and-policy`, Windows PS 5.1 & 7+, Ubuntu, macOS) kiểm chứng cú pháp, bảo toàn nghiêm ngặt `trust_level`, cảnh báo auth-share, tường lửa, fail-closed worktree, bảo toàn chế độ POSIX (`original_mode`), chống path traversal/SUID, khôi phục cài đặt bị ngắt giữa chừng và vòng lặp 3x install/rollback **bằng các binary `codex` giả lập (`mock codex`) trên các hệ điều hành** — **KHÔNG thay thế** cho việc chạy `scripts/doctor.ps1` / `scripts/doctor.sh` và tự kiểm chứng hành vi thực tế trên đúng phiên bản **Codex Desktop/CLI thật** đang cài trên máy bạn (đặc biệt sau mỗi lần nâng cấp Codex). Kết quả kiểm chứng tham khảo trực tiếp trên **`codex-cli 0.171.0-alpha.13` thật** (bao gồm sandbox write boundary, atomic DACL reset & `AuthzAccessCheck`) được ghi nhận đầy đủ tại [docs/REAL_CODEX_CHECKLIST.md](docs/REAL_CODEX_CHECKLIST.md).
+    * **Ranh giới minh bạch CI vs. Codex Runtime thật:** **4/4 job xanh trên GitHub Actions CI** (`hygiene-and-policy`, Windows PS 5.1 & 7+ với **13 pha `test-kit.ps1`**, Ubuntu, macOS kèm **Section 10 `codex-manager.sh`** và bộ unit test Python đồng bộ 2 chiều/cứu hộ) kiểm chứng cú pháp, bảo toàn nghiêm ngặt `trust_level`, cảnh báo auth-share, tường lửa, fail-closed worktree, quản trị Sandbox 2 (`codex-manage`), bảo toàn chế độ POSIX (`original_mode`), chống path traversal/SUID, khôi phục cài đặt bị ngắt giữa chừng và vòng lặp 3x install/rollback **bằng các binary `codex` giả lập (`mock codex`) và local loopback HTTP mock trên các hệ điều hành** — **KHÔNG thay thế** cho việc chạy `scripts/doctor.ps1` / `scripts/doctor.sh` và tự kiểm chứng hành vi thực tế trên đúng phiên bản **Codex Desktop/CLI thật** đang cài trên máy bạn (đặc biệt sau mỗi lần nâng cấp Codex). Kết quả kiểm chứng tham khảo trực tiếp trên **`codex-cli 0.171.0-alpha.13` thật** (bao gồm sandbox write boundary, atomic DACL reset & `AuthzAccessCheck`) được ghi nhận đầy đủ tại [docs/REAL_CODEX_CHECKLIST.md](docs/REAL_CODEX_CHECKLIST.md).
 
 ---
 
@@ -72,34 +76,36 @@ flowchart LR
 ```text
 codex-dual-lane-kit/
 ├── README.md                     # Hướng dẫn tổng hợp (tệp bạn đang đọc)
-├── CHANGELOG.md                  # Lịch sử phát hành & thay đổi (v1.0.0 -> v1.3.3)
+├── CHANGELOG.md                  # Lịch sử phát hành & thay đổi (v1.0.0 -> v1.4.0)
 ├── LICENSE                       # Giấy phép Apache License 2.0
 ├── NOTICE                        # Khai báo bản quyền tác giả (Apache-2.0)
 ├── SECURITY.md                   # Chính sách bảo mật & báo cáo lỗ hổng (tab Security trên GitHub)
 ├── .gitattributes                # Khóa chuẩn LF cho .sh/.py/.md/.rules và CRLF cho .ps1/.cmd
 ├── .gitignore                    # Chặn không commit key / auth.json / config.toml / __pycache__
-├── .github/workflows/ci.yml      # GitHub Actions CI tự động chạy kiểm tra an toàn đa nền tảng
+├── .github/workflows/ci.yml      # GitHub Actions CI tự động chạy kiểm tra an toàn đa nền tảng (kèm Section 10 cho codex-manager.sh)
 ├── scripts/
-│   ├── setup-dual-lane.ps1       # Bộ cài đặt tự thích nghi cho Windows 10/11 (TOML merge, ACL 2 bước, snapshot SHA-256)
-│   ├── setup-dual-lane.sh        # Bộ cài đặt tương đương cho macOS / Linux / WSL (hỗ trợ --dry-run, chmod 600)
+│   ├── setup-dual-lane.ps1       # Bộ cài đặt tự thích nghi cho Windows 10/11 (TOML merge, ACL 2 bước, snapshot SHA-256, cài codex-manage)
+│   ├── setup-dual-lane.sh        # Bộ cài đặt tương đương cho macOS / Linux / WSL (hỗ trợ --dry-run, chmod 600, cài codex-manage)
+│   ├── codex-manager.ps1         # Trung tâm điều khiển Sandbox 2 cho Windows (API Key GPT / Custom config.toml / Login / Check Key & Accounts / Sync 2 chiều / Xóa Sandbox 2 giữ 100% lịch sử chat)
+│   ├── codex-manager.sh          # Trung tâm điều khiển Sandbox 2 tương đương cho macOS / Linux / WSL (menu & cờ CLI đầy đủ)
 │   ├── restore-original.ps1      # Khôi phục chính xác 1 chạm cho Windows (kiểm chứng SHA-256, chống path traversal, gỡ Junction an toàn)
 │   ├── restore-original.sh       # Khôi phục chính xác 1 chạm cho macOS / Linux / WSL
 │   ├── doctor.ps1                # Chẩn đoán hệ thống, ACL & probe thực thi execpolicy cho Windows (read-only)
 │   ├── doctor.sh                 # Chẩn đoán hệ thống & probe thực thi execpolicy cho macOS / Linux / WSL (read-only)
-│   └── sync-sessions.py          # Đồng bộ UPSERT (INSERT + UPDATE) phiên, Pinned & Goals (đọc nguồn ?mode=ro)
+│   └── sync-sessions.py          # Đồng bộ UPSERT 1 chiều / 2 chiều (--bidirectional), sao lưu trước khi ghi (--backup-target) & cứu hộ file cục bộ (--rescue-shared-files) cho phiên, Pinned & Goals
 ├── templates/
 │   ├── default.rules             # Bộ quy tắc tường lửa tiền tố lệnh (Starlark execpolicy, chú thích chi tiết từng nhóm)
 │   ├── AGENTS.lane1.md           # Chỉ thị bảo vệ, phân tích tĩnh & phân luồng cho Luồng 1
 │   ├── AGENTS.lane2.md           # Chỉ thị bảo vệ, phân tích tĩnh & phân luồng cho Luồng 2
 │   └── DUAL_LANE_BRIDGE.md       # Mẫu cầu nối giao tiếp 2 luồng cho bất kỳ dự án nào
 ├── tests/
-│   ├── test_sync_sessions.py     # Unit test kiểm chứng UPSERT, ?mode=ro, atomic JSONL, --pinned-only & --dry-run
-│   └── test-kit.ps1              # Bộ test PowerShell 12 pha: AST, -DryRun, TOML, env_key, ACL, 8.3, fail-closed worktree, interrupted rollback, 3x loop, pre-existing link/exact backup/preflight, zero-intrusion Desktop harvesting (strict trust_level preservation), opt-in auth-share warnings & Git Bash shims
+│   ├── test_sync_sessions.py     # Unit test kiểm chứng UPSERT, ?mode=ro, atomic JSONL, --pinned-only, --bidirectional, --backup-target, --rescue-shared-files & --dry-run
+│   └── test-kit.ps1              # Bộ test PowerShell 13 pha: AST, -DryRun, TOML, env_key, ACL, 8.3, fail-closed worktree, interrupted rollback, 3x loop, pre-existing link/exact backup/preflight, zero-intrusion Desktop harvesting (strict trust_level), Git Bash shims & Pha 13 kiểm thử toàn diện codex-manager.ps1
 └── docs/
     ├── GUIDE_AND_MANIFEST.md     # Hướng dẫn chi tiết, khai báo từng tệp/hàm/tham số & cách gỡ an toàn
     ├── REAL_CODEX_CHECKLIST.md   # Danh sách kiểm chứng thực tế & bằng chứng đo trực tiếp trên codex-cli thật
     ├── SECURITY_MODEL.md         # Mô hình phòng thủ 4 lớp, ranh giới OS/Codex runtime & Khiên Git
-    └── TROUBLESHOOTING.md        # Sổ tay xử lý 10 lỗi thực chiến hay gặp nhất
+    └── TROUBLESHOOTING.md        # Sổ tay xử lý các lỗi thực chiến hay gặp nhất
 ```
 
 ---
@@ -175,11 +181,56 @@ Sau khi toàn bộ mục báo `[PASS]`:
 
 ---
 
+## Trung tâm Điều khiển Sandbox 2 (`codex-manage`) — Menu Tương tác & Xóa CLI Không Mất Lịch Sử (v1.4.0)
+
+Sau khi cài đặt bộ kit, lệnh nhanh **`codex-manage`** được cài sẵn trong `~/.local/bin/` (trên cả PowerShell, CMD, Git Bash, macOS, Linux, WSL). Bạn cũng có thể gọi trực tiếp `scripts/codex-manager.ps1` (Windows) hoặc `scripts/codex-manager.sh` (macOS/Linux/WSL).
+
+### Mở menu tương tác trực quan (6 chức năng đầy đủ)
+```powershell
+# Windows (PowerShell / CMD / Git Bash) hoặc macOS / Linux / WSL:
+codex-manage
+```
+Menu tương tác cho phép chọn nhanh:
+* **`[1A]` API Key (OpenAI / GPT chính chủ — `ApiGpt` / `api-gpt`):** Nhập ẩn đúng 1 API key qua stdin vào `codex login --with-api-key` *(không bao giờ lộ trên dòng lệnh hay in plaintext)*, tự dọn `model_provider` bên thứ 3 xung đột (có backup), khóa NTFS DACL / `chmod 600` và đồng bộ lịch sử chat 2 chiều với GPT 1.
+* **`[1B]` API Key (Bên thứ 3 / Custom Gateway — `ApiOther` / `api-other`):** Tạo backup rồi mở thẳng `~/.codex-official/config.toml` bằng trình soạn thảo, hậu kiểm cú pháp TOML, cảnh báo nổi bật nếu chứa plaintext `api_key`, tự khóa lại NTFS DACL / `chmod 600` và đồng bộ lịch sử chat 2 chiều.
+* **`[2]` Đăng nhập chính thức (`Login` / `login`):** Nhảy thẳng vào `codex login` (hỗ trợ `--device-auth` / `-DeviceAuth`) cho Sandbox 2, khóa ACL / `0600` trên `auth.json` và đồng bộ lịch sử chat 2 chiều.
+* **`[3]` Check API Key (`CheckApiKey` / `check-api-key`):** Kiểm tra cục bộ dạng ẩn (`sk-...xxxx`, độ dài, quyền tệp) và tùy chọn probe sống `GET <base_url>/models` (`-OnlineCheck` / `--online-check`) trả về `VALID (HTTP 200)`, `INVALID/EXPIRED (HTTP 401/403)`, `QUOTA/RATE_LIMITED (HTTP 429)` hoặc `NETWORK_ERROR` với 0 ký tự plaintext bị lộ.
+* **`[4]` Check Tài khoản Hiện có (`CheckAccounts` / `check-accounts`):** Kiểm tra **chỉ-đọc 100%** cả **GPT 1 (`~/.codex`, Desktop)** lẫn **Sandbox 2 (`~/.codex-official`, CLI)**: `codex login status`, `auth_mode`, `model_provider`, `env_key`, 6 liên kết dùng chung, số phiên và trạng thái ACL / `0600`.
+* **`[5]` Đồng bộ Lịch sử Chat 2 chiều (`SyncHistory` / `sync-history`):** Chạy `sync-sessions.py --bidirectional --backup-target` để hợp nhất 2 chiều toàn bộ phiên chat, `Pinned` và `Goals` giữa GPT 1 và Sandbox 2 mà không ghi đè dữ liệu mới hơn của GPT 1.
+* **`[6]` Xóa Sandbox 2 (Codex CLI) An toàn — KHÔNG Xóa Lịch Sử Chat (`RemoveSandbox2` / `remove-sandbox2`):** **Bắt buộc** chạy cứu hộ ngược `sync-sessions.py --source <Lane2> --target <Lane1> --rescue-shared-files --backup-target` (fail-closed) để kéo 100% phiên chat, `Pinned`, `Goals` và mọi tệp rollout/memory cục bộ về **GPT 1 (`~/.codex`) TRƯỚC**, rồi mới gọi `restore-original.*` tháo sạch Junction/symlink và xóa `~/.codex-official`, sau đó xác minh dữ liệu GPT 1 còn nguyên vẹn 100%.
+
+### Ví dụ gọi trực tiếp bằng cờ CLI (không cần qua menu)
+```powershell
+# Windows (PowerShell):
+.\scripts\codex-manager.ps1 -Action ApiGpt                           # Nhập ẩn OpenAI API Key cho Sandbox 2
+.\scripts\codex-manager.ps1 -Action ApiOther                         # Mở thẳng ~/.codex-official/config.toml (Custom Gateway)
+.\scripts\codex-manager.ps1 -Action Login -DeviceAuth                # Đăng nhập chính thức (hoặc bỏ -DeviceAuth để mở trình duyệt)
+.\scripts\codex-manager.ps1 -Action CheckApiKey -OnlineCheck         # Kiểm tra API Key Sandbox 2 (kèm kiểm tra sống /models)
+.\scripts\codex-manager.ps1 -Action CheckAccounts                    # Xem trạng thái cả GPT 1 & Sandbox 2 (chỉ đọc)
+.\scripts\codex-manager.ps1 -Action SyncHistory                      # Đồng bộ lịch sử chat 2 chiều
+.\scripts\codex-manager.ps1 -Action RemoveSandbox2 -DryRun           # Xem trước kế hoạch xóa Sandbox 2 giữ 100% lịch sử chat
+.\scripts\codex-manager.ps1 -Action RemoveSandbox2                   # Thực thi: cứu hộ 100% lịch sử về GPT 1 trước -> rồi mới xóa Sandbox 2
+```
+
+```bash
+# macOS / Linux / WSL:
+./scripts/codex-manager.sh --action api-gpt                          # Nhập ẩn OpenAI API Key cho Sandbox 2
+./scripts/codex-manager.sh --action api-other                        # Mở thẳng ~/.codex-official/config.toml
+./scripts/codex-manager.sh --action login                            # Đăng nhập chính thức (thêm --device-auth nếu cần)
+./scripts/codex-manager.sh --action check-api-key --online-check     # Kiểm tra API Key Sandbox 2 (kèm probe /models)
+./scripts/codex-manager.sh --action check-accounts                   # Kiểm tra chỉ-đọc cả GPT 1 & Sandbox 2
+./scripts/codex-manager.sh --action sync-history                     # Đồng bộ lịch sử chat 2 chiều
+./scripts/codex-manager.sh --action remove-sandbox2 --dry-run        # Xem trước xóa Sandbox 2 bảo toàn lịch sử chat
+./scripts/codex-manager.sh --action remove-sandbox2                  # Cứu hộ 100% lịch sử về GPT 1 trước -> rồi mới xóa Sandbox 2
+```
+
+---
+
 ## Người dùng macOS / Linux / WSL
 ```bash
 git clone https://github.com/h01n9N90c/codex-cli-desktop.git
 cd codex-cli-desktop
-chmod +x ./scripts/setup-dual-lane.sh ./scripts/doctor.sh ./scripts/restore-original.sh
+chmod +x ./scripts/setup-dual-lane.sh ./scripts/codex-manager.sh ./scripts/doctor.sh ./scripts/restore-original.sh
 ./scripts/setup-dual-lane.sh --repo /path/to/your-project --dry-run
 # Cài mặc định (Desktop ~/.codex = acc chính giữ nguyên 100%, tự kế thừa chỉ-đọc [projects] theo đúng trust_level sang CLI ~/.codex-official; hỗ trợ cả --repo-path .):
 ./scripts/setup-dual-lane.sh --repo /path/to/your-project --install-bridge
@@ -190,10 +241,10 @@ chmod +x ./scripts/setup-dual-lane.sh ./scripts/doctor.sh ./scripts/restore-orig
     --gateway-base-url "https://<cong-api-cua-ban>/v1" \
     --cli-api-key-env CODEX_CLI_API_KEY --install-bridge
 ./scripts/doctor.sh
-codex login   # Hoặc: printenv OPENAI_API_KEY | codex login --with-api-key (hay dùng env_key ở trên)
+codex-manage   # Mở trung tâm điều khiển Sandbox 2 (API Key / Login / Check Key & Accounts / Sync 2 chiều / Xóa CLI không mất lịch sử)
 codex
 ```
-*(Khôi phục an toàn bất cứ lúc nào: `./scripts/restore-original.sh --dry-run` rồi `./scripts/restore-original.sh --remove-lane2-home`.)*
+*(Gỡ Sandbox 2 mà vẫn giữ nguyên 100% lịch sử chat về GPT 1: `./scripts/codex-manager.sh --action remove-sandbox2 --dry-run` rồi `./scripts/codex-manager.sh --action remove-sandbox2`; hoặc khôi phục thuần theo snapshot: `./scripts/restore-original.sh --dry-run` rồi `./scripts/restore-original.sh --remove-lane2-home`.)*
 
 ---
 
@@ -201,11 +252,16 @@ codex
 
 | Mục đích | Lệnh |
 | :--- | :--- |
+| Mở Trung tâm Điều khiển Tương tác Sandbox 2 (API Key / Login / Check / Sync / Gỡ CLI) | `codex-manage` *(Windows: `.\scripts\codex-manager.ps1`; Unix: `./scripts/codex-manager.sh`)* |
+| Kiểm tra API Key Sandbox 2 (mask an toàn + probe sống `/models`) | `.\scripts\codex-manager.ps1 -Action CheckApiKey -OnlineCheck` *(Unix: `./scripts/codex-manager.sh --action check-api-key --online-check`)* |
+| Kiểm tra trạng thái tài khoản hiện có (GPT 1 & Sandbox 2, chỉ đọc) | `.\scripts\codex-manager.ps1 -Action CheckAccounts` *(Unix: `./scripts/codex-manager.sh --action check-accounts`)* |
+| Đồng bộ lịch sử chat 2 chiều giữa GPT 1 & Sandbox 2 (có sao lưu trước khi ghi) | `python .\scripts\sync-sessions.py --bidirectional --backup-target` *(hoặc `codex-manage` mục `[5]`)* |
+| **Xóa Sandbox 2 (Codex CLI) an toàn — giữ 100% lịch sử chat về GPT 1** | `.\scripts\codex-manager.ps1 -Action RemoveSandbox2` *(Unix: `./scripts/codex-manager.sh --action remove-sandbox2`; thêm `-DryRun`/`--dry-run` để xem trước)* |
 | Chẩn đoán cấu hình máy, ACL & chạy probe thực thi `execpolicy` | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\doctor.ps1` *(Unix: `./scripts/doctor.sh`)* |
 | Khóa nhanh lại NTFS DACL sau khi sửa Settings / `codex features` (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dual-lane.ps1 -ReapplyAclOnly` |
 | Xem trước khôi phục chính xác về trạng thái gốc (`-DryRun`) | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1 -DryRun` *(Unix: `./scripts/restore-original.sh --dry-run`)* |
 | Khôi phục chính xác 100% về trạng thái trước khi cài (kèm kiểm chứng SHA-256) | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1` *(Unix: `./scripts/restore-original.sh`)* |
-| Chạy toàn bộ Unit Test, Smoke Test & Rollback Test của bộ kit | `powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1` *(Python: `python -m unittest discover -s .\tests -v`)* |
+| Chạy toàn bộ Unit Test, Smoke Test & Rollback Test của bộ kit (**13 pha**) | `powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test-kit.ps1` *(Python: `python -m unittest discover -s .\tests -v`)* |
 | Chạy Codex CLI ở **Luồng 2 (`~/.codex-official` — hỗ trợ CẢ Login OAuth lẫn API Key)** | `codex` *(hoặc `codex-official`)* |
 | Chạy Codex CLI ở **Luồng 1 (`~/.codex` — cấu hình Codex Desktop / Tài khoản chính `acc chính`)** | `codex-t3` |
 | Đổi model ngay trong khung chat TUI | Gõ `/model` |
@@ -218,10 +274,10 @@ codex
 ---
 
 ## Tài liệu chi tiết đi kèm
-* 📘 **[Hướng dẫn Chi tiết & Khai báo Mã nguồn / Công cụ (Manifest)](docs/GUIDE_AND_MANIFEST.md)** — Khai báo minh bạch từng tệp, từng hàm mã nguồn, đường dẫn đọc/ghi, toàn bộ bảng tham số CLI và hướng dẫn gỡ bỏ an toàn.
+* 📘 **[Hướng dẫn Chi tiết & Khai báo Mã nguồn / Công cụ (Manifest)](docs/GUIDE_AND_MANIFEST.md)** — Khai báo minh bạch từng tệp, từng hàm mã nguồn, đường dẫn đọc/ghi, toàn bộ bảng tham số CLI (`setup-dual-lane`, `codex-manager`, `sync-sessions`, `doctor`, `restore-original`) và hướng dẫn gỡ bỏ an toàn.
 * ✅ **[Danh sách Kiểm chứng Thực tế (Real Codex Verification Checklist)](docs/REAL_CODEX_CHECKLIST.md)** — Các lệnh thực nghiệm để tự kiểm tra không lộ key, probe `execpolicy`, kiểm tra ACL/chmod, merge TOML và test UPSERT SQLite.
 * 🛡️ **[Mô hình Phòng thủ 4 Lớp, Ranh giới OS/Codex Runtime & Khiên Git](docs/SECURITY_MODEL.md)**
-* 🔧 **[Cẩm nang Xử lý 10 Lỗi Thực Chiến](docs/TROUBLESHOOTING.md)**
+* 🔧 **[Cẩm nang Xử lý Lỗi Thực Chiến (Troubleshooting)](docs/TROUBLESHOOTING.md)**
 
 ---
 

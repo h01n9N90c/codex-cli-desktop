@@ -61,9 +61,9 @@
     Directory Junctions and must not equal or overlap Lane1Home. Default: %USERPROFILE%\.codex-official.
 
 .PARAMETER LocalBin
-    Directory where self-healing CLI wrappers (codex.cmd, codex-official.cmd, codex-t3.cmd and
-    extensionless Git Bash / MSYS2 POSIX shims codex, codex-official, codex-t3) are
-    installed. Default: %USERPROFILE%\.local\bin.
+    Directory where self-healing CLI wrappers (codex.cmd, codex-official.cmd, codex-t3.cmd,
+    codex-manage.cmd and extensionless Git Bash / MSYS2 POSIX shims codex, codex-official,
+    codex-t3, codex-manage) are installed. Default: %USERPROFILE%\.local\bin.
 
 .PARAMETER CargoTargetDir
     Dedicated CARGO_TARGET_DIR exported for Lane 2 so parallel `cargo test`/`cargo build` runs in
@@ -2446,7 +2446,7 @@ $suppliedSecretForGuard = ''
 # ============================================================================
 # Step 11: Install Self-Healing CLI Wrappers into LocalBin & Update User PATH
 # ============================================================================
-Write-Step "Installing codex.cmd, codex-official.cmd, codex-t3.cmd and Git Bash POSIX shims (codex, codex-official, codex-t3) into $LocalBin..."
+Write-Step "Installing codex.cmd, codex-official.cmd, codex-t3.cmd, codex-manage.cmd and Git Bash POSIX shims (codex, codex-official, codex-t3, codex-manage) into $LocalBin..."
 
 # For Microsoft Store / MSIX installs, the versioned WindowsApps directory changes after updates;
 # this self-healing fallback re-queries Get-AppxPackage automatically when the cached path disappears.
@@ -2459,17 +2459,21 @@ for /f "usebackq delims=" %%I in (``powershell -NoProfile -Command "(Get-AppxPac
 "@ + "`r`n"
 } else { '' }
 
+$managerScriptPath = Resolve-CanonicalLongPath -PathValue (Join-Path $KitRoot 'scripts\codex-manager.ps1')
+
 # Switch cmd.exe to UTF-8 codepage (65001) whenever any embedded path contains non-ASCII/Unicode characters.
-$needsUtf8Codepage = ($Lane1Home -match '[^\x00-\x7F]') -or ($Lane2Home -match '[^\x00-\x7F]') -or ($CargoTargetDir -match '[^\x00-\x7F]') -or ($CodexExe -match '[^\x00-\x7F]') -or ($RepoPath -match '[^\x00-\x7F]') -or ($effectiveLane2Repo -match '[^\x00-\x7F]')
+$needsUtf8Codepage = ($Lane1Home -match '[^\x00-\x7F]') -or ($Lane2Home -match '[^\x00-\x7F]') -or ($LocalBin -match '[^\x00-\x7F]') -or ($CargoTargetDir -match '[^\x00-\x7F]') -or ($CodexExe -match '[^\x00-\x7F]') -or ($RepoPath -match '[^\x00-\x7F]') -or ($effectiveLane2Repo -match '[^\x00-\x7F]') -or ($managerScriptPath -match '[^\x00-\x7F]')
 $utf8Header = if ($needsUtf8Codepage) { "chcp 65001 >nul`r`n" } else { '' }
 
 # Escape '%' -> '%%' and reject quotes/newlines before embedding canonical long paths into .cmd files.
-$cmdLane1Home = Escape-CmdSetValue -Value $Lane1Home          -Label 'Lane1Home'
-$cmdLane2Home = Escape-CmdSetValue -Value $Lane2Home          -Label 'Lane2Home'
-$cmdCargoDir  = Escape-CmdSetValue -Value $CargoTargetDir     -Label 'CargoTargetDir'
-$cmdCodexExe  = Escape-CmdSetValue -Value $CodexExe           -Label 'CodexExe'
-$cmdRepoPath  = Escape-CmdSetValue -Value $RepoPath           -Label 'RepoPath'
-$cmdLane2Repo = Escape-CmdSetValue -Value $effectiveLane2Repo -Label 'Lane2WorktreePath'
+$cmdLane1Home     = Escape-CmdSetValue -Value $Lane1Home          -Label 'Lane1Home'
+$cmdLane2Home     = Escape-CmdSetValue -Value $Lane2Home          -Label 'Lane2Home'
+$cmdLocalBin      = Escape-CmdSetValue -Value $LocalBin           -Label 'LocalBin'
+$cmdCargoDir      = Escape-CmdSetValue -Value $CargoTargetDir     -Label 'CargoTargetDir'
+$cmdCodexExe      = Escape-CmdSetValue -Value $CodexExe           -Label 'CodexExe'
+$cmdRepoPath      = Escape-CmdSetValue -Value $RepoPath           -Label 'RepoPath'
+$cmdLane2Repo     = Escape-CmdSetValue -Value $effectiveLane2Repo -Label 'Lane2WorktreePath'
+$cmdManagerScript = Escape-CmdSetValue -Value $managerScriptPath  -Label 'CodexManagerScript'
 
 # When -UseGitWorktree is enabled, enforce a HARD FAIL-CLOSED OS workspace-write boundary using
 # zero-parenthesis batch labels (safe with spaces, '&', '(', ')', '!', '%', Unicode, and 8.3 short paths):
@@ -2658,9 +2662,31 @@ exit /b 1
 exit /b %ERRORLEVEL%
 "@
 
+$manageWrapper = @"
+@echo off
+setlocal
+${utf8Header}set "CODEX_MANAGER_SCRIPT=$cmdManagerScript"
+if not defined CODEX_LANE1_HOME set "CODEX_LANE1_HOME=$cmdLane1Home"
+if not defined CODEX_LANE2_HOME set "CODEX_LANE2_HOME=$cmdLane2Home"
+if not defined CODEX_LOCAL_BIN set "CODEX_LOCAL_BIN=$cmdLocalBin"
+if not defined CODEX_MANAGER_EXE set "CODEX_MANAGER_EXE=$cmdCodexExe"
+if exist "%CODEX_MANAGER_SCRIPT%" goto :_dl_mgr_ready
+echo [ERROR] Codex Manager script not found at "%CODEX_MANAGER_SCRIPT%". Re-run setup-dual-lane.ps1. >&2
+exit /b 1
+:_dl_mgr_ready
+where pwsh.exe >nul 2>nul
+if %ERRORLEVEL%==0 goto :_dl_mgr_pwsh
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CODEX_MANAGER_SCRIPT%" %*
+exit /b %ERRORLEVEL%
+:_dl_mgr_pwsh
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%CODEX_MANAGER_SCRIPT%" %*
+exit /b %ERRORLEVEL%
+"@
+
 # Enforce strict CRLF line endings on generated .cmd wrappers so cmd.exe goto labels never corrupt.
 $officialWrapper = ($officialWrapper -replace "\r?\n", "`r`n").TrimEnd("`r", "`n") + "`r`n"
 $t3Wrapper       = ($t3Wrapper       -replace "\r?\n", "`r`n").TrimEnd("`r", "`n") + "`r`n"
+$manageWrapper   = ($manageWrapper   -replace "\r?\n", "`r`n").TrimEnd("`r", "`n") + "`r`n"
 
 function New-PosixWrapperShim([string]$CmdFileName) {
     <#
@@ -2685,9 +2711,11 @@ $wrapperSpecs = @(
     @{ Name = 'codex.cmd';          Content = $officialWrapper },
     @{ Name = 'codex-official.cmd'; Content = $officialWrapper },
     @{ Name = 'codex-t3.cmd';       Content = $t3Wrapper },
+    @{ Name = 'codex-manage.cmd';   Content = $manageWrapper },
     @{ Name = 'codex';              Content = (New-PosixWrapperShim -CmdFileName 'codex.cmd') },
     @{ Name = 'codex-official';     Content = (New-PosixWrapperShim -CmdFileName 'codex-official.cmd') },
-    @{ Name = 'codex-t3';           Content = (New-PosixWrapperShim -CmdFileName 'codex-t3.cmd') }
+    @{ Name = 'codex-t3';           Content = (New-PosixWrapperShim -CmdFileName 'codex-t3.cmd') },
+    @{ Name = 'codex-manage';       Content = (New-PosixWrapperShim -CmdFileName 'codex-manage.cmd') }
 )
 foreach ($spec in $wrapperSpecs) {
     $wrapperFullPath = Resolve-CanonicalLongPath -PathValue (Join-Path $LocalBin $spec.Name)
@@ -2842,7 +2870,8 @@ if (-not $script:IsDryRun) {
 
 Write-Host "`n[OK] Setup completed!" -ForegroundColor Green
 Write-Host "Next steps:"
-Write-Host "  1. Run health check anytime:   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\doctor.ps1"
-Write-Host "  2. Sign in to Lane 2 (once):   codex login"
-Write-Host "  3. Start Lane 2 Official CLI:  codex"
-Write-Host "  4. Start Lane 1 (Desktop/T3):  codex-t3 (or open Codex Desktop App)"
+Write-Host "  1. Open Sandbox 2 Control Center: codex-manage"
+Write-Host "  2. Run health check anytime:      powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\doctor.ps1"
+Write-Host "  3. Sign in to Lane 2 (once):      codex login"
+Write-Host "  4. Start Lane 2 Official CLI:     codex"
+Write-Host "  5. Start Lane 1 (Desktop/T3):     codex-t3 (or open Codex Desktop App)"

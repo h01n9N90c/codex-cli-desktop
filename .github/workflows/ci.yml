@@ -15,20 +15,22 @@
 #        - Starlark AST & core policy check on templates/default.rules
 #        - Python syntax compilation (py_compile)
 #   2. test-windows (windows-latest):
-#        - Full 10-stage tests/test-kit.ps1 under Windows PowerShell 5.1 AND PowerShell 7+
+#        - Full 13-stage tests/test-kit.ps1 under Windows PowerShell 5.1 AND PowerShell 7+
 #        - Covers AST parse, Python unittest, default.rules, -DryRun/-WhatIf,
 #          non-destructive TOML merge, env_key secret isolation, Protect-SensitiveFileAcl,
 #          8.3 short-path canonicalization, hard fail-closed worktree isolation,
 #          doctor.ps1 zero-leakage/bypass checks, path-traversal rejection,
-#          SHA-256 rollback, interrupted mid-install recovery, and 3x install/rollback loop.
+#          SHA-256 rollback, interrupted mid-install recovery, 3x install/rollback loop,
+#          trust-boundary preservation, and codex-manager.ps1 (all 6 actions + rescue).
 #   3. test-unix (ubuntu-latest & macos-latest):
-#        - bash -n syntax validation on all scripts/*.sh
+#        - bash -n syntax validation on all 4 scripts/*.sh (including codex-manager.sh)
 #        - py_compile + python3 -B -m unittest discover -s ./tests -v
 #        - Portable end-to-end smoke test (paths with spaces, --dry-run zero-mutation,
 #          TOML merge preservation, 0600 permissions, hard fail-closed worktree routing
 #          & failed-cd/missing-worktree refusal, doctor.sh zero-secret-leakage,
 #          tampered path-traversal/SUID manifest rejection, SHA-256 + POSIX mode rollback,
-#          interrupted mid-install rollback recovery, and 3x install/rollback loop).
+#          interrupted mid-install rollback recovery, 3x install/rollback loop,
+#          trust-boundary parity, and Section 10 codex-manager.sh all 6 actions + rescue).
 # ==============================================================================
 name: CI
 
@@ -65,10 +67,11 @@ jobs:
           tracked = [p for p in tracked if p]
           assert tracked, "git ls-files returned empty repository"
 
-          # Verify legal attribution files remain intact.
-          for req in ("LICENSE", "NOTICE"):
+          # Verify legal attribution & core manager scripts remain tracked and non-empty.
+          for req in ("LICENSE", "NOTICE", "scripts/codex-manager.sh", "scripts/codex-manager.ps1"):
               p = pathlib.Path(req)
               assert p.is_file() and p.stat().st_size > 0, f"Required file missing or empty: {req}"
+              assert req in tracked, f"Required file is not tracked by git: {req}"
 
           # Reject forbidden tracked artifacts (bytecode caches, live configs, secrets, DBs).
           forbidden_names = {"auth.json", "config.toml", "config.backup.toml", ".env"}
@@ -89,6 +92,8 @@ jobs:
               )
 
               if is_crlf_type:
+                  if data.startswith(b"\xef\xbb\xbf"):
+                      errors.append(f"UTF-8 BOM not permitted in CRLF-enforced file: {rel}")
                   # Every LF in .ps1/.cmd must be preceded by CR (strict CRLF per .gitattributes).
                   for i, b in enumerate(data):
                       if b == 0x0A and (i == 0 or data[i - 1] != 0x0D):
@@ -241,6 +246,7 @@ jobs:
           bash -n ./scripts/setup-dual-lane.sh
           bash -n ./scripts/doctor.sh
           bash -n ./scripts/restore-original.sh
+          bash -n ./scripts/codex-manager.sh
           python3 -B -m py_compile ./scripts/sync-sessions.py ./tests/test_sync_sessions.py
           python3 -B -m unittest discover -s ./tests -v
 
@@ -267,7 +273,11 @@ jobs:
           }
 
           TMP_ROOT="$(mktemp -d 2>/dev/null || mktemp -d -t codex-kit-ci)"
+          P10_MOCK_PID=""
           cleanup_tmp() {
+            if [ -n "${P10_MOCK_PID:-}" ]; then
+              kill "${P10_MOCK_PID}" 2>/dev/null || true
+            fi
             chmod -R u+rwx "${TMP_ROOT}" 2>/dev/null || true
             rm -rf "${TMP_ROOT}"
           }
@@ -515,6 +525,7 @@ jobs:
           [ ! -L "${LANE2}/sessions" ]
           [ ! -e "${LOCAL_BIN}/codex" ]
           [ ! -e "${LOCAL_BIN}/codex-official" ]
+          [ ! -e "${LOCAL_BIN}/codex-manage" ]
           [ -x "${LOCAL_BIN}/codex-t3" ]
           [ "$(sha256_of "${LOCAL_BIN}/codex-t3")" = "${ORIG_LAUNCHER_HASH}" ]
           python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o755' "${LOCAL_BIN}/codex-t3"
@@ -605,6 +616,7 @@ jobs:
             grep -q 'approval_policy = "on-request"' "${LANE2}/config.toml"
             grep -q 'model = "custom-ci-model"' "${LANE2}/config.toml"
             grep -q '^# status=complete$' "${LANE2}/.rollback/latest.tsv"
+            [ -x "${LOCAL_BIN}/codex-manage" ]
             python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600' "${LANE2}/config.toml"
             for d in memories memories_v2 sessions archived_sessions skills plugins; do
               [ -L "${LANE2}/${d}" ] || { echo "[FAIL] Cycle ${cycle}: missing symlink ${d}!" >&2; exit 1; }
@@ -620,6 +632,7 @@ jobs:
             python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o755' "${LOCAL_BIN}/codex-t3"
             [ ! -e "${LOCAL_BIN}/codex" ]
             [ ! -e "${LOCAL_BIN}/codex-official" ]
+            [ ! -e "${LOCAL_BIN}/codex-manage" ]
             [ ! -e "${LANE2}/AGENTS.md" ]
             [ ! -e "${LANE2}/rules/default.rules" ]
             for d in memories memories_v2 sessions archived_sessions skills plugins; do
@@ -833,6 +846,456 @@ jobs:
           [ "$(sha256_of "${P9_L2}/config.toml")" = "${P9E_ORIG_CFG_HASH}" ]
           python3 -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o644' "${P9_L2}/config.toml"
           [ ! -e "${P9_L2}/auth.json" ]
+          [ ! -e "${P9_BIN}/codex-manage" ]
           [ -L "${P9_L2}/skills" ]
 
-          echo "[PASS] Unix smoke, fail-closed worktree, traversal/SUID defense, interrupted rollback, 3x loop, pre-existing link/exact backup/missing-backup preflight, and v1.3.3 trust-boundary + CLI gateway + auth-share parity passed!"
+          # 10) v1.4.0 Interactive Sandbox 2 Control Center (`scripts/codex-manager.sh` & `codex-manage`):
+          #     Tests ALL 6 actions end-to-end inside a path with spaces:
+          #       10a) check-accounts (strictly read-only on GPT 1 & Sandbox 2, zero secret leakage, via codex-manage)
+          #       10b) api-gpt (refuses CLI plaintext flag, accepts stdin key, strips 3rd-party model_provider,
+          #            preserves [projects.*] trust_level, enforces 0600, runs bidirectional chat sync)
+          #       10c) api-other (direct config.toml backup/edit, TOML syntax validation, plaintext key warning, 0600)
+          #       10d) check-api-key (offline mask + local Python loopback HTTP mock 200/401/429, zero secret leakage)
+          #       10e) login (--device-auth + --force clears conflicting model_provider, invokes codex login, 0600)
+          #       10f) sync-history (--dry-run zero mutation + bidirectional convergence across GPT 1 & Sandbox 2)
+          #       10g) remove-sandbox2 (fail-closed without --force, --dry-run safe, rescues Sandbox 2 chats + local
+          #            non-symlink rollout file into GPT 1 BEFORE unlinking symlinks & removing Sandbox 2!)
+          PY_CMD=""
+          for _py_cand in python3 python; do
+            if command -v "${_py_cand}" >/dev/null 2>&1 && "${_py_cand}" --version 2>&1 | grep -Eq '^Python 3\.'; then
+              PY_CMD="${_py_cand}"
+              break
+            fi
+          done
+          [ -n "${PY_CMD}" ] || { echo "[FAIL] Section 10 requires Python 3." >&2; exit 1; }
+
+          assert_mode_0600() {
+            if ! uname -s | grep -Eqi 'mingw|msys|cygwin'; then
+              "${PY_CMD}" -B -c 'import os, stat, sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600, oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))' "$1"
+            fi
+          }
+
+          P10_DIR="${WORK_DIR}/p10 manager"
+          P10_L1="${P10_DIR}/gpt 1"
+          P10_L2="${P10_DIR}/sandbox 2"
+          P10_BIN="${P10_DIR}/local bin"
+          P10_REPO="${P10_DIR}/my repo"
+          P10_FAKE_BIN="${P10_DIR}/fake bin"
+          P10_CODEX_LOG="${P10_DIR}/codex-invocations.log"
+          mkdir -p "${P10_L1}/sessions" "${P10_L2}" "${P10_BIN}" "${P10_REPO}" "${P10_FAKE_BIN}"
+
+          cat > "${P10_FAKE_BIN}/codex" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [ "${1:-}" = "--version" ]; then echo "codex-cli 0.171.0-ci"; exit 0; fi
+          if [ "${1:-}" = "features" ]; then echo "memories stable true"; exit 0; fi
+          if [ "${1:-}" = "execpolicy" ]; then echo '{"decision":"forbidden"}'; exit 0; fi
+          if [ "${1:-}" = "login" ]; then
+            shift
+            if [ "${1:-}" = "status" ]; then
+              if [ -f "${CODEX_HOME:-}/auth.json" ]; then
+                echo "Logged in (mock status for ${CODEX_HOME:-})"
+              else
+                echo "Not logged in"
+              fi
+              exit 0
+            elif [ "${1:-}" = "--with-api-key" ]; then
+              IFS= read -r _k || true
+              [ -n "${_k}" ] || { echo "missing stdin api key" >&2; exit 2; }
+              mkdir -p "${CODEX_HOME}"
+              printf '{"auth_mode":"api_key","OPENAI_API_KEY":"%s"}\n' "${_k}" > "${CODEX_HOME}/auth.json"
+              # Deliberately leave 644 so Section 10 verifies codex-manager.sh locks it to 0600!
+              chmod 644 "${CODEX_HOME}/auth.json"
+              if [ -n "${P10_CODEX_LOG_FILE:-}" ]; then
+                printf 'LOGIN_API_KEY:%s\n' "${CODEX_HOME}" >> "${P10_CODEX_LOG_FILE}"
+              fi
+              echo "Successfully logged in with API key"
+              exit 0
+            else
+              mkdir -p "${CODEX_HOME}"
+              printf '{"auth_mode":"chatgpt","tokens":{"access_token":"eyJCANARY.MOCKTOKEN.SIG123456"}}\n' > "${CODEX_HOME}/auth.json"
+              chmod 644 "${CODEX_HOME}/auth.json"
+              if [ -n "${P10_CODEX_LOG_FILE:-}" ]; then
+                printf 'LOGIN_OAUTH:%s:%s\n' "${CODEX_HOME}" "$*" >> "${P10_CODEX_LOG_FILE}"
+              fi
+              echo "Logged in via OAuth ($*)"
+              exit 0
+            fi
+          fi
+          exit 0
+          EOF
+          chmod +x "${P10_FAKE_BIN}/codex"
+
+          P10_L1_CANARY="sk-CANARY-L1-NEVER-LEAK-778899"
+          cat > "${P10_L1}/config.toml" <<'EOF'
+          model = "gpt-5"
+
+          [projects."/tmp/p10-desktop-trusted"]
+          trust_level = "trusted"
+
+          [projects."/tmp/p10-desktop-untrusted"]
+          trust_level = "untrusted"
+          EOF
+          chmod 600 "${P10_L1}/config.toml"
+          P10_L1_CFG_HASH="$(sha256_of "${P10_L1}/config.toml")"
+
+          printf '{"auth_mode":"chatgpt","tokens":{"access_token":"%s"}}\n' "${P10_L1_CANARY}" > "${P10_L1}/auth.json"
+          chmod 600 "${P10_L1}/auth.json"
+          P10_L1_AUTH_HASH="$(sha256_of "${P10_L1}/auth.json")"
+
+          printf '{"id":"gpt1-thread-1","title":"GPT1 Chat"}\n' > "${P10_L1}/sessions/gpt1-chat.jsonl"
+          P10_L1_CHAT_HASH="$(sha256_of "${P10_L1}/sessions/gpt1-chat.jsonl")"
+          printf '{"id":"gpt1-thread-1","thread_name":"GPT1 Primary","updated_at":"2026-11-23T01:00:00Z"}\n' > "${P10_L1}/session_index.jsonl"
+
+          "${PY_CMD}" -B - "${P10_L1}/state_5.sqlite" "${P10_L1}/goals_1.sqlite" <<'PY'
+          import sqlite3, sys
+          c = sqlite3.connect(sys.argv[1])
+          c.execute("""CREATE TABLE threads (
+              id TEXT PRIMARY KEY, name TEXT, is_pinned INTEGER, thread_section_id TEXT,
+              section_position INTEGER, section_entered_at_ms INTEGER, project_id TEXT,
+              model_provider TEXT, approval_mode TEXT, cwd TEXT, updated_at INTEGER
+          )""")
+          c.execute("INSERT INTO threads VALUES ('gpt1-thread-1','GPT1 Primary',1,NULL,NULL,NULL,NULL,'openai','on-request','/tmp',200)")
+          c.commit(); c.close()
+          g = sqlite3.connect(sys.argv[2])
+          g.execute("CREATE TABLE thread_goals (id TEXT PRIMARY KEY, thread_id TEXT, title TEXT)")
+          g.execute("INSERT INTO thread_goals VALUES ('goal-l1','gpt1-thread-1','Primary Goal')")
+          g.commit(); g.close()
+          PY
+
+          # Install dual-lane with 3rd-party CLI gateway + codex-manage launcher wrapper
+          PATH="${P10_FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P10_L1}" CODEX_LANE2_HOME="${P10_L2}" CODEX_LOCAL_BIN="${P10_BIN}" \
+            ./scripts/setup-dual-lane.sh --repo "${P10_REPO}" \
+              --configure-cli-gateway \
+              --gateway-base-url "https://thirdparty.example.invalid/v1" \
+              --cli-api-key-env "CODEX_CUSTOM_KEY"
+          [ -x "${P10_BIN}/codex-manage" ] || { echo "[FAIL] Section 10: codex-manage wrapper not installed!" >&2; exit 1; }
+
+          # Seed Sandbox 2 with its own unique chat/goal so bidirectional sync is verified
+          printf '{"id":"s2-thread-1","thread_name":"Sandbox 2 Chat","updated_at":"2026-11-23T02:00:00Z"}\n' > "${P10_L2}/session_index.jsonl"
+          "${PY_CMD}" -B - "${P10_L2}/state_5.sqlite" "${P10_L2}/goals_1.sqlite" <<'PY'
+          import sqlite3, sys
+          c = sqlite3.connect(sys.argv[1])
+          c.execute("""CREATE TABLE threads (
+              id TEXT PRIMARY KEY, name TEXT, is_pinned INTEGER, thread_section_id TEXT,
+              section_position INTEGER, section_entered_at_ms INTEGER, project_id TEXT,
+              model_provider TEXT, approval_mode TEXT, cwd TEXT, updated_at INTEGER
+          )""")
+          c.execute("INSERT INTO threads VALUES ('s2-thread-1','Sandbox 2 Chat',0,NULL,NULL,NULL,NULL,'OpenAI','on-request','/tmp',250)")
+          c.commit(); c.close()
+          g = sqlite3.connect(sys.argv[2])
+          g.execute("CREATE TABLE thread_goals (id TEXT PRIMARY KEY, thread_id TEXT, title TEXT)")
+          g.execute("INSERT INTO thread_goals VALUES ('goal-s2','s2-thread-1','Sandbox2 Goal')")
+          g.commit(); g.close()
+          PY
+
+          # 10a) check-accounts (via codex-manage wrapper): strictly read-only on both lanes, zero secret leakage!
+          P10_L2_CFG_BEFORE_ACC="$(sha256_of "${P10_L2}/config.toml")"
+          P10_ACC_OUT="$("${P10_BIN}/codex-manage" --action check-accounts --non-interactive 2>&1)"
+          printf '%s\n' "${P10_ACC_OUT}"
+          printf '%s\n' "${P10_ACC_OUT}" | grep -Fq 'GPT 1 (Codex Desktop)'
+          printf '%s\n' "${P10_ACC_OUT}" | grep -Fq 'Sandbox 2 (Codex CLI)'
+          printf '%s\n' "${P10_ACC_OUT}" | grep -Fq '6/6 healthy'
+          if printf '%s' "${P10_ACC_OUT}" | grep -Fq "${P10_L1_CANARY}"; then
+            echo "[FAIL] Section 10a: check-accounts leaked Lane 1 secret canary!" >&2; exit 1
+          fi
+          [ "$(sha256_of "${P10_L1}/config.toml")" = "${P10_L1_CFG_HASH}" ]
+          [ "$(sha256_of "${P10_L1}/auth.json")" = "${P10_L1_AUTH_HASH}" ]
+          [ "$(sha256_of "${P10_L2}/config.toml")" = "${P10_L2_CFG_BEFORE_ACC}" ]
+
+          # 10b) api-gpt: refuses plaintext CLI flags, accepts stdin key, strips 3rd-party model_provider,
+          #      preserves [projects.*] trust_level, enforces 0600, and syncs chat history bidirectionally!
+          if ./scripts/codex-manager.sh --action api-gpt --api-key "sk-CANARY-FORBIDDEN-CLI-ARG-1234567890" \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" --non-interactive >/dev/null 2>&1; then
+            echo "[FAIL] Section 10b: codex-manager.sh accepted plaintext --api-key CLI argument!" >&2; exit 1
+          fi
+
+          P10_GPT_CANARY="sk-CANARY-GPT-STDIN-KEY-1234567890"
+          P10_APIGPT_OUT="$(
+            printf '%s\n' "${P10_GPT_CANARY}" | \
+            P10_CODEX_LOG_FILE="${P10_CODEX_LOG}" \
+            ./scripts/codex-manager.sh --action api-gpt \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" \
+              --codex-path "${P10_FAKE_BIN}/codex" --api-key-from-stdin --non-interactive 2>&1
+          )"
+          printf '%s\n' "${P10_APIGPT_OUT}"
+          if printf '%s' "${P10_APIGPT_OUT}" | grep -Fq "${P10_GPT_CANARY}"; then
+            echo "[FAIL] Section 10b: api-gpt leaked plaintext API key canary!" >&2; exit 1
+          fi
+          printf '%s\n' "${P10_APIGPT_OUT}" | grep -Fq 'sk-...7890'
+          [ -n "$(find "${P10_L2}" -maxdepth 1 -name 'config.toml.backup-*' 2>/dev/null)" ]
+          assert_mode_0600 "${P10_L2}/auth.json"
+          assert_mode_0600 "${P10_L2}/config.toml"
+          "${PY_CMD}" -B - "${P10_L2}/config.toml" "${P10_L1}/state_5.sqlite" "${P10_L2}/state_5.sqlite" <<'PY'
+          import pathlib, sqlite3, sys, tomllib
+          cfg = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert "model_provider" not in cfg, f"Expected top-level model_provider stripped: {cfg}"
+          projs = cfg.get("projects", {})
+          assert projs.get("/tmp/p10-desktop-trusted", {}).get("trust_level") == "trusted", projs
+          assert projs.get("/tmp/p10-desktop-untrusted", {}).get("trust_level") == "untrusted", projs
+          c1 = sqlite3.connect(sys.argv[2])
+          ids1 = {r[0] for r in c1.execute("SELECT id FROM threads").fetchall()}
+          c1.close()
+          c2 = sqlite3.connect(sys.argv[3])
+          ids2 = {r[0] for r in c2.execute("SELECT id FROM threads").fetchall()}
+          c2.close()
+          assert {"gpt1-thread-1", "s2-thread-1"}.issubset(ids1), ids1
+          assert {"gpt1-thread-1", "s2-thread-1"}.issubset(ids2), ids2
+          PY
+          [ "$(sha256_of "${P10_L1}/config.toml")" = "${P10_L1_CFG_HASH}" ]
+          [ "$(sha256_of "${P10_L1}/auth.json")" = "${P10_L1_AUTH_HASH}" ]
+
+          # 10c) api-other: backup + direct config.toml edit + TOML syntax check + plaintext key warning + 0600
+          P10_PLAIN_CANARY="sk-CANARY-PLAINTEXT-WARN-4455667788"
+          P10_ED_PLAIN="${P10_DIR}/fake-editor-plain.sh"
+          cat > "${P10_ED_PLAIN}" <<EOF
+          #!/usr/bin/env bash
+          cat > "\$1" <<'TOML'
+          model_provider = "MockLocal"
+          sandbox_mode = "workspace-write"
+
+          [model_providers."MockLocal"]
+          name = "MockLocal"
+          base_url = "https://example.invalid/v1"
+          api_key = "${P10_PLAIN_CANARY}"
+          TOML
+          EOF
+          chmod +x "${P10_ED_PLAIN}"
+          P10_OTHER_PLAIN_OUT="$(
+            ./scripts/codex-manager.sh --action api-other \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" \
+              --editor "${P10_ED_PLAIN}" --non-interactive 2>&1
+          )"
+          printf '%s\n' "${P10_OTHER_PLAIN_OUT}" | grep -Eqi '\[WARN\].*Plaintext'
+          if printf '%s' "${P10_OTHER_PLAIN_OUT}" | grep -Fq "${P10_PLAIN_CANARY}"; then
+            echo "[FAIL] Section 10c: api-other leaked plaintext key canary!" >&2; exit 1
+          fi
+          assert_mode_0600 "${P10_L2}/config.toml"
+
+          P10_ED_BAD="${P10_DIR}/fake-editor-bad.sh"
+          cat > "${P10_ED_BAD}" <<'EOF'
+          #!/usr/bin/env bash
+          printf 'model_provider = [BROKEN TOML\n' > "$1"
+          EOF
+          chmod +x "${P10_ED_BAD}"
+          if ./scripts/codex-manager.sh --action api-other \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" \
+              --editor "${P10_ED_BAD}" --non-interactive >/dev/null 2>&1; then
+            echo "[FAIL] Section 10c: api-other accepted invalid TOML syntax!" >&2; exit 1
+          fi
+
+          # 10d) check-api-key: offline mask + live local Python loopback HTTP mock (200 / 401 / 429), zero leakage!
+          P10_VALID_KEY="sk-CANARY-MOCK-VALID-200-99887766"
+          P10_BAD_KEY="sk-CANARY-MOCK-BAD-401-11223344"
+          P10_QUOTA_KEY="sk-CANARY-MOCK-QUOTA-429-55667788"
+          P10_PORT_FILE="${P10_DIR}/mock-port.txt"
+          rm -f "${P10_PORT_FILE}"
+
+          P10_MOCK_VALID="${P10_VALID_KEY}" P10_MOCK_QUOTA="${P10_QUOTA_KEY}" \
+          "${PY_CMD}" -B - "${P10_PORT_FILE}" <<'PY' &
+          import http.server, json, os, sys
+
+          port_file = sys.argv[1]
+          valid_key = os.environ["P10_MOCK_VALID"]
+          quota_key = os.environ["P10_MOCK_QUOTA"]
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def log_message(self, fmt, *args):
+                  pass
+              def do_GET(self):
+                  if self.path != "/v1/models":
+                      self.send_response(404)
+                      self.end_headers()
+                      return
+                  auth = self.headers.get("Authorization", "")
+                  if auth == f"Bearer {valid_key}":
+                      payload = json.dumps({"data": [{"id": "gpt-5"}, {"id": "gpt-5-mini"}]}).encode("utf-8")
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(payload)))
+                      self.end_headers()
+                      self.wfile.write(payload)
+                  elif auth == f"Bearer {quota_key}":
+                      self.send_response(429)
+                      self.end_headers()
+                      self.wfile.write(b'{"error":"rate_limit"}')
+                  else:
+                      self.send_response(401)
+                      self.end_headers()
+                      self.wfile.write(b'{"error":"invalid_api_key"}')
+
+          srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+          with open(port_file, "w", encoding="utf-8") as fh:
+              fh.write(str(srv.server_address[1]))
+          srv.serve_forever()
+          PY
+          P10_MOCK_PID=$!
+
+          for _wait_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            [ -s "${P10_PORT_FILE}" ] && break
+            sleep 0.25
+          done
+          [ -s "${P10_PORT_FILE}" ] || { echo "[FAIL] Section 10d: mock HTTP server failed to bind port!" >&2; exit 1; }
+          P10_MOCK_PORT="$(cat "${P10_PORT_FILE}")"
+
+          P10_ED_CLEAN="${P10_DIR}/fake-editor-clean.sh"
+          cat > "${P10_ED_CLEAN}" <<EOF
+          #!/usr/bin/env bash
+          cat > "\$1" <<'TOML'
+          model_provider = "MockLocal"
+          sandbox_mode = "workspace-write"
+          approval_policy = "on-request"
+
+          [model_providers."MockLocal"]
+          name = "MockLocal"
+          base_url = "http://127.0.0.1:${P10_MOCK_PORT}/v1"
+          wire_api = "responses"
+          env_key = "MOCK_GW_API_KEY"
+
+          [projects."/tmp/p10-desktop-trusted"]
+          trust_level = "trusted"
+          TOML
+          EOF
+          chmod +x "${P10_ED_CLEAN}"
+          ./scripts/codex-manager.sh --action api-other \
+            --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" \
+            --editor "${P10_ED_CLEAN}" --non-interactive
+          assert_mode_0600 "${P10_L2}/config.toml"
+
+          # Offline check
+          P10_OFFLINE_OUT="$(
+            MOCK_GW_API_KEY="${P10_VALID_KEY}" \
+            ./scripts/codex-manager.sh --action check-api-key \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" --non-interactive 2>&1
+          )"
+          printf '%s\n' "${P10_OFFLINE_OUT}" | grep -Fq 'sk-...7766'
+          if printf '%s' "${P10_OFFLINE_OUT}" | grep -Fq "${P10_VALID_KEY}"; then
+            echo "[FAIL] Section 10d: offline check-api-key leaked plaintext key!" >&2; exit 1
+          fi
+
+          # Online 200 OK
+          P10_ON200_OUT="$(
+            MOCK_GW_API_KEY="${P10_VALID_KEY}" \
+            ./scripts/codex-manager.sh --action check-api-key --online-check \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" --non-interactive 2>&1
+          )"
+          printf '%s\n' "${P10_ON200_OUT}"
+          printf '%s\n' "${P10_ON200_OUT}" | grep -Fq 'VALID (HTTP 200, 2 models)'
+          if printf '%s' "${P10_ON200_OUT}" | grep -Fq "${P10_VALID_KEY}"; then
+            echo "[FAIL] Section 10d: online 200 check-api-key leaked plaintext key!" >&2; exit 1
+          fi
+
+          # Online 401 INVALID/EXPIRED
+          P10_ON401_OUT="$(
+            MOCK_GW_API_KEY="${P10_BAD_KEY}" \
+            ./scripts/codex-manager.sh --action check-api-key --online-check \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" --non-interactive 2>&1
+          )"
+          printf '%s\n' "${P10_ON401_OUT}" | grep -Fq 'INVALID/EXPIRED (HTTP 401)'
+          if printf '%s' "${P10_ON401_OUT}" | grep -Fq "${P10_BAD_KEY}"; then
+            echo "[FAIL] Section 10d: online 401 check-api-key leaked plaintext key!" >&2; exit 1
+          fi
+
+          # Online 429 QUOTA/RATE_LIMITED
+          P10_ON429_OUT="$(
+            MOCK_GW_API_KEY="${P10_QUOTA_KEY}" \
+            ./scripts/codex-manager.sh --action check-api-key --online-check \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" --non-interactive 2>&1
+          )"
+          printf '%s\n' "${P10_ON429_OUT}" | grep -Fq 'QUOTA/RATE_LIMITED (HTTP 429)'
+          if printf '%s' "${P10_ON429_OUT}" | grep -Fq "${P10_QUOTA_KEY}"; then
+            echo "[FAIL] Section 10d: online 429 check-api-key leaked plaintext key!" >&2; exit 1
+          fi
+
+          kill "${P10_MOCK_PID}" 2>/dev/null || true
+          wait "${P10_MOCK_PID}" 2>/dev/null || true
+          P10_MOCK_PID=""
+
+          # 10e) login: --device-auth + --force clears conflicting model_provider, runs codex login, locks 0600
+          P10_LOGIN_OUT="$(
+            P10_CODEX_LOG_FILE="${P10_CODEX_LOG}" \
+            ./scripts/codex-manager.sh --action login --device-auth --force --non-interactive \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" \
+              --codex-path "${P10_FAKE_BIN}/codex" 2>&1
+          )"
+          printf '%s\n' "${P10_LOGIN_OUT}"
+          grep -Fq -- '--device-auth' "${P10_CODEX_LOG}"
+          ! grep -Eq '^[[:space:]]*model_provider[[:space:]]*=' "${P10_L2}/config.toml"
+          assert_mode_0600 "${P10_L2}/auth.json"
+
+          # 10f) sync-history: --dry-run zero mutation + real bidirectional convergence
+          printf '{"id":"l1-only-bidir","thread_name":"L1 Bidir","updated_at":"2026-11-23T03:00:00Z"}\n' >> "${P10_L1}/session_index.jsonl"
+          printf '{"id":"s2-only-bidir","thread_name":"S2 Bidir","updated_at":"2026-11-23T03:05:00Z"}\n' >> "${P10_L2}/session_index.jsonl"
+          "${PY_CMD}" -B - "${P10_L1}/state_5.sqlite" "${P10_L2}/state_5.sqlite" <<'PY'
+          import sqlite3, sys
+          c1 = sqlite3.connect(sys.argv[1])
+          c1.execute("INSERT INTO threads VALUES ('l1-only-bidir','L1 Bidir',1,NULL,NULL,NULL,NULL,'openai','on-request','/tmp',300)")
+          c1.commit(); c1.close()
+          c2 = sqlite3.connect(sys.argv[2])
+          c2.execute("INSERT INTO threads VALUES ('s2-only-bidir','S2 Bidir',0,NULL,NULL,NULL,NULL,'openai','on-request','/tmp',305)")
+          c2.commit(); c2.close()
+          PY
+
+          ./scripts/codex-manager.sh --action sync-history --dry-run --non-interactive \
+            --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}"
+          ! grep -Fq '"s2-only-bidir"' "${P10_L1}/session_index.jsonl"
+
+          ./scripts/codex-manager.sh --action sync-history --non-interactive \
+            --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}"
+          grep -Fq '"s2-only-bidir"' "${P10_L1}/session_index.jsonl"
+          grep -Fq '"l1-only-bidir"' "${P10_L2}/session_index.jsonl"
+
+          # 10g) remove-sandbox2: rescues Sandbox 2 unique chat + detached local rollout file into GPT 1 BEFORE deletion!
+          printf '{"id":"s2-final-rescue","thread_name":"Final Rescue Chat","updated_at":"2026-11-23T04:00:00Z"}\n' >> "${P10_L2}/session_index.jsonl"
+          "${PY_CMD}" -B - "${P10_L2}/state_5.sqlite" <<'PY'
+          import sqlite3, sys
+          c2 = sqlite3.connect(sys.argv[1])
+          c2.execute("INSERT INTO threads VALUES ('s2-final-rescue','Final Rescue Chat',1,NULL,NULL,NULL,NULL,'openai','on-request','/tmp',400)")
+          c2.commit(); c2.close()
+          PY
+          # Replace archived_sessions symlink with a real local directory containing a Sandbox-2-only rollout file.
+          rm -- "${P10_L2}/archived_sessions"
+          mkdir -p "${P10_L2}/archived_sessions/2026"
+          printf '{"id":"s2-final-rescue","rescued":true}\n' > "${P10_L2}/archived_sessions/2026/s2-local-rollout.jsonl"
+          P10_RESCUE_FILE_HASH="$(sha256_of "${P10_L2}/archived_sessions/2026/s2-local-rollout.jsonl")"
+
+          # Must fail closed in --non-interactive without --force
+          if ./scripts/codex-manager.sh --action remove-sandbox2 --non-interactive \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" >/dev/null 2>&1; then
+            echo "[FAIL] Section 10g: remove-sandbox2 proceeded without --force in --non-interactive mode!" >&2; exit 1
+          fi
+          [ -d "${P10_L2}" ]
+
+          # --dry-run must leave Sandbox 2 untouched and perform zero writes
+          ./scripts/codex-manager.sh --action remove-sandbox2 --dry-run --non-interactive \
+            --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}"
+          [ -d "${P10_L2}" ]
+          ! grep -Fq '"s2-final-rescue"' "${P10_L1}/session_index.jsonl"
+
+          # Real history-preserving uninstall
+          ./scripts/codex-manager.sh --action remove-sandbox2 --force --non-interactive \
+            --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}"
+          [ ! -e "${P10_L2}" ] || { echo "[FAIL] Section 10g: Sandbox 2 directory still exists after remove-sandbox2!" >&2; exit 1; }
+          [ ! -e "${P10_BIN}/codex" ]
+          [ ! -e "${P10_BIN}/codex-official" ]
+          [ ! -e "${P10_BIN}/codex-t3" ]
+          [ ! -e "${P10_BIN}/codex-manage" ]
+
+          # Verify 100% of GPT 1 + rescued Sandbox 2 chat history survived intact in GPT 1!
+          [ "$(sha256_of "${P10_L1}/config.toml")" = "${P10_L1_CFG_HASH}" ]
+          [ "$(sha256_of "${P10_L1}/auth.json")" = "${P10_L1_AUTH_HASH}" ]
+          [ "$(sha256_of "${P10_L1}/sessions/gpt1-chat.jsonl")" = "${P10_L1_CHAT_HASH}" ]
+          [ -f "${P10_L1}/archived_sessions/2026/s2-local-rollout.jsonl" ]
+          [ "$(sha256_of "${P10_L1}/archived_sessions/2026/s2-local-rollout.jsonl")" = "${P10_RESCUE_FILE_HASH}" ]
+          grep -Fq '"gpt1-thread-1"' "${P10_L1}/session_index.jsonl"
+          grep -Fq '"s2-final-rescue"' "${P10_L1}/session_index.jsonl"
+          "${PY_CMD}" -B - "${P10_L1}/state_5.sqlite" <<'PY'
+          import sqlite3, sys
+          c = sqlite3.connect(sys.argv[1])
+          rows = dict(c.execute("SELECT id, is_pinned FROM threads").fetchall())
+          c.close()
+          assert "gpt1-thread-1" in rows and rows["gpt1-thread-1"] == 1, rows
+          assert "s2-final-rescue" in rows and rows["s2-final-rescue"] == 1, rows
+          PY
+
+          echo "[PASS] Unix smoke, fail-closed worktree, traversal/SUID defense, interrupted rollback, 3x loop, pre-existing link/exact backup/missing-backup preflight, v1.3.3 trust-boundary parity, and v1.4.0 Section 10 codex-manager.sh (all 6 actions + history-preserving rescue) passed!"

@@ -26,6 +26,17 @@
          launcher backup, Completed=false incremental journal).
      10. Repeated Install + Rollback loop (3x consecutive cycles) verifying zero data loss,
          zero stray backups, and zero broken Junctions/ACLs.
+     11. Pre-existing Junction preservation, exact directory backup restore, and fail-closed
+         missing-backup preflight checks.
+     12. Strict [projects.*] trust-boundary preservation, opt-in -ShareAuthToLane2 guardrails,
+         -ConfigureCliGateway, relative -RepoPath, Git Bash POSIX shims, and workspace file CRUD.
+     13. Interactive/scriptable Sandbox 2 Control Center (scripts/codex-manager.ps1) end-to-end:
+         ApiGpt (stdin-only, third-party cleanup + backup, ACL, bidirectional sync), ApiOther
+         (direct Lane2\config.toml edit, TOML validation, plaintext warning, ACL re-lock), Login
+         (standard & --device-auth), CheckApiKey (offline + live loopback HttpListener 200/401,
+         zero secret echo), CheckAccounts (100% read-only on both lanes, zero token echo),
+         SyncHistory (bidirectional), and RemoveSandbox2 (fail-closed pre-uninstall chat & local
+         rollout rescue into GPT 1 before safe Junction detach and Lane 2 removal).
 
 .NOTES
     Author    : Lê Hoàng Ngọc Tươi
@@ -40,6 +51,7 @@ $KitRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $SetupScript   = Join-Path $KitRoot 'scripts\setup-dual-lane.ps1'
 $DoctorScript  = Join-Path $KitRoot 'scripts\doctor.ps1'
 $RestoreScript = Join-Path $KitRoot 'scripts\restore-original.ps1'
+$ManagerScript = Join-Path $KitRoot 'scripts\codex-manager.ps1'
 $RulesFile     = Join-Path $KitRoot 'templates\default.rules'
 
 # Use the currently running PowerShell host (powershell.exe on 5.1, pwsh.exe on 7+) so CI can
@@ -275,7 +287,8 @@ $psFiles = @(
     @(Get-ChildItem -LiteralPath (Join-Path $KitRoot 'scripts') -Filter '*.ps1' -File) +
     @(Get-ChildItem -LiteralPath (Join-Path $KitRoot 'tests') -Filter '*.ps1' -File)
 ) | Sort-Object FullName
-Assert-True ($psFiles.Count -ge 4) "Expected at least 4 .ps1 scripts, found $($psFiles.Count)"
+Assert-True ($psFiles.Count -ge 5) "Expected at least 5 .ps1 scripts (including codex-manager.ps1), found $($psFiles.Count)"
+Assert-True (Test-Path -LiteralPath $ManagerScript -PathType Leaf) "Expected scripts\codex-manager.ps1 to exist"
 
 foreach ($pf in $psFiles) {
     $tokens = $null
@@ -287,8 +300,10 @@ foreach ($pf in $psFiles) {
         throw "PowerShell AST parse error(s) in $($pf.FullName): $errSummary"
     }
 
-    # Verify CRLF line endings per .gitattributes (*.ps1 text eol=crlf).
+    # Verify UTF-8 NO-BOM and strict CRLF line endings per .gitattributes (*.ps1 text eol=crlf).
     $rawBytes = [System.IO.File]::ReadAllBytes($pf.FullName)
+    $hasBom = ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF)
+    Assert-True (-not $hasBom) "$($pf.Name) contains a UTF-8 BOM; all scripts must be UTF-8 without BOM"
     $loneLf = 0
     for ($i = 0; $i -lt $rawBytes.Length; $i++) {
         if ($rawBytes[$i] -eq 0x0A -and ($i -eq 0 -or $rawBytes[$i - 1] -ne 0x0D)) {
@@ -302,7 +317,7 @@ foreach ($pf in $psFiles) {
         $helpText = Get-Content -LiteralPath $pf.FullName -Raw -Encoding UTF8
         Assert-True ($helpText -match '(?m)^\.SYNOPSIS\s*$') "$($pf.Name) is missing comment-based .SYNOPSIS help"
     }
-    Write-Host "    [OK] $($pf.Name) (AST errors=0, lone-LF=0)" -ForegroundColor Green
+    Write-Host "    [OK] $($pf.Name) (AST errors=0, BOM=0, lone-LF=0)" -ForegroundColor Green
 }
 
 # ============================================================================
@@ -1097,9 +1112,11 @@ theme = "light"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $l2 'AGENTS.md'))) 'Newly created Lane 2 AGENTS.md should have been removed by rollback'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex.cmd'))) 'Newly created wrapper codex.cmd should have been removed by rollback'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-official.cmd'))) 'Newly created wrapper codex-official.cmd should have been removed by rollback'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-manage.cmd'))) 'Newly created wrapper codex-manage.cmd should have been removed by rollback'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex'))) 'Newly created extensionless POSIX shim codex should have been removed by rollback'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-official'))) 'Newly created extensionless POSIX shim codex-official should have been removed by rollback'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-t3'))) 'Newly created extensionless POSIX shim codex-t3 should have been removed by rollback'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bin 'codex-manage'))) 'Newly created extensionless POSIX shim codex-manage should have been removed by rollback'
     Assert-True (Test-Path -LiteralPath $preExistingLauncher -PathType Leaf) 'Pre-existing user launcher codex-t3.cmd MUST be restored by rollback (not deleted!)'
     $restoredLauncherHash = (Get-FileHash -LiteralPath $preExistingLauncher -Algorithm SHA256).Hash
     Assert-True ($restoredLauncherHash -eq $origLauncherHash) "Rollback SHA-256 mismatch on pre-existing codex-t3.cmd! Expected $origLauncherHash, got $restoredLauncherHash"
@@ -1299,9 +1316,11 @@ theme = "light"
             Assert-True ((Get-FileHash -LiteralPath $loopSess -Algorithm SHA256).Hash -eq $loopSessHash) "Cycle $cycle CRITICAL: Lane 1 session file drift!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex.cmd'))) "Cycle $cycle left behind codex.cmd!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex-official.cmd'))) "Cycle $cycle left behind codex-official.cmd!"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex-manage.cmd'))) "Cycle $cycle left behind codex-manage.cmd!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex'))) "Cycle $cycle left behind extensionless codex shim!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex-official'))) "Cycle $cycle left behind extensionless codex-official shim!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex-t3'))) "Cycle $cycle left behind extensionless codex-t3 shim!"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopBin 'codex-manage'))) "Cycle $cycle left behind extensionless codex-manage shim!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopL2 'AGENTS.md'))) "Cycle $cycle left behind Lane 2 AGENTS.md!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopL2 'rules\default.rules'))) "Cycle $cycle left behind Lane 2 default.rules!"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $loopL1 'config.backup.toml'))) "Cycle $cycle left behind stray config.backup.toml!"
@@ -1696,10 +1715,10 @@ if sys.version_info >= (3, 11):
         Assert-True ([bool](Get-Acl -LiteralPath (Join-Path $p12L2 'config.backup.toml')).AreAccessRulesProtected) 'Lane 2 config.backup.toml DACL not locked!'
 
         # Verify both .cmd wrappers and extensionless Git Bash POSIX shims exist in $p12Bin with strict LF line endings on the POSIX shims!
-        foreach ($cmdName in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd')) {
+        foreach ($cmdName in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd', 'codex-manage.cmd')) {
             Assert-True (Test-Path -LiteralPath (Join-Path $p12Bin $cmdName) -PathType Leaf) "Expected .cmd wrapper $cmdName in $p12Bin"
         }
-        foreach ($posixName in @('codex', 'codex-official', 'codex-t3')) {
+        foreach ($posixName in @('codex', 'codex-official', 'codex-t3', 'codex-manage')) {
             $posixFile = Join-Path $p12Bin $posixName
             Assert-True (Test-Path -LiteralPath $posixFile -PathType Leaf) "Expected extensionless Git Bash POSIX shim '$posixName' in $p12Bin"
             $posixBytes = [System.IO.File]::ReadAllBytes($posixFile)
@@ -1781,7 +1800,7 @@ if sys.version_info >= (3, 11):
         Assert-True ((Get-FileHash -LiteralPath $p12Cfg2 -Algorithm SHA256).Hash -eq $p12Cfg2OrigHash) 'Lane 2 CLI config.toml SHA-256 mismatch after rollback!'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12L2 'config.backup.toml'))) 'Rollback left stray Lane 2 config.backup.toml!'
         Assert-True (-not (Test-Path -LiteralPath $p12Auth2)) 'Rollback left newly shared Lane 2 auth.json!'
-        foreach ($removedShim in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd', 'codex', 'codex-official')) {
+        foreach ($removedShim in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd', 'codex-manage.cmd', 'codex', 'codex-official', 'codex-manage')) {
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $p12Bin $removedShim))) "Rollback left behind newly created launcher '$removedShim'!"
         }
         Assert-True (Test-Path -LiteralPath $p12PrePosixT3 -PathType Leaf) 'Pre-existing extensionless POSIX shim codex-t3 MUST be restored on rollback!'
@@ -1816,7 +1835,582 @@ if sys.version_info >= (3, 11):
         try { git -C $p12Repo worktree remove -f "$p12Repo-lane2" 2>$null } catch {}
     }
 
-    Write-Host "`n[PASS] All 12 Windows test stages passed cleanly (AST, Python, default.rules, DryRun/WhatIf, TOML/env_key/ACL/8.3/fail-closed worktree, doctor, traversal defense, SHA-256 rollback, interrupted recovery, 3x loop, pre-existing link/exact backup/missing-backup preflight, and Strict Project Trust Boundaries + -ShareAuthToLane2 Guardrails + CLI Login/API-Key + Relative RepoPath + Git Bash Shims + Workspace File CRUD)!" -ForegroundColor Green
+    # ========================================================================
+    # TEST 13: Sandbox 2 Interactive/Scriptable Control Center (scripts/codex-manager.ps1)
+    # WHAT: Comprehensively exercises ALL 6 manager actions + wrapper integration:
+    #   13a) ApiGpt via stdin (zero plaintext CLI args, zero secret echo, cleans third-party
+    #        model_provider with ACL-locked backup while preserving [projects.*] trust_level,
+    #        [features], sandbox_mode & [mcp_servers.*], locks auth.json & config.toml ACLs,
+    #        and runs bidirectional chat history sync).
+    #   13b) ApiOther pointing directly to Lane2\config.toml (backup created, custom TOML
+    #        validated, plaintext canary warning triggered with zero echo, invalid TOML rejected,
+    #        and NTFS DACL automatically re-locked after editor exit).
+    #   13c) Login (official `codex login` with -Force third-party cleanup AND `--device-auth`,
+    #        verifying CODEX_HOME=Lane2Home, ACL lock, and bidirectional sync).
+    #   13d) CheckApiKey offline + live local loopback HttpListener mock returning HTTP 200
+    #        ({"data":[{"id":"gpt-5"}]}) and HTTP 401, asserting zero plaintext canary leakage!
+    #   13e) CheckAccounts strictly 100% read-only on BOTH Lane 1 and Lane 2 (verifying Lane 1 &
+    #        Lane 2 tree SHA-256 unchanged, zero token/key leakage, and codex-manage.cmd launcher).
+    #   13f) SyncHistory bidirectional check + RemoveSandbox2 verifying DryRun zero-mutation,
+    #        fail-closed confirmation gate, AND live uninstall rescuing a Sandbox-2-only chat
+    #        (state_5.sqlite + goals_1.sqlite + session_index.jsonl + detached local rollout file)
+    #        into GPT 1 BEFORE removing Sandbox 2 & CLI wrappers, leaving GPT 1 100% intact!
+    # ========================================================================
+    Write-Host "`n=== 13. Sandbox 2 Control Center (codex-manager.ps1): ApiGpt, ApiOther, Login, CheckApiKey, CheckAccounts, SyncHistory & RemoveSandbox2 ===" -ForegroundColor Cyan
+    $p13L1   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p13 lane 1 desktop')
+    $p13L2   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p13 lane 2 cli')
+    $p13Bin  = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p13 local bin')
+    $p13Repo = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p13 repo')
+    New-Item -ItemType Directory -Path (Join-Path $p13L1 'sessions'), $p13L2, $p13Bin, $p13Repo -Force | Out-Null
+
+    $invokePsWithStdin = {
+        param([string]$ScriptPath, [string[]]$Arguments, [string]$StdinLine)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $CurrentPsExe
+        $quotedArgs = New-Object 'System.Collections.Generic.List[string]'
+        $quotedArgs.Add('-NoProfile')
+        $quotedArgs.Add('-ExecutionPolicy')
+        $quotedArgs.Add('Bypass')
+        $quotedArgs.Add('-File')
+        $quotedArgs.Add(('"' + $ScriptPath + '"'))
+        foreach ($a in $Arguments) {
+            if ($a -match '[\s&()]') {
+                $quotedArgs.Add(('"' + $a + '"'))
+            } else {
+                $quotedArgs.Add($a)
+            }
+        }
+        $psi.Arguments = ($quotedArgs -join ' ')
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $psi
+        try {
+            [void]$p.Start()
+            $outTask = $p.StandardOutput.ReadToEndAsync()
+            $errTask = $p.StandardError.ReadToEndAsync()
+            $p.StandardInput.WriteLine($StdinLine)
+            $p.StandardInput.Flush()
+            $p.StandardInput.Close()
+            $p.WaitForExit()
+            return [PSCustomObject]@{
+                ExitCode = $p.ExitCode
+                Output   = ($outTask.GetAwaiter().GetResult() + "`n" + $errTask.GetAwaiter().GetResult())
+            }
+        } finally {
+            $p.Dispose()
+        }
+    }
+
+    try {
+        # Build mock codex CLI handling --version, features, execpolicy, login (--with-api-key / --device-auth / web), and login status.
+        $p13MockPs1 = Join-Path $tmpRoot 'p13-mock-codex.ps1'
+        $p13MockCmd = Join-Path $tmpRoot 'p13-mock-codex.cmd'
+        $p13MockWorker = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$cmd = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
+$sub = if ($args.Count -gt 1) { [string]$args[1] } else { '' }
+$codexHome = $env:CODEX_HOME
+
+if ($cmd -eq '--version') { Write-Output 'codex-cli 0.171.0-test'; exit 0 }
+if ($cmd -eq 'features')  { Write-Output 'memories stable true'; exit 0 }
+if ($cmd -eq 'execpolicy'){ Write-Output '{"decision":"forbidden"}'; exit 0 }
+
+if ($cmd -eq 'login') {
+    if ([string]::IsNullOrWhiteSpace($codexHome)) {
+        Write-Error 'CODEX_HOME not set'
+        exit 2
+    }
+    if ($sub -eq '--with-api-key') {
+        $inKey = [Console]::In.ReadLine()
+        if ([string]::IsNullOrWhiteSpace($inKey)) { Write-Error 'Missing stdin API key'; exit 3 }
+        $inKey = $inKey.Trim()
+        if (-not (Test-Path -LiteralPath $codexHome)) { [void][System.IO.Directory]::CreateDirectory($codexHome) }
+        $authObj = @{ auth_mode = 'apikey'; OPENAI_API_KEY = $inKey } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText((Join-Path $codexHome 'auth.json'), $authObj, (New-Object System.Text.UTF8Encoding($false)))
+        # Intentionally echo the received key to prove codex-manager.ps1 redacts stdout/stderr!
+        Write-Output ("MOCK_API_LOGIN_OK CODEX_HOME=$codexHome Bearer $inKey $inKey")
+        exit 0
+    } elseif ($sub -eq '--device-auth') {
+        if (-not (Test-Path -LiteralPath $codexHome)) { [void][System.IO.Directory]::CreateDirectory($codexHome) }
+        $authObj = @{
+            auth_mode = 'chatgpt'
+            tokens = @{
+                access_token  = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZXYifQ.CANARY_P13_DEV_SIG'
+                refresh_token = 'rt_CANARY_P13_DEV_9999'
+                id_token      = 'eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6ImRldiJ9.CANARY_P13_ID_SIG'
+                account_id    = 'acct_p13_device_9876'
+            }
+            email        = 'deviceuser@example.invalid'
+            plan_type    = 'pro'
+            last_refresh = '2026-11-23T08:00:00Z'
+        } | ConvertTo-Json -Depth 4 -Compress
+        [System.IO.File]::WriteAllText((Join-Path $codexHome 'auth.json'), $authObj, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Output "MOCK_DEVICE_AUTH_OK CODEX_HOME=$codexHome"
+        exit 0
+    } elseif ($sub -eq 'status') {
+        $authPath = Join-Path $codexHome 'auth.json'
+        $mode = 'not-logged-in'
+        if (Test-Path -LiteralPath $authPath -PathType Leaf) {
+            try { $mode = (Get-Content -LiteralPath $authPath -Raw -Encoding UTF8 | ConvertFrom-Json).auth_mode } catch {}
+        }
+        # Intentionally include an adversarial token pattern to prove CheckAccounts redacts it!
+        Write-Output "Logged in using $mode (CODEX_HOME=$codexHome) Bearer sk-CANARY-P13-STATUS-LEAK-44556677"
+        exit 0
+    } else {
+        if (-not (Test-Path -LiteralPath $codexHome)) { [void][System.IO.Directory]::CreateDirectory($codexHome) }
+        $authObj = @{
+            auth_mode = 'chatgpt'
+            tokens = @{
+                access_token  = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ3ZWIifQ.CANARY_P13_WEB_SIG'
+                refresh_token = 'rt_CANARY_P13_WEB_8888'
+                account_id    = 'acct_p13_web_5432'
+            }
+            email     = 'webuser@example.invalid'
+            plan_type = 'plus'
+        } | ConvertTo-Json -Depth 4 -Compress
+        [System.IO.File]::WriteAllText((Join-Path $codexHome 'auth.json'), $authObj, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Output "MOCK_WEB_LOGIN_OK CODEX_HOME=$codexHome"
+        exit 0
+    }
+}
+exit 0
+'@
+        [System.IO.File]::WriteAllText($p13MockPs1, ($p13MockWorker -replace "\r?\n", "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+        $p13MockBat = "@echo off`r`n`"$CurrentPsExe`" -NoProfile -ExecutionPolicy Bypass -File `"$p13MockPs1`" %*`r`nexit /b %ERRORLEVEL%`r`n"
+        [System.IO.File]::WriteAllText($p13MockCmd, $p13MockBat, [System.Text.Encoding]::ASCII)
+
+        # Install full Dual-Lane Kit into p13 temp dirs (with third-party CustomGW on Lane 2 so ApiGpt must clean it).
+        $p13SeedCfg2 = @"
+[projects."c:\\p13\\trusted"]
+trust_level = "trusted"
+
+[projects."c:\\p13\\untrusted"]
+trust_level = "untrusted"
+
+[projects."c:\\p13\\missing"]
+custom_note = "preserve-missing-trust"
+
+[mcp_servers.p13_mcp]
+command = "node"
+args = ["p13-mcp.js"]
+"@
+        [System.IO.File]::WriteAllText((Join-Path $p13L2 'config.toml'), $p13SeedCfg2, (New-Object System.Text.UTF8Encoding($false)))
+
+        $resP13Setup = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
+            '-RepoPath', $p13Repo, '-CodexPath', $p13MockCmd,
+            '-Lane1Home', $p13L1, '-Lane2Home', $p13L2, '-LocalBin', $p13Bin,
+            '-ConfigureCliGateway', '-GatewayProviderName', 'CustomGW',
+            '-GatewayBaseUrl', 'https://old-gw.example.invalid/v1', '-CliApiKeyEnv', 'CODEX_P13_OLD_KEY',
+            '-SkipPathUpdate'
+        )
+        Assert-True ($resP13Setup.ExitCode -eq 0) "Test 13 setup failed (exit=$($resP13Setup.ExitCode)):`n$($resP13Setup.Output)"
+        Assert-True (Test-Path -LiteralPath (Join-Path $p13Bin 'codex-manage.cmd') -PathType Leaf) 'setup-dual-lane.ps1 did not install codex-manage.cmd!'
+        Assert-True (Test-Path -LiteralPath (Join-Path $p13Bin 'codex-manage') -PathType Leaf) 'setup-dual-lane.ps1 did not install extensionless codex-manage shim!'
+
+        # Seed GPT 1 (Lane 1) & Sandbox 2 (Lane 2) chat history DBs, session_index.jsonl, sessions file, and Lane 1 auth.json.
+        $p13L1SessionFile = Join-Path $p13L1 'sessions\chat-l1.jsonl'
+        [System.IO.File]::WriteAllText($p13L1SessionFile, '{"id":"thread-l1","text":"gpt1 original history"}', (New-Object System.Text.UTF8Encoding($false)))
+        $p13L1SessionOrigHash = (Get-FileHash -LiteralPath $p13L1SessionFile -Algorithm SHA256).Hash
+
+        $p13L1AuthJson = '{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-CANARY-P13-L1-KEY-22223333","tokens":{"access_token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJsMSJ9.CANARY_P13_L1_TOK","refresh_token":"rt_CANARY_P13_L1_1111","account_id":"acct_p13_lane1_1111"},"email":"lane1@example.invalid","plan_type":"pro"}'
+        [System.IO.File]::WriteAllText((Join-Path $p13L1 'auth.json'), $p13L1AuthJson, (New-Object System.Text.UTF8Encoding($false)))
+
+        $p13SeedDbPy = @'
+import json, pathlib, sqlite3, sys
+
+def init_lane(lane_dir: pathlib.Path, tid: str, title: str, gid: str, updated_ms: int):
+    st = sqlite3.connect(str(lane_dir / "state_5.sqlite"))
+    st.execute("""CREATE TABLE IF NOT EXISTS threads (
+        id TEXT PRIMARY KEY, name TEXT, is_pinned INTEGER,
+        thread_section_id TEXT, section_position INTEGER, section_entered_at_ms INTEGER,
+        project_id TEXT, model_provider TEXT, approval_mode TEXT, cwd TEXT,
+        created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER
+    )""")
+    st.execute(
+        "INSERT OR REPLACE INTO threads (id, name, is_pinned, model_provider, created_at_ms, updated_at_ms) VALUES (?, ?, 1, 'openai', ?, ?)",
+        (tid, title, updated_ms, updated_ms),
+    )
+    st.commit()
+    st.close()
+
+    gl = sqlite3.connect(str(lane_dir / "goals_1.sqlite"))
+    gl.execute("""CREATE TABLE IF NOT EXISTS thread_goals (
+        thread_id TEXT PRIMARY KEY, goal_text TEXT, updated_at_ms INTEGER
+    )""")
+    gl.execute("INSERT OR REPLACE INTO thread_goals (thread_id, goal_text, updated_at_ms) VALUES (?, ?, ?)", (gid, f"goal-{gid}", updated_ms))
+    gl.commit()
+    gl.close()
+
+    idx = lane_dir / "session_index.jsonl"
+    existing = idx.read_text(encoding="utf-8") if idx.exists() else ""
+    line = json.dumps({"id": tid, "thread_name": title, "updated_at": updated_ms}) + "\n"
+    idx.write_text(existing + line, encoding="utf-8")
+
+init_lane(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]))
+'@
+        $p13SeedDbPy | & $py -B - $p13L1 'thread-l1' 'GPT 1 Original Chat' 'goal-l1' '1700000001000'
+        Assert-True ($LASTEXITCODE -eq 0) 'Failed seeding p13 Lane 1 SQLite DBs'
+        $p13SeedDbPy | & $py -B - $p13L2 'thread-l2-initial' 'Sandbox 2 Initial Chat' 'goal-l2-initial' '1700000002000'
+        Assert-True ($LASTEXITCODE -eq 0) 'Failed seeding p13 Lane 2 SQLite DBs'
+
+        $p13QueryDbPy = @'
+import json, pathlib, sqlite3, sys
+lane = pathlib.Path(sys.argv[1])
+st = sqlite3.connect(str(lane / "state_5.sqlite"))
+threads = {r[0]: r[1] for r in st.execute("SELECT id, is_pinned FROM threads").fetchall()}
+st.close()
+gl = sqlite3.connect(str(lane / "goals_1.sqlite"))
+goals = sorted(r[0] for r in gl.execute("SELECT thread_id FROM thread_goals").fetchall())
+gl.close()
+idx_ids = sorted(json.loads(ln)["id"] for ln in (lane / "session_index.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip())
+print(json.dumps({"threads": threads, "goals": goals, "index": idx_ids}))
+'@
+
+        # 13a) ApiGpt via stdin mock `codex login --with-api-key`
+        $gptKeyCanary = 'sk-CANARY-P13-GPT-STDIN-1122334455'
+        $res13aMissing = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'ApiGpt', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-CodexPath', $p13MockCmd, '-NonInteractive'
+        )
+        Assert-True ($res13aMissing.ExitCode -ne 0) 'ApiGpt -NonInteractive without key input MUST fail closed!'
+
+        $res13a = & $invokePsWithStdin $ManagerScript @(
+            '-Action', 'ApiGpt', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-CodexPath', $p13MockCmd, '-ApiKeyFromStdin', '-NonInteractive'
+        ) $gptKeyCanary
+        Assert-True ($res13a.ExitCode -eq 0) "Test 13a ApiGpt failed (exit=$($res13a.ExitCode)):`n$($res13a.Output)"
+        Assert-True (-not $res13a.Output.Contains($gptKeyCanary)) 'CRITICAL: ApiGpt leaked plaintext API key canary in stdout/stderr!'
+        Assert-True ($res13a.Output -match 'sk-\.\.\.4455 \(len=34\)') "ApiGpt did not print masked key summary:`n$($res13a.Output)"
+
+        $p13Cfg2Path  = Join-Path $p13L2 'config.toml'
+        $p13Auth2Path = Join-Path $p13L2 'auth.json'
+        $p13Cfg2After13a = Get-Content -LiteralPath $p13Cfg2Path -Raw -Encoding UTF8
+        Assert-True ($p13Cfg2After13a -notmatch '(?m)^\s*model_provider\s*=') 'ApiGpt did not clean third-party model_provider from Lane2\config.toml!'
+        Assert-True ($p13Cfg2After13a -notmatch '\[model_providers\.') 'ApiGpt did not remove conflicting [model_providers.*] section from Lane2\config.toml!'
+        Assert-True ($p13Cfg2After13a -match 'sandbox_mode = "workspace-write"') 'ApiGpt lost sandbox_mode!'
+        Assert-True ($p13Cfg2After13a -match '\[features\]') 'ApiGpt lost [features] section!'
+        Assert-True ($p13Cfg2After13a -match '\[mcp_servers\.p13_mcp\]') 'ApiGpt lost [mcp_servers.p13_mcp]!'
+        $p13ProjMap = & $parseProjectSections $p13Cfg2After13a
+        Assert-True ($p13ProjMap.ContainsKey('c:\p13\trusted') -and $p13ProjMap['c:\p13\trusted'].Body -match 'trust_level\s*=\s*"trusted"') 'ApiGpt lost trusted project!'
+        Assert-True ($p13ProjMap.ContainsKey('c:\p13\untrusted') -and $p13ProjMap['c:\p13\untrusted'].Body -match 'trust_level\s*=\s*"untrusted"') 'SECURITY: ApiGpt altered untrusted project!'
+        Assert-True ($p13ProjMap.ContainsKey('c:\p13\missing') -and $p13ProjMap['c:\p13\missing'].Body -notmatch 'trust_level\s*=') 'SECURITY: ApiGpt promoted missing-trust project!'
+        $tomlCheckPy | & $py -B - $p13Cfg2Path
+        Assert-True ($LASTEXITCODE -eq 0) 'Lane2\config.toml invalid TOML after ApiGpt cleanup!'
+
+        $p13CfgBkps = @(Get-ChildItem -LiteralPath $p13L2 -Filter 'config.toml.backup-*' -File)
+        Assert-True ($p13CfgBkps.Count -ge 1) 'ApiGpt did not create backup of Lane2\config.toml before cleaning model_provider!'
+        Assert-True ([bool](Get-Acl -LiteralPath $p13Cfg2Path).AreAccessRulesProtected) 'ApiGpt did not lock NTFS DACL on Lane2\config.toml!'
+        Assert-True ([bool](Get-Acl -LiteralPath $p13Auth2Path).AreAccessRulesProtected) 'ApiGpt did not lock NTFS DACL on Lane2\auth.json!'
+        $p13Auth2Obj = Get-Content -LiteralPath $p13Auth2Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-True ($p13Auth2Obj.OPENAI_API_KEY -eq $gptKeyCanary) 'ApiGpt did not pipe exact API key via stdin to mock codex!'
+
+        # Verify bidirectional sync converged BOTH Lane 1 and Lane 2 after ApiGpt.
+        $l1State13a = ($p13QueryDbPy | & $py -B - $p13L1) | ConvertFrom-Json
+        $l2State13a = ($p13QueryDbPy | & $py -B - $p13L2) | ConvertFrom-Json
+        Assert-True (($null -ne $l1State13a.threads.PSObject.Properties['thread-l2-initial']) -and ($null -ne $l2State13a.threads.PSObject.Properties['thread-l1'])) 'ApiGpt bidirectional sync did not converge threads between GPT 1 and Sandbox 2!'
+        Assert-True (($l1State13a.index -contains 'thread-l2-initial') -and ($l2State13a.index -contains 'thread-l1')) 'ApiGpt bidirectional sync did not converge session_index.jsonl!'
+
+        # 13b) ApiOther pointing directly to Lane2\config.toml
+        $p13EdOk    = Join-Path $tmpRoot 'p13-editor-ok.ps1'
+        $p13EdPlain = Join-Path $tmpRoot 'p13-editor-plain.ps1'
+        $p13EdBad   = Join-Path $tmpRoot 'p13-editor-bad.ps1'
+        $p13OtherPlainCanary = 'sk-CANARY-P13-OTHER-PLAINTEXT-77889900'
+
+        $edOkCode = @"
+param([string]`$TargetPath)
+if ([System.IO.Path]::GetFileName(`$TargetPath) -ne 'config.toml') { throw "Unexpected target: `$TargetPath" }
+`$txt = @'
+model_provider = "other_gw"
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[model_providers.other_gw]
+name = "Other Gateway"
+base_url = "https://other-gw.example.invalid/v1"
+wire_api = "responses"
+env_key = "CODEX_P13_OTHER_KEY"
+'@
+[System.IO.File]::WriteAllText(`$TargetPath, (`$txt -replace "\r?\n", "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding(`$false)))
+`$null = & icacls.exe `$TargetPath /inheritance:e 2>&1
+exit 0
+"@
+        [System.IO.File]::WriteAllText($p13EdOk, ($edOkCode -replace "\r?\n", "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+        $edPlainCode = @"
+param([string]`$TargetPath)
+`$cur = [System.IO.File]::ReadAllText(`$TargetPath)
+`$line = 'api_key = "$p13OtherPlainCanary"' + [Environment]::NewLine
+[System.IO.File]::WriteAllText(`$TargetPath, (`$cur + `$line), (New-Object System.Text.UTF8Encoding(`$false)))
+`$null = & icacls.exe `$TargetPath /inheritance:e 2>&1
+exit 0
+"@
+        [System.IO.File]::WriteAllText($p13EdPlain, ($edPlainCode -replace "\r?\n", "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+        $edBadCode = @'
+param([string]$TargetPath)
+[System.IO.File]::WriteAllText($TargetPath, "[broken_header`r`nfoo = ", (New-Object System.Text.UTF8Encoding($false)))
+$null = & icacls.exe $TargetPath /inheritance:e 2>&1
+exit 0
+'@
+        [System.IO.File]::WriteAllText($p13EdBad, ($edBadCode -replace "\r?\n", "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+        $bkpCountBefore13b = @(Get-ChildItem -LiteralPath $p13L2 -Filter 'config.toml.backup-*' -File).Count
+        $res13bOk = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'ApiOther', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-Editor', $p13EdOk, '-NonInteractive'
+        )
+        Assert-True ($res13bOk.ExitCode -eq 0) "Test 13b ApiOther (valid TOML) failed (exit=$($res13bOk.ExitCode)):`n$($res13bOk.Output)"
+        Assert-True ($res13bOk.Output.Contains($p13Cfg2Path)) "ApiOther did not display direct Lane2\config.toml path:`n$($res13bOk.Output)"
+        Assert-True ($res13bOk.Output -match 'Valid TOML syntax') "ApiOther did not report TOML validation success:`n$($res13bOk.Output)"
+        Assert-True (@(Get-ChildItem -LiteralPath $p13L2 -Filter 'config.toml.backup-*' -File).Count -gt $bkpCountBefore13b) 'ApiOther did not create timestamped backup before opening editor!'
+        Assert-True ([bool](Get-Acl -LiteralPath $p13Cfg2Path).AreAccessRulesProtected) 'ApiOther did not re-lock NTFS DACL after editor reset inheritance!'
+
+        $res13bPlain = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'ApiOther', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-Editor', $p13EdPlain, '-NonInteractive'
+        )
+        Assert-True ($res13bPlain.ExitCode -eq 0) "Test 13b ApiOther (plaintext canary) failed:`n$($res13bPlain.Output)"
+        Assert-True ($res13bPlain.Output -match 'SECURITY WARNING.*api_key') "ApiOther did not warn on plaintext api_key canary:`n$($res13bPlain.Output)"
+        Assert-True (-not $res13bPlain.Output.Contains($p13OtherPlainCanary)) 'CRITICAL: ApiOther leaked plaintext api_key canary!'
+        Assert-True ([bool](Get-Acl -LiteralPath $p13Cfg2Path).AreAccessRulesProtected) 'ApiOther did not re-lock NTFS DACL on plaintext pass!'
+
+        $res13bBad = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'ApiOther', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-Editor', $p13EdBad, '-NonInteractive'
+        )
+        Assert-True ($res13bBad.ExitCode -ne 0 -and $res13bBad.Output -match 'Invalid TOML syntax') "ApiOther must report error on invalid TOML:`n$($res13bBad.Output)"
+        Assert-True ([bool](Get-Acl -LiteralPath $p13Cfg2Path).AreAccessRulesProtected) 'ApiOther must STILL re-lock NTFS DACL even when TOML is invalid!'
+
+        # Restore clean custom provider TOML via $p13EdOk for 13c Login -Force cleanup test.
+        $res13bRestore = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'ApiOther', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-Editor', $p13EdOk, '-NonInteractive'
+        )
+        Assert-True ($res13bRestore.ExitCode -eq 0) 'Failed restoring valid TOML for 13c'
+
+        # 13c) Login (official `codex login` with -Force third-party cleanup AND `--device-auth`)
+        $res13cWeb = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'Login', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-CodexPath', $p13MockCmd, '-Force', '-NonInteractive'
+        )
+        Assert-True ($res13cWeb.ExitCode -eq 0) "Test 13c Login (standard) failed (exit=$($res13cWeb.ExitCode)):`n$($res13cWeb.Output)"
+        Assert-True ($res13cWeb.Output -match 'MOCK_WEB_LOGIN_OK') "Login did not invoke codex login:`n$($res13cWeb.Output)"
+        Assert-True ((Get-Content -LiteralPath $p13Cfg2Path -Raw -Encoding UTF8) -notmatch '(?m)^\s*model_provider\s*=') 'Login -Force did not clean third-party model_provider!'
+        Assert-True ([bool](Get-Acl -LiteralPath $p13Auth2Path).AreAccessRulesProtected) 'Login did not lock NTFS DACL on Lane2\auth.json!'
+
+        $res13cDev = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'Login', '-DeviceAuth', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-CodexPath', $p13MockCmd, '-NonInteractive'
+        )
+        Assert-True ($res13cDev.ExitCode -eq 0) "Test 13c Login (--device-auth) failed (exit=$($res13cDev.ExitCode)):`n$($res13cDev.Output)"
+        Assert-True ($res13cDev.Output -match 'MOCK_DEVICE_AUTH_OK') "Login -DeviceAuth did not invoke codex login --device-auth:`n$($res13cDev.Output)"
+        Assert-True ([bool](Get-Acl -LiteralPath $p13Auth2Path).AreAccessRulesProtected) 'Login -DeviceAuth did not lock NTFS DACL on Lane2\auth.json!'
+
+        # 13d) CheckApiKey offline + live local loopback HttpListener mock (HTTP 200 & HTTP 401, zero secret leakage)
+        $tcpProbe = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+        $tcpProbe.Start()
+        $mockPort = ([System.Net.IPEndPoint]$tcpProbe.LocalEndpoint).Port
+        $tcpProbe.Stop()
+
+        $validProbeCanary   = 'sk-CANARY-P13-LIVE-VALID-11223344'
+        $invalidProbeCanary = 'sk-CANARY-P13-LIVE-BAD-99887766'
+        $p13ProbeCfg = @"
+model_provider = "localmock"
+sandbox_mode = "workspace-write"
+
+[model_providers.localmock]
+name = "LocalMock"
+base_url = "http://127.0.0.1:$mockPort/v1"
+wire_api = "responses"
+env_key = "CODEX_P13_PROBE_KEY"
+"@
+        [System.IO.File]::WriteAllText($p13Cfg2Path, $p13ProbeCfg, (New-Object System.Text.UTF8Encoding($false)))
+
+        $httpReadyEvt = New-Object System.Threading.ManualResetEventSlim($false)
+        $httpListener = New-Object System.Net.HttpListener
+        $httpListener.Prefixes.Add("http://127.0.0.1:$mockPort/")
+        $httpPs = [PowerShell]::Create()
+        $null = $httpPs.AddScript({
+            param($Listener, $ReadyEvent, $ValidKey)
+            try {
+                $Listener.Start()
+                $ReadyEvent.Set()
+                while ($Listener.IsListening) {
+                    try {
+                        $ctx = $Listener.GetContext()
+                    } catch {
+                        break
+                    }
+                    try {
+                        $authHdr = $ctx.Request.Headers['Authorization']
+                        if ($authHdr -ceq ("Bearer " + $ValidKey)) {
+                            $ctx.Response.StatusCode = 200
+                            $payload = [System.Text.Encoding]::UTF8.GetBytes('{"data":[{"id":"gpt-5"}]}')
+                        } else {
+                            $ctx.Response.StatusCode = 401
+                            $payload = [System.Text.Encoding]::UTF8.GetBytes('{"error":"invalid_api_key"}')
+                        }
+                        $ctx.Response.ContentType = 'application/json'
+                        $ctx.Response.ContentLength64 = $payload.Length
+                        $ctx.Response.OutputStream.Write($payload, 0, $payload.Length)
+                    } finally {
+                        try { $ctx.Response.Close() } catch {}
+                    }
+                }
+            } finally {
+                $ReadyEvent.Set()
+            }
+        }).AddArgument($httpListener).AddArgument($httpReadyEvt).AddArgument($validProbeCanary)
+
+        $httpAsync = $httpPs.BeginInvoke()
+        $prevProbeEnv = $env:CODEX_P13_PROBE_KEY
+        try {
+            Assert-True ($httpReadyEvt.Wait(5000)) 'Local loopback HttpListener mock did not start in time'
+
+            $env:CODEX_P13_PROBE_KEY = $validProbeCanary
+            $res13dOff = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'CheckApiKey', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+                '-LocalBin', $p13Bin, '-NonInteractive'
+            )
+            Assert-True ($res13dOff.ExitCode -eq 0) "CheckApiKey offline failed (exit=$($res13dOff.ExitCode)):`n$($res13dOff.Output)"
+            Assert-True ($res13dOff.Output -match 'sk-\.\.\.3344 \(len=33\)') "CheckApiKey offline did not show masked key:`n$($res13dOff.Output)"
+            Assert-True (-not $res13dOff.Output.Contains($validProbeCanary)) 'CRITICAL: CheckApiKey offline leaked plaintext API key!'
+
+            $res13d200 = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'CheckApiKey', '-OnlineCheck', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+                '-LocalBin', $p13Bin, '-NonInteractive'
+            )
+            Assert-True ($res13d200.ExitCode -eq 0) "CheckApiKey online (HTTP 200) failed (exit=$($res13d200.ExitCode)):`n$($res13d200.Output)"
+            Assert-True ($res13d200.Output -match 'VALID \(HTTP 200, 1 models\)') "CheckApiKey online (200) did not report VALID (HTTP 200, 1 models):`n$($res13d200.Output)"
+            Assert-True (-not $res13d200.Output.Contains($validProbeCanary)) 'CRITICAL: CheckApiKey online (200) leaked plaintext API key!'
+
+            $env:CODEX_P13_PROBE_KEY = $invalidProbeCanary
+            $res13d401 = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'CheckApiKey', '-OnlineCheck', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+                '-LocalBin', $p13Bin, '-NonInteractive'
+            )
+            Assert-True ($res13d401.ExitCode -eq 1) "CheckApiKey online (HTTP 401) must exit 1 (got $($res13d401.ExitCode)):`n$($res13d401.Output)"
+            Assert-True ($res13d401.Output -match 'INVALID/EXPIRED \(HTTP 401\)') "CheckApiKey online (401) did not report INVALID/EXPIRED (HTTP 401):`n$($res13d401.Output)"
+            Assert-True (-not $res13d401.Output.Contains($invalidProbeCanary)) 'CRITICAL: CheckApiKey online (401) leaked plaintext API key!'
+        } finally {
+            if ($null -eq $prevProbeEnv) { Remove-Item Env:CODEX_P13_PROBE_KEY -ErrorAction SilentlyContinue } else { $env:CODEX_P13_PROBE_KEY = $prevProbeEnv }
+            try { $httpListener.Stop() } catch {}
+            try { $httpListener.Close() } catch {}
+            try { $null = $httpPs.EndInvoke($httpAsync) } catch {}
+            $httpPs.Dispose()
+            $httpReadyEvt.Dispose()
+        }
+
+        # 13e) CheckAccounts strictly 100% read-only on BOTH Lane 1 & Lane 2 + via codex-manage.cmd wrapper!
+        $snapL1Before13e = Get-TreeSnapshot -RootDir $p13L1
+        $snapL2Before13e = Get-TreeSnapshot -RootDir $p13L2
+        $res13e = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'CheckAccounts', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-CodexPath', $p13MockCmd, '-NonInteractive'
+        )
+        Assert-True ($res13e.ExitCode -eq 0) "Test 13e CheckAccounts failed (exit=$($res13e.ExitCode)):`n$($res13e.Output)"
+        Assert-SnapshotsEqual -Before $snapL1Before13e -After (Get-TreeSnapshot -RootDir $p13L1) -Context 'CheckAccounts Lane 1 read-only guarantee'
+        Assert-SnapshotsEqual -Before $snapL2Before13e -After (Get-TreeSnapshot -RootDir $p13L2) -Context 'CheckAccounts Lane 2 read-only guarantee'
+        Assert-True ($res13e.Output -match 'GPT 1 \(Codex Desktop\)' -and $res13e.Output -match 'Sandbox 2 \(Codex CLI\)') "CheckAccounts missing dual-lane headers:`n$($res13e.Output)"
+        Assert-True ($res13e.Output -match '6/6 NTFS Junctions healthy') "CheckAccounts did not report 6/6 healthy Junctions:`n$($res13e.Output)"
+        foreach ($secretCanary in @(
+            'CANARY_P13_L1_TOK', 'rt_CANARY_P13_L1_1111', 'sk-CANARY-P13-L1-KEY-22223333',
+            'CANARY_P13_DEV_SIG', 'rt_CANARY_P13_DEV_9999', 'CANARY_P13_ID_SIG',
+            'sk-CANARY-P13-STATUS-LEAK-44556677'
+        )) {
+            Assert-True (-not $res13e.Output.Contains($secretCanary)) "CRITICAL: CheckAccounts leaked secret canary '$secretCanary'!"
+        }
+
+        # Verify installed codex-manage.cmd wrapper invokes codex-manager.ps1 cleanly!
+        $prevEapMgr = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $mgrWrapOut = (& (Join-Path $p13Bin 'codex-manage.cmd') '-Action' 'CheckAccounts' '-NonInteractive' 2>&1) -join "`n"
+            $mgrWrapExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEapMgr
+        }
+        Assert-True ($mgrWrapExit -eq 0 -and $mgrWrapOut -match '6/6 NTFS Junctions healthy') "codex-manage.cmd wrapper invocation failed (exit=$mgrWrapExit):`n$mgrWrapOut"
+
+        # 13f) SyncHistory bidirectional check + RemoveSandbox2 (history-preserving uninstall!)
+        $p13SeedDbPy | & $py -B - $p13L2 'thread-l2-sync' 'Sandbox 2 Synced Chat' 'goal-l2-sync' '1700000003000'
+        Assert-True ($LASTEXITCODE -eq 0) 'Failed seeding thread-l2-sync'
+        $res13fSync = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'SyncHistory', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-NonInteractive'
+        )
+        Assert-True ($res13fSync.ExitCode -eq 0) "Test 13f SyncHistory failed (exit=$($res13fSync.ExitCode)):`n$($res13fSync.Output)"
+        $l1AfterSync = ($p13QueryDbPy | & $py -B - $p13L1) | ConvertFrom-Json
+        Assert-True ($null -ne $l1AfterSync.threads.PSObject.Properties['thread-l2-sync']) 'SyncHistory did not sync thread-l2-sync to GPT 1!'
+
+        # Now add a final chat ONLY in Sandbox 2 + detach archived_sessions Junction into a local dir with a rollout file!
+        $p13SeedDbPy | & $py -B - $p13L2 'thread-l2-final' 'Sandbox 2 Final Rescue Chat' 'goal-l2-final' '1700000004000'
+        Assert-True ($LASTEXITCODE -eq 0) 'Failed seeding thread-l2-final'
+        $p13L2Arch = Join-Path $p13L2 'archived_sessions'
+        [System.IO.Directory]::Delete($p13L2Arch, $false)
+        $p13RescuedSrcDir = Join-Path $p13L2Arch '2026'
+        New-Item -ItemType Directory -Path $p13RescuedSrcDir -Force | Out-Null
+        $p13RescuedPayload = '{"id":"thread-l2-final","msg":"rescued rollout before uninstall"}'
+        [System.IO.File]::WriteAllText((Join-Path $p13RescuedSrcDir 'rescued-rollout.jsonl'), $p13RescuedPayload, (New-Object System.Text.UTF8Encoding($false)))
+
+        # RemoveSandbox2 -DryRun must make ZERO mutations!
+        $snapL1BeforeRmDry = Get-TreeSnapshot -RootDir $p13L1
+        $snapL2BeforeRmDry = Get-TreeSnapshot -RootDir $p13L2
+        $res13fDry = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'RemoveSandbox2', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-SkipPathUpdate', '-DryRun', '-NonInteractive'
+        )
+        Assert-True ($res13fDry.ExitCode -eq 0) "RemoveSandbox2 -DryRun failed (exit=$($res13fDry.ExitCode)):`n$($res13fDry.Output)"
+        Assert-SnapshotsEqual -Before $snapL1BeforeRmDry -After (Get-TreeSnapshot -RootDir $p13L1) -Context 'RemoveSandbox2 -DryRun Lane 1'
+        Assert-SnapshotsEqual -Before $snapL2BeforeRmDry -After (Get-TreeSnapshot -RootDir $p13L2) -Context 'RemoveSandbox2 -DryRun Lane 2'
+
+        # RemoveSandbox2 -NonInteractive WITHOUT -Force must fail closed!
+        $res13fNoForce = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'RemoveSandbox2', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-SkipPathUpdate', '-NonInteractive'
+        )
+        Assert-True ($res13fNoForce.ExitCode -ne 0 -and (Test-Path -LiteralPath $p13L2 -PathType Container)) 'RemoveSandbox2 -NonInteractive without -Force MUST fail closed!'
+
+        # Live RemoveSandbox2 -Force: MUST rescue thread-l2-final + goal-l2-final + rescued-rollout.jsonl into GPT 1 BEFORE removing Sandbox 2!
+        $res13fLive = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+            '-Action', 'RemoveSandbox2', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+            '-LocalBin', $p13Bin, '-SkipPathUpdate', '-Force', '-NonInteractive'
+        )
+        Assert-True ($res13fLive.ExitCode -eq 0) "Test 13f RemoveSandbox2 live failed (exit=$($res13fLive.ExitCode)):`n$($res13fLive.Output)"
+        Assert-True (-not (Test-Path -LiteralPath $p13L2)) 'RemoveSandbox2 did not remove Sandbox 2 directory!'
+        foreach ($rmWrap in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd', 'codex-manage.cmd', 'codex', 'codex-official', 'codex-t3', 'codex-manage')) {
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $p13Bin $rmWrap))) "RemoveSandbox2 left behind wrapper '$rmWrap'!"
+        }
+
+        # Verify GPT 1 retains 100% of BOTH original Lane 1 AND rescued Sandbox 2 chats, goals, index, and local rollout file!
+        Assert-True ((Get-FileHash -LiteralPath $p13L1SessionFile -Algorithm SHA256).Hash -eq $p13L1SessionOrigHash) 'CRITICAL: GPT 1 original session file hash changed during RemoveSandbox2!'
+        $rescuedDst = Join-Path $p13L1 'archived_sessions\2026\rescued-rollout.jsonl'
+        Assert-True (Test-Path -LiteralPath $rescuedDst -PathType Leaf) 'CRITICAL: Local Sandbox 2 rollout file was NOT rescued into GPT 1 before uninstall!'
+        Assert-True ([System.IO.File]::ReadAllText($rescuedDst) -eq $p13RescuedPayload) 'Rescued rollout file content mismatch!'
+
+        $l1Final = ($p13QueryDbPy | & $py -B - $p13L1) | ConvertFrom-Json
+        foreach ($expectedTid in @('thread-l1', 'thread-l2-initial', 'thread-l2-sync', 'thread-l2-final')) {
+            Assert-True ($null -ne $l1Final.threads.PSObject.Properties[$expectedTid]) "CRITICAL: GPT 1 state_5.sqlite missing thread '$expectedTid' after RemoveSandbox2!"
+            Assert-True ([int]$l1Final.threads.$expectedTid -eq 1) "Thread '$expectedTid' lost is_pinned=1 in GPT 1!"
+            Assert-True ($l1Final.index -contains $expectedTid) "CRITICAL: GPT 1 session_index.jsonl missing '$expectedTid' after RemoveSandbox2!"
+        }
+        foreach ($expectedGid in @('goal-l1', 'goal-l2-initial', 'goal-l2-sync', 'goal-l2-final')) {
+            Assert-True ($l1Final.goals -contains $expectedGid) "CRITICAL: GPT 1 goals_1.sqlite missing '$expectedGid' after RemoveSandbox2!"
+        }
+        $syncBkps = @(Get-ChildItem -LiteralPath $p13L1 -Filter 'state_5.sqlite.sync-backup-*' -File)
+        Assert-True ($syncBkps.Count -ge 1) 'Expected SQLite .sync-backup-* safety copy in GPT 1 before sync write!'
+
+        Write-Host "    [OK] codex-manager.ps1 verified end-to-end (ApiGpt, ApiOther, Login/--device-auth, CheckApiKey offline+200+401, CheckAccounts read-only, SyncHistory, and history-preserving RemoveSandbox2)" -ForegroundColor Green
+    } finally {
+        Remove-TempTreeSafely -RootDir $null -Lane2Dir $p13L2
+    }
+
+    Write-Host "`n[PASS] All 13 Windows test stages passed cleanly (AST/BOM/CRLF, Python, default.rules, DryRun/WhatIf, TOML/env_key/ACL/8.3/fail-closed worktree, doctor, traversal defense, SHA-256 rollback, interrupted recovery, 3x loop, pre-existing link/exact backup/missing-backup preflight, Strict Project Trust Boundaries + -ShareAuthToLane2 Guardrails + CLI Login/API-Key + Relative RepoPath + Git Bash Shims + Workspace File CRUD, and Sandbox 2 Control Center codex-manager.ps1)!" -ForegroundColor Green
 } finally {
     Remove-TempTreeSafely -RootDir $tmpRoot -Lane2Dir $l2
 }

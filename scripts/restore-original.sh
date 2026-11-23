@@ -893,7 +893,7 @@ is_dual_lane_wrapper() {
 }
 
 echo "[+] Step 3: Reconciling CLI wrappers in ${LOCAL_BIN}..."
-for w in codex codex-official codex-t3; do
+for w in codex codex-official codex-t3 codex-manage; do
   wp="${LOCAL_BIN}/${w}"
   if is_handled_target "${wp}"; then
     continue

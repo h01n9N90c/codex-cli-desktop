@@ -1,4 +1,4 @@
-# Cẩm nang Xử lý Nhanh 10 Lỗi Thực Chiến (Troubleshooting)
+# Cẩm nang Xử lý Nhanh Các Lỗi Thực Chiến (Troubleshooting)
 
 > **Tác giả:** Lê Hoàng Ngọc Tươi | **Dự án:** Codex Dual-Lane & Security Kit (Apache License 2.0)
 
@@ -36,10 +36,18 @@
 * **Nguyên nhân:**
   1. Thư mục `sessions/` được nối chung qua Junction/symlink nhưng bảng metadata (`session_index.jsonl`, `state_*.sqlite`, `goals_*.sqlite`) nằm riêng ở từng `CODEX_HOME`.
   2. `codex resume` mặc định lọc theo thư mục làm việc hiện tại (`cwd`) và `model_provider` khớp cấu hình hiện tại (`openai` chữ thường vs `OpenAI` chữ hoa).
-* **Cách sửa:** Khởi chạy `codex` tối thiểu 1 lần để khởi tạo `state_*.sqlite` ở Luồng 2, rồi chạy lệnh đồng bộ kèm đường dẫn dự án (có thể thêm `--pinned-only` nếu chỉ muốn đồng bộ các phiên đã ghim):
-  ```powershell
-  python .\scripts\sync-sessions.py --repo "C:\Projects\my-app" --pinned-only
-  ```
+* **Cách sửa:** Khởi chạy `codex` tối thiểu 1 lần để khởi tạo `state_*.sqlite` ở Luồng 2, rồi đồng bộ bằng 1 trong 2 cách sau:
+  * **Đồng bộ 2 chiều đầy đủ giữa GPT 1 (`~/.codex`) và Sandbox 2 (`~/.codex-official`) — khuyên dùng từ v1.4.0** *(có sao lưu SQLite trước khi ghi, bảo toàn `is_pinned = 1` và không bao giờ ghi đè dữ liệu `updated_at` mới hơn của GPT 1)*:
+    ```powershell
+    # Windows (hoặc gõ `codex-manage` rồi chọn mục [5]):
+    .\scripts\codex-manager.ps1 -Action SyncHistory
+    # Hoặc gọi trực tiếp Python (Windows / macOS / Linux / WSL):
+    python .\scripts\sync-sessions.py --bidirectional --backup-target
+    ```
+  * **Hoặc chỉ đồng bộ 1 chiều các phiên đã ghim (`Pinned`) gắn với thư mục dự án hiện tại:**
+    ```powershell
+    python .\scripts\sync-sessions.py --repo "C:\Projects\my-app" --pinned-only
+    ```
   Hoặc mở danh sách toàn bộ mọi thư mục bằng `codex resume --all`.
 
 ---
@@ -111,7 +119,19 @@
   * Từ v1.3.1 (`SchemaVersion = 2` / `schema_version=2`), manifest ghi nhận rõ `SharedLinkRecords` / dòng `L` (`PriorState`: `absent`, `preexisting_link`, `preexisting_dir` và `CreatedByKit`): mọi Junction/symlink do bạn tự tạo từ trước khi cài kit sẽ **được giữ nguyên 100%** khi rollback; các thư mục gốc được khôi phục từ **đúng đường dẫn `BackupDirPath` / `dir_bkp` ghi trong manifest** (không đoán mò theo tên wildcard `.backup-*`).
   * Nếu bạn vô tình xóa/di chuyển mất một tệp hoặc thư mục `.backup-*` bắt buộc, bước **Preflight Fail-Closed** của `restore-original.*` sẽ dừng ngay lập tức với mã thoát `1` **trước khi tháo bất kỳ Junction/symlink nào hay sửa tệp trên đĩa** (0 tác dụng phụ bán phần).
 * **Phục hồi khi cài đặt bị ngắt giữa chừng (`Ctrl+C` / lỗi đột ngột):** Bộ cài ghi nhật ký rollback tăng dần sau từng thao tác (`.rollback/latest.json` với `Completed: false` trên Windows / `.rollback/latest.tsv` với `# status=in-progress` trên Unix). Nếu `doctor.ps1` / `doctor.sh` báo `[WARN] Rollback Journal`, hãy chạy ngay `restore-original.*` bên dưới để hoàn nguyên sạch toàn bộ thay đổi bán phần rồi cài lại.
-* **Cách gỡ chuẩn và an toàn nhất (tự động kiểm chứng SHA-256 & tháo liên kết trước):**
+* **Cách gỡ chuẩn và an toàn nhất — Xóa Sandbox 2 KHÔNG mất 1 cuộc chat nào (v1.4.0, khuyên dùng):**
+  * Dùng **`codex-manage`** (mục `[6]`) hoặc chạy trực tiếp `RemoveSandbox2` / `remove-sandbox2`. Công cụ **bắt buộc chạy bước cứu hộ ngược fail-closed** (`sync-sessions.py --source <Lane2> --target <Lane1> --rescue-shared-files --backup-target`) để đưa 100% phiên chat, `Pinned`, `Goals` và mọi tệp rollout/memory cục bộ (nếu không phải Junction/symlink) về **GPT 1 (`~/.codex`) trước**, rồi mới gọi `restore-original.* -RemoveLane2Home` / `--remove-lane2-home` tháo sạch liên kết và xóa `~/.codex-official` (nếu bước cứu hộ lỗi, Sandbox 2 sẽ không bị xóa!):
+    * **Windows:**
+      ```powershell
+      .\scripts\codex-manager.ps1 -Action RemoveSandbox2 -DryRun
+      .\scripts\codex-manager.ps1 -Action RemoveSandbox2
+      ```
+    * **macOS / Linux / WSL:**
+      ```bash
+      ./scripts/codex-manager.sh --action remove-sandbox2 --dry-run
+      ./scripts/codex-manager.sh --action remove-sandbox2
+      ```
+* **Hoặc khôi phục thuần theo Snapshot SHA-256 (chỉ rollback cấu hình/launcher, không cần cứu hộ thêm nếu đã đồng bộ xong):**
   * **Windows:**
     ```powershell
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore-original.ps1 -DryRun
@@ -144,3 +164,25 @@
   * **Dùng API Key / Gateway 1 chạm (`env_key`):** Cài với `-ConfigureCliGateway -GatewayBaseUrl "https://<endpoint>/v1" -CliApiKeyEnv "CODEX_CLI_API_KEY" -PromptGatewayApiKey` (Windows) hoặc `--configure-cli-gateway --gateway-base-url "https://<endpoint>/v1" --cli-api-key-env CODEX_CLI_API_KEY` (Unix), hoặc nạp key chuẩn bằng `$env:OPENAI_API_KEY | codex login --with-api-key`. Trên Windows, bộ cài sinh cả `.cmd` lẫn POSIX shim không đuôi (`codex`, `codex-official`, `codex-t3`) nên bạn có thể gõ `codex` trực tiếp trong cả PowerShell, CMD lẫn Git Bash / MSYS2.
 * **3. Toàn quyền nắm cây thư mục & thao tác File CRUD trong Workspace:**
   * Bên trong thư mục dự án (`workspace-write`), toàn bộ công cụ duyệt cây thư mục (`rg --files`, `git status`, `Get-ChildItem`, `find`) và thao tác file CRUD (`apply_patch`, `Set-Content`, `Remove-Item`, `rm`, `mv`, `cp`, `mkdir`) đều được phép 100% (`matchedRules: []` trong `default.rules`). Quy tắc `Static-Analysis-Only` chỉ cấm **thực thi/kích nổ** tệp mẫu mã độc/payload bên thứ 3, tuyệt đối không hạn chế việc đọc/tạo/sửa/xóa code của dự án.
+
+---
+
+### Lỗi 12 *(Câu hỏi thực tế — v1.4.0)*: Làm sao đổi nhanh API Key OpenAI / Custom Gateway, chuyển sang Đăng nhập chính thức, kiểm tra API Key còn sống hay hết hạn (`401`/`429`), hoặc kiểm tra nhanh trạng thái cả GPT 1 & Sandbox 2 mà không lộ secret?
+* **Giải pháp 1 chạm — Mở Trung tâm Điều khiển Sandbox 2 (`codex-manage`):**
+  ```powershell
+  codex-manage
+  ```
+* **Đổi sang OpenAI / GPT API Key chính chủ (không để lại xung đột `model_provider` bên thứ 3):**
+  * Chạy `.\scripts\codex-manager.ps1 -Action ApiGpt` *(Unix: `./scripts/codex-manager.sh --action api-gpt`)*: nhập ẩn đúng 1 key (tuyệt đối không truyền key trên dòng lệnh), script tự sao lưu `config.toml`, dọn `model_provider` bên thứ 3, nạp key qua stdin vào `codex login --with-api-key`, khóa lại NTFS DACL / `chmod 600` và đồng bộ lịch sử 2 chiều.
+* **Chỉnh cổng API bên thứ 3 / Custom Gateway trực tiếp trong `~/.codex-official/config.toml`:**
+  * Chạy `.\scripts\codex-manager.ps1 -Action ApiOther` *(Unix: `./scripts/codex-manager.sh --action api-other`)*: script tự sao lưu, mở thẳng `config.toml` kèm mẫu `env_key` an toàn, hậu kiểm cú pháp TOML (`tomllib`), cảnh báo nếu bạn lỡ dán plaintext `api_key`, rồi tự khóa lại NTFS DACL / `chmod 600`.
+* **Chuyển sang Đăng nhập chính thức (`codex login`):**
+  * Chạy `.\scripts\codex-manager.ps1 -Action Login` *(thêm `-DeviceAuth` nếu môi trường không có trình duyệt; Unix: `./scripts/codex-manager.sh --action login --device-auth`)*.
+* **Kiểm tra API Key sống/chết & đọc mã trạng thái `/models` mà không lộ key:**
+  * Chạy `.\scripts\codex-manager.ps1 -Action CheckApiKey -OnlineCheck` *(Unix: `./scripts/codex-manager.sh --action check-api-key --online-check`)*:
+    * **`VALID (HTTP 200, N models)`:** Key hợp lệ và endpoint phản hồi tốt.
+    * **`INVALID/EXPIRED (HTTP 401/403)`:** Key sai, bị thu hồi, hoặc sai `base_url`/quyền project — chạy lại `ApiGpt` hoặc `ApiOther` để cập nhật.
+    * **`QUOTA/RATE_LIMITED (HTTP 429)`:** Tài khoản/API key hết hạn mức thanh toán hoặc bị giới hạn tốc độ — kiểm tra billing trên trang nhà cung cấp.
+    * **`NETWORK_ERROR`:** Lỗi mạng, proxy hoặc sai `base_url` (lưu ý: `CheckApiKey` mặc định chạy offline khi không truyền `-OnlineCheck`/`--online-check`).
+* **Kiểm tra nhanh trạng thái cả 2 tài khoản (GPT 1 Desktop & Sandbox 2 CLI — chỉ đọc 100%):**
+  * Chạy `.\scripts\codex-manager.ps1 -Action CheckAccounts` *(Unix: `./scripts/codex-manager.sh --action check-accounts`)* để xem `codex login status`, `auth_mode`, `model_provider`, `env_key`, 6 liên kết dùng chung, số lượng phiên và trạng thái ACL / `0600` của cả hai luồng mà không làm thay đổi 1 byte nào ở GPT 1.

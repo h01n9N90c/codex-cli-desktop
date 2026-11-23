@@ -20,6 +20,7 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -815,6 +816,745 @@ class TestSyncSessionsSafetyAndUpsert(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn(canary, stdout_buf.getvalue())
         self.assertNotIn(canary, stderr_buf.getvalue())
+
+    # ------------------------------------------------------------------
+    # 7. Bidirectional Sync, Conflict Protection, SQLite Backup & Rescue (v1.4.0)
+    # ------------------------------------------------------------------
+
+    def test_bidirectional_sync_converges_threads_pinned_goals_and_index(self) -> None:
+        """
+        WHAT: Verifies `--bidirectional` with `--source`/`--target` aliases and
+              `--backup-target` merges unique threads, pinned flags, `thread_sections`,
+              `goals_*.sqlite` (`thread_goals`), and `session_index.jsonl` created in BOTH
+              Lane 1 and Lane 2 so both homes converge to the exact union without losing
+              any row or clobbering GPT 1's `model_provider`.
+        PREVENTS: One-way sync leaving Sandbox 2 chats/goals/pins trapped outside GPT 1
+                  or reverse sync downgrading GPT 1 metadata.
+        """
+        # Seed Lane 2 with unique pinned & unpinned threads plus its own section.
+        c2 = sqlite3.connect(self.st2)
+        c2.execute("INSERT INTO thread_sections VALUES (?, ?)", ("sec-2", "Sandbox Work"))
+        c2.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "t-lane2-pinned",
+                "Sandbox Pinned Task",
+                1,
+                "sec-2",
+                1,
+                2000,
+                "proj-2",
+                "openai",
+                "never",
+                "C:\\lane2\\repo",
+                500001,
+                9,
+            ),
+        )
+        c2.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "t-lane2-casual",
+                "Sandbox Casual Chat",
+                0,
+                None,
+                None,
+                None,
+                None,
+                "openai",
+                "on-request",
+                "C:\\lane2\\repo",
+                500002,
+                3,
+            ),
+        )
+        c2.commit()
+        c2.close()
+
+        Path(self.lane2, "session_index.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"id": "t-lane2-pinned", "thread_name": "Sandbox Pinned Task"}),
+                    json.dumps({"id": "t-lane2-casual", "thread_name": "Sandbox Casual Chat"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        # Seed unique Goals in both lanes.
+        g1 = os.path.join(self.lane1, "goals_2.sqlite")
+        g2 = os.path.join(self.lane2, "goals_2.sqlite")
+        for db in (g1, g2):
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE thread_goals (id TEXT PRIMARY KEY, title TEXT)")
+            conn.commit()
+            conn.close()
+        cg1 = sqlite3.connect(g1)
+        cg1.execute("INSERT INTO thread_goals VALUES (?, ?)", ("g-lane1", "GPT 1 Goal"))
+        cg1.commit()
+        cg1.close()
+        cg2 = sqlite3.connect(g2)
+        cg2.execute("INSERT INTO thread_goals VALUES (?, ?)", ("g-lane2", "Sandbox 2 Goal"))
+        cg2.commit()
+        cg2.close()
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "sync-sessions.py",
+                    "--source",
+                    self.lane1,
+                    "--target",
+                    self.lane2,
+                    "--bidirectional",
+                    "--backup-target",
+                ],
+            ),
+            contextlib.redirect_stdout(stdout_buf),
+            contextlib.redirect_stderr(stderr_buf),
+        ):
+            rc = sync_mod.main()
+
+        self.assertEqual(rc, 0)
+        out = stdout_buf.getvalue()
+        self.assertIn("[OK] [forward]", out)
+        self.assertIn("[OK] [reverse]", out)
+        # Ensure zero thread/goal title leakage in CLI output.
+        for secret_title in ("Pinned Core Task", "Sandbox Pinned Task", "GPT 1 Goal", "Sandbox 2 Goal"):
+            self.assertNotIn(secret_title, out)
+            self.assertNotIn(secret_title, stderr_buf.getvalue())
+
+        expected_ids = {"t-pinned-1", "t-unpinned-2", "t-lane2-pinned", "t-lane2-casual"}
+        for db_path in (self.st1, self.st2):
+            conn = sqlite3.connect(db_path)
+            rows = {
+                r[0]: r[1:]
+                for r in conn.execute("SELECT id, name, is_pinned, model_provider FROM threads").fetchall()
+            }
+            sections = dict(conn.execute("SELECT id, title FROM thread_sections").fetchall())
+            conn.close()
+            self.assertEqual(set(rows.keys()), expected_ids)
+            self.assertEqual(rows["t-pinned-1"][1], 1)
+            self.assertEqual(rows["t-lane2-pinned"][1], 1)
+            self.assertEqual(sections, {"sec-1": "Core", "sec-2": "Sandbox Work"})
+
+        # Verify reverse sync did NOT clobber Lane 1's existing model_provider ("OpenAI").
+        c1_check = sqlite3.connect(self.st1)
+        l1_provider = c1_check.execute(
+            "SELECT model_provider FROM threads WHERE id = ?", ("t-pinned-1",)
+        ).fetchone()[0]
+        c1_check.close()
+        self.assertEqual(l1_provider, "OpenAI")
+
+        # Verify Goals converged to exact union in both lanes.
+        for gdb in (g1, g2):
+            cg = sqlite3.connect(gdb)
+            grows = dict(cg.execute("SELECT id, title FROM thread_goals").fetchall())
+            cg.close()
+            self.assertEqual(grows, {"g-lane1": "GPT 1 Goal", "g-lane2": "Sandbox 2 Goal"})
+
+        # Verify session_index.jsonl converged to exact union in both lanes.
+        for lane_dir in (self.lane1, self.lane2):
+            idx_ids = {
+                json.loads(line)["id"]
+                for line in Path(lane_dir, "session_index.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            }
+            self.assertEqual(idx_ids, expected_ids)
+
+        # Verify backups were created in both lanes.
+        self.assertGreaterEqual(len(list(Path(self.lane1).glob("state_5.sqlite.sync-backup-*"))), 1)
+        self.assertGreaterEqual(len(list(Path(self.lane2).glob("state_5.sqlite.sync-backup-*"))), 1)
+
+        # Re-run --bidirectional a second time to verify idempotency (no duplicates).
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["sync-sessions.py", "--source", self.lane1, "--target", self.lane2, "--bidirectional"],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rc2 = sync_mod.main()
+        self.assertEqual(rc2, 0)
+        c1_again = sqlite3.connect(self.st1)
+        self.assertEqual(c1_again.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 4)
+        c1_again.close()
+
+    def test_conflict_safe_merge_preserves_newer_updated_at_and_monotonic_pinned(self) -> None:
+        """
+        WHAT: Verifies conflict-safe merge across `threads`, `goals_*.sqlite`, and
+              `session_index.jsonl`:
+              1) Older source rows NEVER clobber newer target metadata (`updated_at`),
+                 while still filling NULL/empty target fields.
+              2) `pinned = 1` / `is_pinned = 1` is preserved monotonically whenever EITHER
+                 source or target has it set, even when a newer row has `pinned = 0` or
+                 an older row has `pinned = 1`.
+        PREVENTS: Syncing Sandbox 2 back to GPT 1 from downgrading newer GPT 1 titles,
+                  timestamps, goals, or unpinning pinned conversations.
+        """
+        l1 = os.path.join(self.tmp.name, "conflict_lane1")
+        l2 = os.path.join(self.tmp.name, "conflict_lane2")
+        os.makedirs(l1, exist_ok=True)
+        os.makedirs(l2, exist_ok=True)
+        db1 = os.path.join(l1, "state_6.sqlite")
+        db2 = os.path.join(l2, "state_6.sqlite")
+
+        schema = """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                pinned INTEGER,
+                is_pinned INTEGER,
+                updated_at INTEGER,
+                summary TEXT,
+                model_provider TEXT
+            )
+        """
+        for db in (db1, db2):
+            conn = sqlite3.connect(db)
+            conn.execute(schema)
+            conn.commit()
+            conn.close()
+
+        # Seed GPT 1 (target of reverse sync).
+        c1 = sqlite3.connect(db1)
+        c1.executemany(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                # Newer in GPT 1, pinned=1, missing summary (should keep newer name/ts/pinned, fill summary).
+                ("t-gpt1-newer", "GPT 1 Newer Title", 1, 1, 2000, None, "OpenAI"),
+                # Older in GPT 1, pinned=1 (newer Sandbox 2 name/ts should win, pinned=1 MUST stay 1).
+                ("t-pin-protected", "Old GPT 1 Title", 1, 1, 1000, "Keep Summary", "OpenAI"),
+                # Newer in GPT 1, pinned=0 (older Sandbox 2 has pinned=1 -> pinned upgrades to 1, name/ts stay newer).
+                ("t-pin-upgrade", "Newer Unpinned Title", 0, 0, 2500, "GPT1 Summary", "OpenAI"),
+            ],
+        )
+        c1.commit()
+        c1.close()
+
+        # Seed Sandbox 2 (source of reverse sync).
+        c2 = sqlite3.connect(db2)
+        c2.executemany(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("t-gpt1-newer", "Stale Sandbox 2 Title", 0, 0, 1000, "Recovered Summary", "openai"),
+                ("t-pin-protected", "Newer Sandbox 2 Title", 0, 0, 3000, None, "openai"),
+                ("t-pin-upgrade", "Older Pinned Title", 1, 1, 1200, "Older Summary", "openai"),
+            ],
+        )
+        c2.commit()
+        c2.close()
+
+        # Seed session_index.jsonl with ISO-8601 updated_at timestamps.
+        Path(l1, "session_index.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "id": "t-gpt1-newer",
+                            "thread_name": "GPT 1 Newer Index",
+                            "updated_at": "2026-11-23T12:00:00Z",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "id": "t-pin-protected",
+                            "thread_name": "GPT 1 Older Index",
+                            "updated_at": "2026-11-23T08:00:00Z",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        Path(l2, "session_index.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "id": "t-gpt1-newer",
+                            "thread_name": "Sandbox 2 Older Index",
+                            "updated_at": "2026-11-23T10:00:00Z",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "id": "t-pin-protected",
+                            "thread_name": "Sandbox 2 Newer Index",
+                            "updated_at": "2026-11-23T11:00:00Z",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        # Seed goals DB with updated_at column.
+        g1 = os.path.join(l1, "goals_3.sqlite")
+        g2 = os.path.join(l2, "goals_3.sqlite")
+        for gdb in (g1, g2):
+            cg = sqlite3.connect(gdb)
+            cg.execute("CREATE TABLE thread_goals (id TEXT PRIMARY KEY, title TEXT, updated_at INTEGER)")
+            cg.commit()
+            cg.close()
+        cg1 = sqlite3.connect(g1)
+        cg1.executemany(
+            "INSERT INTO thread_goals VALUES (?, ?, ?)",
+            [("g-keep-newer", "GPT 1 Newer Goal", 5000), ("g-update-me", "Old Goal", 1000)],
+        )
+        cg1.commit()
+        cg1.close()
+        cg2 = sqlite3.connect(g2)
+        cg2.executemany(
+            "INSERT INTO thread_goals VALUES (?, ?, ?)",
+            [("g-keep-newer", "Stale Sandbox 2 Goal", 2000), ("g-update-me", "Fresh Sandbox 2 Goal", 6000)],
+        )
+        cg2.commit()
+        cg2.close()
+
+        # Sync Lane 2 -> Lane 1 (simulating pre-uninstall rescue or reverse merge).
+        sync_mod.sync_state_db(
+            l2, l1, None, None, False, False, force_openai_provider=False
+        )
+        sync_mod.sync_session_index(l2, l1, dry_run=False)
+        sync_mod.sync_goals_db(l2, l1, dry_run=False, preserve_existing_on_conflict=True)
+
+        c1_after = sqlite3.connect(db1)
+        rows = {
+            r[0]: r[1:]
+            for r in c1_after.execute(
+                "SELECT id, name, pinned, is_pinned, updated_at, summary, model_provider FROM threads"
+            ).fetchall()
+        }
+        c1_after.close()
+
+        # Case A: Newer GPT 1 metadata preserved, NULL summary filled, pinned=1 kept.
+        self.assertEqual(
+            rows["t-gpt1-newer"],
+            ("GPT 1 Newer Title", 1, 1, 2000, "Recovered Summary", "OpenAI"),
+        )
+        # Case B: Newer Sandbox 2 name/ts applied, NULL source summary did NOT erase target summary, pinned=1 preserved!
+        self.assertEqual(
+            rows["t-pin-protected"],
+            ("Newer Sandbox 2 Title", 1, 1, 3000, "Keep Summary", "OpenAI"),
+        )
+        # Case C: Older Sandbox 2 upgraded pinned=1 without clobbering newer name/ts/summary!
+        self.assertEqual(
+            rows["t-pin-upgrade"],
+            ("Newer Unpinned Title", 1, 1, 2500, "GPT1 Summary", "OpenAI"),
+        )
+
+        # Verify session_index.jsonl timestamp conflict resolution.
+        idx_merged = {
+            json.loads(line)["id"]: json.loads(line)
+            for line in Path(l1, "session_index.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        self.assertEqual(idx_merged["t-gpt1-newer"]["thread_name"], "GPT 1 Newer Index")
+        self.assertEqual(idx_merged["t-pin-protected"]["thread_name"], "Sandbox 2 Newer Index")
+
+        # Verify goals DB timestamp conflict resolution.
+        cg1_after = sqlite3.connect(g1)
+        goals_after = dict(cg1_after.execute("SELECT id, title FROM thread_goals").fetchall())
+        cg1_after.close()
+        self.assertEqual(
+            goals_after,
+            {"g-keep-newer": "GPT 1 Newer Goal", "g-update-me": "Fresh Sandbox 2 Goal"},
+        )
+
+    def test_backup_target_creates_valid_sqlite_snapshot_and_dry_run_is_zero_mutation(self) -> None:
+        """
+        WHAT: Verifies `--backup-target` creates valid online SQLite `.sync-backup-*`
+              snapshots capturing the pre-write target DB state (with zero leftover `.tmp`
+              files and `0600` mode on POSIX), while `--backup-target --dry-run` performs
+              strictly zero filesystem mutations across both lanes.
+        PREVENTS: Irrecoverable target DB loss during bidirectional/reverse writes or
+                  unexpected backup file creation during `--dry-run`.
+        """
+        c2 = sqlite3.connect(self.st2)
+        c2.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("t-pre-backup", "Pre-Backup Row", 1, None, None, None, None, "openai", "on-request", "C:\\x", 10, 5),
+        )
+        c2.commit()
+        c2.close()
+
+        g1 = os.path.join(self.lane1, "goals_1.sqlite")
+        g2 = os.path.join(self.lane2, "goals_1.sqlite")
+        for gdb in (g1, g2):
+            cg = sqlite3.connect(gdb)
+            cg.execute("CREATE TABLE thread_goals (id TEXT PRIMARY KEY, title TEXT)")
+            cg.commit()
+            cg.close()
+        cg1 = sqlite3.connect(g1)
+        cg1.execute("INSERT INTO thread_goals VALUES (?, ?)", ("g-from-l1", "Lane 1 Goal"))
+        cg1.commit()
+        cg1.close()
+        cg2 = sqlite3.connect(g2)
+        cg2.execute("INSERT INTO thread_goals VALUES (?, ?)", ("g-pre-backup", "Pre-Backup Goal"))
+        cg2.commit()
+        cg2.close()
+
+        snap1_before = _dir_snapshot(self.lane1)
+        snap2_before = _dir_snapshot(self.lane2)
+
+        # 1) --dry-run with --bidirectional --backup-target must cause ZERO mutations.
+        dry_out = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "sync-sessions.py",
+                    "--source",
+                    self.lane1,
+                    "--target",
+                    self.lane2,
+                    "--bidirectional",
+                    "--backup-target",
+                    "--dry-run",
+                ],
+            ),
+            contextlib.redirect_stdout(dry_out),
+        ):
+            rc_dry = sync_mod.main()
+        self.assertEqual(rc_dry, 0)
+        self.assertIn("[DRY-RUN]", dry_out.getvalue())
+        self.assertEqual(_dir_snapshot(self.lane1), snap1_before)
+        self.assertEqual(_dir_snapshot(self.lane2), snap2_before)
+        self.assertEqual(list(Path(self.lane2).glob("*.sync-backup-*")), [])
+
+        # 2) Real run with --backup-target creates valid pre-sync SQLite snapshots before writing.
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "sync-sessions.py",
+                    "--source",
+                    self.lane1,
+                    "--target",
+                    self.lane2,
+                    "--backup-target",
+                ],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rc_real = sync_mod.main()
+        self.assertEqual(rc_real, 0)
+
+        state_backups = list(Path(self.lane2).glob("state_5.sqlite.sync-backup-*"))
+        goal_backups = list(Path(self.lane2).glob("goals_1.sqlite.sync-backup-*"))
+        self.assertEqual(len(state_backups), 1)
+        self.assertEqual(len(goal_backups), 1)
+        self.assertEqual(list(Path(self.lane2).glob("*.tmp")), [])
+
+        # Open backup SQLite files: must pass quick_check and hold ONLY pre-sync rows.
+        cb_state = sqlite3.connect(str(state_backups[0]))
+        self.assertEqual(cb_state.execute("PRAGMA quick_check(1)").fetchone()[0].lower(), "ok")
+        backup_thread_ids = {r[0] for r in cb_state.execute("SELECT id FROM threads").fetchall()}
+        cb_state.close()
+        self.assertEqual(backup_thread_ids, {"t-pre-backup"})
+
+        cb_goals = sqlite3.connect(str(goal_backups[0]))
+        self.assertEqual(cb_goals.execute("PRAGMA quick_check(1)").fetchone()[0].lower(), "ok")
+        backup_goal_ids = {r[0] for r in cb_goals.execute("SELECT id FROM thread_goals").fetchall()}
+        cb_goals.close()
+        self.assertEqual(backup_goal_ids, {"g-pre-backup"})
+
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(os.stat(state_backups[0]).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(goal_backups[0]).st_mode), 0o600)
+
+        # Live target DB must contain both pre-existing and newly synced rows.
+        c2_live = sqlite3.connect(self.st2)
+        live_ids = {r[0] for r in c2_live.execute("SELECT id FROM threads").fetchall()}
+        c2_live.close()
+        self.assertEqual(live_ids, {"t-pre-backup", "t-pinned-1", "t-unpinned-2"})
+
+    def test_rescue_shared_files_copies_local_files_skips_links_and_rejects_planted_symlinks(self) -> None:
+        """
+        WHAT: Verifies `--rescue-shared-files`:
+              1) Copies missing regular files from real local `sessions`, `archived_sessions`,
+                 `memories`, and `memories_v2` dirs (preserving nested subdirectories) while
+                 NEVER overwriting existing GPT 1 files, respecting `--dry-run`, and leaking
+                 zero filenames/contents in stdout/stderr.
+              2) Skips top-level shared folders that are ALREADY symlinks or Windows NTFS
+                 junctions cleanly.
+              3) Rejects planted symlinks (or Windows NTFS junctions) INSIDE a real shared
+                 folder fail-closed with ValueError and ZERO partial copies.
+        PREVENTS: Losing local Sandbox 2 rollout/memory files on pre-uninstall, clobbering
+                  existing GPT 1 files, or following attacker-planted symlinks outside CODEX_HOME.
+        """
+        # Part A: Non-destructive copy + --dry-run + zero secret filename/content leak.
+        secret_canary = "ROLLOUT_CANARY_TOKEN_883311"
+        src_rollout_new = Path(
+            self.lane2, "sessions", "2026", "11", "23", f"rollout-{secret_canary}.jsonl"
+        )
+        src_rollout_existing = Path(self.lane2, "sessions", "2026", "11", "23", "rollout-existing.jsonl")
+        src_arch = Path(self.lane2, "archived_sessions", "arch-01.jsonl")
+        src_mem = Path(self.lane2, "memories", "notes", "mem-01.md")
+        src_mem2 = Path(self.lane2, "memories_v2", "index.json")
+
+        for fpath, body in (
+            (src_rollout_new, f'{{"msg":"{secret_canary}"}}\n'),
+            (src_rollout_existing, "SANDBOX2_MUST_NOT_OVERWRITE\n"),
+            (src_arch, '{"archived":true}\n'),
+            (src_mem, "# Sandbox 2 Memory\n"),
+            (src_mem2, '{"v":2}\n'),
+        ):
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            fpath.write_text(body, encoding="utf-8", newline="\n")
+
+        dst_rollout_existing = Path(self.lane1, "sessions", "2026", "11", "23", "rollout-existing.jsonl")
+        dst_rollout_existing.parent.mkdir(parents=True, exist_ok=True)
+        dst_rollout_existing.write_text("GPT1_ORIGINAL_DO_NOT_OVERWRITE\n", encoding="utf-8", newline="\n")
+
+        snap_l1_before = _dir_snapshot(self.lane1)
+        snap_l2_before = _dir_snapshot(self.lane2)
+
+        # Dry-run must report exact counts with zero mutations and zero canary leakage.
+        dry_out = io.StringIO()
+        dry_err = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "sync-sessions.py",
+                    "--source",
+                    self.lane2,
+                    "--target",
+                    self.lane1,
+                    "--rescue-shared-files",
+                    "--backup-target",
+                    "--dry-run",
+                ],
+            ),
+            contextlib.redirect_stdout(dry_out),
+            contextlib.redirect_stderr(dry_err),
+        ):
+            rc_dry = sync_mod.main()
+        self.assertEqual(rc_dry, 0)
+        self.assertIn("rescued_files=4 (skipped_existing=1, skipped_links=0)", dry_out.getvalue())
+        self.assertNotIn(secret_canary, dry_out.getvalue())
+        self.assertNotIn(secret_canary, dry_err.getvalue())
+        self.assertEqual(_dir_snapshot(self.lane1), snap_l1_before)
+        self.assertEqual(_dir_snapshot(self.lane2), snap_l2_before)
+
+        # Real rescue run copies all 4 missing files without overwriting existing GPT 1 file.
+        real_out = io.StringIO()
+        real_err = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "sync-sessions.py",
+                    "--source",
+                    self.lane2,
+                    "--target",
+                    self.lane1,
+                    "--rescue-shared-files",
+                    "--backup-target",
+                ],
+            ),
+            contextlib.redirect_stdout(real_out),
+            contextlib.redirect_stderr(real_err),
+        ):
+            rc_real = sync_mod.main()
+        self.assertEqual(rc_real, 0)
+        self.assertIn("rescued_files=4 (skipped_existing=1, skipped_links=0)", real_out.getvalue())
+        self.assertNotIn(secret_canary, real_out.getvalue())
+        self.assertNotIn(secret_canary, real_err.getvalue())
+
+        self.assertEqual(
+            dst_rollout_existing.read_text(encoding="utf-8"),
+            "GPT1_ORIGINAL_DO_NOT_OVERWRITE\n",
+        )
+        self.assertEqual(
+            Path(self.lane1, "sessions", "2026", "11", "23", f"rollout-{secret_canary}.jsonl").read_text(
+                encoding="utf-8"
+            ),
+            f'{{"msg":"{secret_canary}"}}\n',
+        )
+        self.assertEqual(Path(self.lane1, "archived_sessions", "arch-01.jsonl").read_text(encoding="utf-8"), '{"archived":true}\n')
+        self.assertEqual(Path(self.lane1, "memories", "notes", "mem-01.md").read_text(encoding="utf-8"), "# Sandbox 2 Memory\n")
+        self.assertEqual(Path(self.lane1, "memories_v2", "index.json").read_text(encoding="utf-8"), '{"v":2}\n')
+
+        # Part B: Top-level shared folder that is ALREADY a symlink/junction is skipped cleanly.
+        real_islink = os.path.islink
+        top_sessions = os.path.abspath(os.path.join(self.lane2, "sessions"))
+
+        def fake_top_link(p: object) -> bool:
+            return os.path.abspath(os.fspath(p)) == top_sessions or real_islink(p)
+
+        with mock.patch.object(sync_mod.os.path, "islink", side_effect=fake_top_link):
+            copied, skipped_ex, skipped_ln = sync_mod.rescue_shared_files(self.lane2, self.lane1, dry_run=False)
+        self.assertEqual(copied, 0)
+        self.assertEqual(skipped_ln, 1)
+        self.assertEqual(skipped_ex, 3)
+
+        # Real Windows NTFS Junction check (does not require admin/SeCreateSymbolicLinkPrivilege).
+        if os.name == "nt":
+            j_l1 = Path(self.tmp.name, "junc_l1")
+            j_l2 = Path(self.tmp.name, "junc_l2")
+            (j_l1 / "sessions").mkdir(parents=True)
+            (j_l1 / "sessions" / "gpt1.jsonl").write_text("ok\n", encoding="utf-8")
+            j_l2.mkdir(parents=True)
+            j_link = j_l2 / "sessions"
+            proc = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(j_link), str(j_l1 / "sessions")],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                try:
+                    self.assertEqual(
+                        sync_mod.rescue_shared_files(str(j_l2), str(j_l1), dry_run=False),
+                        (0, 0, 1),
+                    )
+                finally:
+                    subprocess.run(["cmd", "/c", "rmdir", str(j_link)], capture_output=True, check=False)
+
+        # Part C: Planted symlink INSIDE a real local shared folder fails closed with 0 partial copies.
+        evil_src = Path(self.tmp.name, "evil_src")
+        evil_dst = Path(self.tmp.name, "evil_dst")
+        (evil_src / "sessions").mkdir(parents=True)
+        evil_dst.mkdir(parents=True)
+        good_file = evil_src / "sessions" / "a_good.jsonl"
+        planted_file = evil_src / "sessions" / "z_planted.jsonl"
+        good_file.write_text('{"ok":1}\n', encoding="utf-8")
+        planted_file.write_text('{"evil":1}\n', encoding="utf-8")
+
+        planted_abs = os.path.abspath(str(planted_file))
+
+        def fake_planted_link(p: object) -> bool:
+            return os.path.abspath(os.fspath(p)) == planted_abs or real_islink(p)
+
+        with mock.patch.object(sync_mod.os.path, "islink", side_effect=fake_planted_link):
+            with self.assertRaises(ValueError):
+                sync_mod.rescue_shared_files(str(evil_src), str(evil_dst), dry_run=False)
+        # Fail-closed guarantee: a_good.jsonl must NOT have been copied before rejecting z_planted.jsonl!
+        self.assertFalse((evil_dst / "sessions" / "a_good.jsonl").exists())
+
+        # Real filesystem symlink check inside a real shared dir when OS allows symlinks.
+        if _can_create_symlinks(self.tmp.name):
+            outside_secret = Path(self.tmp.name, "outside_rescue_secret.txt")
+            outside_secret.write_text("TOP_SECRET", encoding="utf-8")
+            real_link = evil_src / "sessions" / "real_symlink.jsonl"
+            os.symlink(str(outside_secret), str(real_link))
+            try:
+                err_buf = io.StringIO()
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "sync-sessions.py",
+                            "--source",
+                            str(evil_src),
+                            "--target",
+                            str(evil_dst),
+                            "--rescue-shared-files",
+                        ],
+                    ),
+                    contextlib.redirect_stderr(err_buf),
+                ):
+                    rc_evil = sync_mod.main()
+                self.assertEqual(rc_evil, 1)
+                self.assertIn("Security violation", err_buf.getvalue())
+                self.assertFalse((evil_dst / "sessions" / "a_good.jsonl").exists())
+            finally:
+                os.unlink(real_link)
+
+        # Real NTFS Junction planted INSIDE a real shared dir on Windows must also fail closed!
+        if os.name == "nt":
+            outside_dir = Path(self.tmp.name, "outside_dir_for_junc")
+            outside_dir.mkdir(exist_ok=True)
+            (outside_dir / "secret.jsonl").write_text("OUTSIDE", encoding="utf-8")
+            sub_junc = evil_src / "sessions" / "nested_junc"
+            proc = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(sub_junc), str(outside_dir)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                try:
+                    with self.assertRaises(ValueError):
+                        sync_mod.rescue_shared_files(str(evil_src), str(evil_dst), dry_run=False)
+                    self.assertFalse((evil_dst / "sessions" / "a_good.jsonl").exists())
+                finally:
+                    subprocess.run(["cmd", "/c", "rmdir", str(sub_junc)], capture_output=True, check=False)
+
+    def test_missing_state_db_still_syncs_index_and_rescues_shared_files_with_exit_0(self) -> None:
+        """
+        WHAT: Verifies pre-uninstall rescue (`--source Lane2 --target Lane1 --rescue-shared-files
+              --backup-target`) succeeds with exit code 0 when `state_*.sqlite` and
+              `goals_*.sqlite` are absent, still merging `session_index.jsonl` and rescuing
+              local `sessions/` files into GPT 1.
+        PREVENTS: Pre-uninstall failing needlessly on fresh/lightweight Sandbox 2 homes that
+                  only contain `session_index.jsonl` and rollout files.
+        """
+        l1 = Path(self.tmp.name, "nodb_l1")
+        l2 = Path(self.tmp.name, "nodb_l2")
+        l1.mkdir()
+        (l2 / "sessions" / "2026").mkdir(parents=True)
+        (l1 / "session_index.jsonl").write_text(
+            json.dumps({"id": "t-l1", "thread_name": "GPT 1 Only"}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (l2 / "session_index.jsonl").write_text(
+            json.dumps({"id": "t-l2", "thread_name": "Sandbox 2 Only"}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (l2 / "sessions" / "2026" / "rollout-l2.jsonl").write_text('{"role":"user"}\n', encoding="utf-8")
+
+        out_buf = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "sync-sessions.py",
+                    "--source",
+                    str(l2),
+                    "--target",
+                    str(l1),
+                    "--rescue-shared-files",
+                    "--backup-target",
+                ],
+            ),
+            contextlib.redirect_stdout(out_buf),
+        ):
+            rc = sync_mod.main()
+
+        self.assertEqual(rc, 0)
+        self.assertIn("session_index=2", out_buf.getvalue())
+        self.assertIn("state_db=N/A", out_buf.getvalue())
+        self.assertIn("rescued_files=1", out_buf.getvalue())
+        merged_ids = {
+            json.loads(line)["id"]
+            for line in (l1 / "session_index.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        self.assertEqual(merged_ids, {"t-l1", "t-l2"})
+        self.assertTrue((l1 / "sessions" / "2026" / "rollout-l2.jsonl").is_file())
 
 
 if __name__ == "__main__":

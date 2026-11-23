@@ -20,8 +20,9 @@
          staged restore with transient-lock retries, re-verifies SHA-256 after writing, only
          removes backups once integrity is proven, and never deletes untouched pre-existing user
          launchers when an install was interrupted before reaching wrapper installation.
-      4. Removes CLI wrappers (codex.cmd, codex-official.cmd, codex-t3.cmd) from LocalBin and
-         cleans LocalBin from User PATH (unless -SkipPathUpdate is passed).
+      4. Removes CLI wrappers (codex.cmd, codex-official.cmd, codex-t3.cmd, codex-manage.cmd and
+         extensionless Git Bash POSIX shims codex, codex-official, codex-t3, codex-manage) from
+         LocalBin and cleans LocalBin from User PATH (unless -SkipPathUpdate is passed).
       5. Optionally removes Lane2Home (-RemoveLane2Home) ONLY after proving zero restore errors
          occurred, Lane2Home is not a dangerous OS/profile/Lane1 root, and zero NTFS Junctions or
          ReparsePoints remain anywhere inside Lane2Home (checked at all depths without following links).
@@ -35,7 +36,8 @@
     Authorized CODEX_HOME root for Lane 2. Default: %USERPROFILE%\.codex-official.
 
 .PARAMETER LocalBin
-    Authorized CLI wrapper directory containing codex.cmd, codex-official.cmd, and codex-t3.cmd.
+    Authorized CLI wrapper directory containing codex.cmd, codex-official.cmd, codex-t3.cmd,
+    codex-manage.cmd, and extensionless Git Bash POSIX shims.
     Default: %USERPROFILE%\.local\bin.
 
 .PARAMETER SnapshotPath
@@ -1022,7 +1024,7 @@ if ($manifest) {
 # Step 3: Reconcile CLI Wrappers (Restore Pre-Existing or Remove Newly Created) & Clean User PATH
 # ============================================================================
 Write-Step "Step 3: Reconciling CLI wrappers in $LocalBin..."
-foreach ($w in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd', 'codex', 'codex-official', 'codex-t3')) {
+foreach ($w in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd', 'codex-manage.cmd', 'codex', 'codex-official', 'codex-t3', 'codex-manage')) {
     $wp = Resolve-CanonicalLongPath -PathValue (Join-Path $LocalBin $w)
     # If Step 2 already restored (ExistedPrior=$true) or removed (ExistedPrior=$false) this wrapper
     # from the rollback manifest, do not touch it again in Step 3.
