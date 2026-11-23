@@ -2380,9 +2380,20 @@ action_launch() {
 # Interactive Menu
 action_menu() {
   if [ "${NON_INTERACTIVE}" -eq 1 ]; then
-    echo "[FAIL] --action menu cannot run with --non-interactive. Pass an explicit --action <api-gpt|api-other|login|check-api-key|check-accounts|sync-history|remove-sandbox2|set-cli-mode>." >&2
+    echo "[FAIL] --action menu cannot run with --non-interactive. Pass an explicit --action <api-gpt|api-other|quick-third-party|login|check-api-key|check-accounts|sync-history|remove-sandbox2|set-cli-mode|launch|cleanup-storage>." >&2
     return 1
   fi
+
+  if [ -z "${REPO_PATH}" ]; then
+    if ! REPO_PATH="$(select_mandatory_project_dir "")"; then
+      echo "[INFO] Chua chon thu muc du an; da thoat Control Center."
+      return 0
+    fi
+  else
+    REPO_PATH="$(select_mandatory_project_dir "${REPO_PATH}")"
+  fi
+  cd -P -- "${REPO_PATH}" 2>/dev/null || true
+  echo "[OK] Da khoa thu muc du an lam viec (Active Project CWD): ${REPO_PATH}"
 
   while true; do
     read_config_meta "${LANE2_HOME}/config.toml"
@@ -2391,32 +2402,49 @@ action_menu() {
     cat <<EOF
 
 ========================================================================
-  Codex Dual-Lane Control Center — Sandbox 2 Manager (v1.4)
+  Codex Dual-Lane Control Center — 1-Touch Sandbox 2 CLI (v1.5)
 ========================================================================
+  Du an dang chon  : ${REPO_PATH}
   GPT 1 (Desktop)  : ${LANE1_HOME}
   Sandbox 2 (CLI)  : ${LANE2_HOME}
   Che do quyen CLI : ${active_cli_mode}
 ------------------------------------------------------------------------
+  [00] CHAY CODEX CLI NGAY TAI DU AN TREN (1 Cham) [Enter]
+  [p]  Doi thu muc du an khac (Switch Project Directory)
   [1]  Xac thuc API Key cho Sandbox 2 (Codex CLI)
        [1a] OpenAI / GPT API Key (masked -> codex login --with-api-key)
        [1b] Ben thu 3 / Custom Provider (mo thang config.toml)
+       [1c] Wizard 1 Cham API Ben thu 3 (Hoi 3 dong -> Tu dong A-Z)
   [2]  Dang nhap chinh thuc OpenAI / ChatGPT (codex login)
   [3]  Check API Key (masked offline + optional live /models probe)
   [4]  Check Tai khoan Hien co (GPT 1 & Sandbox 2 — chi doc)
   [5]  Dong bo Lich su Chat 2 chieu (GPT 1 <-> Sandbox 2)
   [6]  Xoa Sandbox 2 An toan (GIU NGUYEN 100% lich su chat ve GPT 1)
   [7]  Chon che do quyen Sandbox 2 (Codex CLI)
+  [8]  Don dep & Toi uu Dung luong RAM / ROM (cleanup-storage)
   [0]  Thoat (Exit)
 ------------------------------------------------------------------------
 EOF
     local choice=""
-    printf 'Chon chuc nang [1/1a/1b/2/3/4/5/6/7/0]: ' >&2
+    printf 'Chon chuc nang [Enter/00/p/1c/1a/1b/2..8/0]: ' >&2
     if ! IFS= read -r choice; then
       printf '\n' >&2
       break
     fi
     choice="$(to_lower "$(printf '%s' "${choice}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')")"
+    [ -z "${choice}" ] && choice="00"
     case "${choice}" in
+      00|launch) action_launch || true ;;
+      p)
+        local np=""
+        if np="$(select_mandatory_project_dir "")"; then
+          REPO_PATH="${np}"
+          cd -P -- "${REPO_PATH}" 2>/dev/null || true
+          echo "[OK] Da chuyen sang thu muc du an: ${REPO_PATH}"
+        fi
+        ;;
+      1c) action_quick_third_party || true ;;
+      8) action_cleanup_storage || true ;;
       1)
         local sub=""
         printf 'Chon loai API Key: [a] OpenAI / GPT chinh chu | [b] Ben thu 3 / Custom (config.toml): ' >&2

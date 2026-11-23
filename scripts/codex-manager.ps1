@@ -3587,9 +3587,24 @@ function Invoke-ActionLaunch {
 
 function Invoke-InteractiveMenu {
     if ($NonInteractive) {
-        Write-FailLine 'Cannot run interactive Menu with -NonInteractive. Specify -Action ApiGpt|ApiOther|Login|CheckApiKey|CheckAccounts|SyncHistory|RemoveSandbox2|SetCliMode.'
+        Write-FailLine 'Cannot run interactive Menu with -NonInteractive. Specify -Action ApiGpt|ApiOther|QuickThirdParty|Login|CheckApiKey|CheckAccounts|SyncHistory|RemoveSandbox2|SetCliMode|Launch|CleanupStorage.'
         return 1
     }
+
+    # MANDATORY STEP 0 ON MENU STARTUP: Force user to select/confirm the target Project Directory FIRST!
+    if ([string]::IsNullOrWhiteSpace($RepoPath)) {
+        $pickedStartupRepo = Select-MandatoryProjectDirectory -InitialRepoPath ''
+        if ([string]::IsNullOrWhiteSpace($pickedStartupRepo)) {
+            Write-Info '[CANCELLED] Chua chon thu muc du an; da thoat Control Center.'
+            return 0
+        }
+        $RepoPath = $pickedStartupRepo
+    } else {
+        $RepoPath = Select-MandatoryProjectDirectory -InitialRepoPath $RepoPath
+    }
+    try { Set-Location -LiteralPath $RepoPath } catch {}
+    Write-Ok "Da khoa thu muc du an lam viec (Active Project CWD): $RepoPath"
+
     while ($true) {
         $activeCliMode = Get-CliPermissionModeInfo -ConfigPath (Join-Path $Lane2Home 'config.toml')
         $usage = Get-BoundedDirectoryUsage -DirPath $Lane2Home
@@ -3597,17 +3612,16 @@ function Invoke-InteractiveMenu {
         Write-Host "========================================================================" -ForegroundColor Cyan
         Write-Host "  CODEX DUAL-LANE CONTROL CENTER -- 1-Touch Sandbox 2 CLI (v1.5)" -ForegroundColor Cyan
         Write-Host "========================================================================" -ForegroundColor Cyan
+        Write-Host "  Du an dang chon (CWD) : $RepoPath" -ForegroundColor Cyan
         Write-Host "  GPT 1 (Codex Desktop) : $Lane1Home" -ForegroundColor Green
         Write-Host "  Sandbox 2 (Codex CLI) : $Lane2Home (ROM: $(Format-ByteSize $usage.TotalBytes))" -ForegroundColor Yellow
         Write-Host "  Sandbox 2 Mode        : $($activeCliMode.DisplayLabel)" -ForegroundColor $activeCliMode.Color
-        if (-not [string]::IsNullOrWhiteSpace($RepoPath)) {
-            Write-Host "  Active Project (-Repo): $RepoPath" -ForegroundColor Cyan
-        }
         if ($script:IsDryRun) {
             Write-Host "  [DRY-RUN MODE ACTIVE -- preview only, zero mutations]" -ForegroundColor Yellow
         }
         Write-Host "------------------------------------------------------------------------" -ForegroundColor DarkGray
-        Write-Host "  [00] CHON DU AN (BAT BUOC) & CHAY CODEX CLI NGAY (1 Cham) [Enter]" -ForegroundColor Green
+        Write-Host "  [00] CHAY CODEX CLI NGAY TAI DU AN TREN (1 Cham) [Enter]" -ForegroundColor Green
+        Write-Host "  [P]  DOI THU MUC DU AN KHAC (Switch Project Directory)" -ForegroundColor Cyan
         Write-Host "  [1]  Xac thuc API Key cho Sandbox 2 (Codex CLI)"
         Write-Host "       [1A] OpenAI / GPT chinh chu (nhap 1 API key -> codex login --with-api-key)"
         Write-Host "       [1B] Mo truc tiep Lane2\config.toml (chinh tay + khoa ACL)"
@@ -3618,11 +3632,11 @@ function Invoke-InteractiveMenu {
         Write-Host "  [5]  Dong bo Lich su Chat 2 chieu (GPT 1 <-> Sandbox 2)"
         Write-Host "  [6]  Xoa Sandbox 2 (Codex CLI) An toan -- KHONG xoa lich su chat GPT 1"
         Write-Host "  [7]  Chon che do quyen Sandbox 2 (Codex CLI): Xin yeu cau / Config / Toan quyen"
-        Write-Host "  [8]  Don dep & Toi uu Dung luong RAM / ROM (CleanupStorage)"
+        Write-Host "  [8]  Don dep & Toi uu Dung luong RAM / ROM (CleanupStorage -- giai phong ~800MB cache)" -ForegroundColor Yellow
         Write-Host "  [0]  Thoat (Exit)"
         Write-Host "------------------------------------------------------------------------" -ForegroundColor DarkGray
 
-        $choice = Read-Host 'Chon chuc nang (Enter/00=Chay ngay, 1C=Wizard API, 1A, 1B, 2..8, 0=Thoat)'
+        $choice = Read-Host 'Chon chuc nang (Enter/00=Chay ngay, P=Doi du an, 1C=Wizard API, 1A, 1B, 2..8, 0=Thoat)'
         if ($null -eq $choice) { break }
         $c = $choice.Trim().ToUpperInvariant()
         if ($c -eq '') { $c = '00' }
@@ -3630,6 +3644,14 @@ function Invoke-InteractiveMenu {
         switch ($c) {
             '00' { [void](Invoke-ActionLaunch) }
             'LAUNCH' { [void](Invoke-ActionLaunch) }
+            'P' {
+                $newProj = Select-MandatoryProjectDirectory -InitialRepoPath ''
+                if (-not [string]::IsNullOrWhiteSpace($newProj)) {
+                    $RepoPath = $newProj
+                    try { Set-Location -LiteralPath $RepoPath } catch {}
+                    Write-Ok "Da chuyen sang thu muc du an: $RepoPath"
+                }
+            }
             '1' {
                 Write-Host "    [A] OpenAI / GPT chinh chu (nhap 1 API key)" -ForegroundColor Cyan
                 Write-Host "    [B] Mo truc tiep Lane2\config.toml (Notepad)" -ForegroundColor Cyan

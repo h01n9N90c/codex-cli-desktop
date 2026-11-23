@@ -1613,7 +1613,7 @@ def compact_codex_home_storage(
         except (OSError, ValueError):
             continue
 
-    for prefix in ("state", "goals"):
+    for prefix in ("state", "goals", "logs", "thread_history"):
         db_file = find_latest_versioned_db(home_dir, prefix)
         if not db_file:
             continue
@@ -1636,16 +1636,88 @@ def compact_codex_home_storage(
         try:
             conn = connect_readwrite(db_file, timeout=1.0)
             _verify_sqlite_readable(conn)
+            tables = get_tables(conn)
+            did_prune_rows = False
+
+            # 1) Bounded log table rotation in logs_*.sqlite (keep newest 200 rows).
+            if prefix == "logs" and "logs" in tables:
+                cols = get_columns(conn, "logs") if "logs" in ALLOWED_TABLES else []
+                row_cnt = int(conn.execute('SELECT COUNT(*) FROM "logs"').fetchone()[0])
+                if row_cnt > 200:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        'DELETE FROM "logs" WHERE rowid NOT IN (SELECT rowid FROM "logs" ORDER BY rowid DESC LIMIT 200)'
+                    )
+                    conn.execute("COMMIT")
+                    did_prune_rows = True
+
+            # 2) Bounded projection-cache pruning in thread_history_*.sqlite when file exceeds 32 MiB:
+            #    preserves 100% of pinned threads + 25 most recently updated threads from state_*.sqlite
+            #    (real chat transcripts in sessions/*.jsonl and state_*.sqlite are NEVER touched).
+            if prefix == "thread_history" and before_sz > 32 * 1024 * 1024:
+                keep_thread_ids: set[str] = set()
+                st_file = find_latest_versioned_db(home_dir, "state")
+                if st_file:
+                    c_st: sqlite3.Connection | None = None
+                    try:
+                        c_st = connect_readonly(st_file, timeout=1.0)
+                        _, pinned_ids = _snapshot_state_threads(c_st)
+                        keep_thread_ids.update(pinned_ids)
+                        if "threads" in get_tables(c_st):
+                            st_cols = get_columns(c_st, "threads")
+                            order_col = next(
+                                (
+                                    c
+                                    for c in ("updated_at_ms", "updated_at", "created_at_ms", "created_at")
+                                    if c in st_cols
+                                ),
+                                "rowid",
+                            )
+                            q_order = quote_identifier(order_col) if order_col != "rowid" else "rowid"
+                            recent_rows = c_st.execute(
+                                f'SELECT "id" FROM "threads" ORDER BY {q_order} DESC LIMIT 25'
+                            ).fetchall()
+                            for r in recent_rows:
+                                if r and r[0]:
+                                    keep_thread_ids.add(str(r[0]))
+                    except sqlite3.Error:
+                        pass
+                    finally:
+                        if c_st is not None:
+                            c_st.close()
+
+                if keep_thread_ids and "thread_items" in tables:
+                    placeholders = ", ".join(["?"] * len(keep_thread_ids))
+                    keep_params = list(keep_thread_ids)
+                    conn.execute("BEGIN IMMEDIATE")
+                    for hist_tbl in (
+                        "thread_items",
+                        "thread_turns",
+                        "thread_history_projection_state",
+                        "thread_realtime_items",
+                    ):
+                        if hist_tbl in tables:
+                            conn.execute(
+                                f'DELETE FROM "{hist_tbl}" WHERE thread_id NOT IN ({placeholders})',
+                                keep_params,
+                            )
+                    conn.execute("COMMIT")
+                    did_prune_rows = True
+
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.execute("PRAGMA optimize")
             free_row = conn.execute("PRAGMA freelist_count").fetchone()
             free_pages = int(free_row[0]) if free_row and free_row[0] is not None else 0
-            if free_pages >= SQLITE_VACUUM_MIN_FREE_PAGES:
+            if did_prune_rows or free_pages >= SQLITE_VACUUM_MIN_FREE_PAGES:
                 conn.execute("VACUUM")
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             dbs_compacted += 1
         except sqlite3.Error:
-            pass
+            if conn is not None and conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
         finally:
             if conn is not None:
                 conn.close()
@@ -1659,6 +1731,44 @@ def compact_codex_home_storage(
                     pass
         if before_sz > after_sz:
             bytes_reclaimed += before_sz - after_sz
+
+    # 3) Clean non-reparse temporary staging directories (.tmp / tmp) inside home_dir.
+    for tmp_dir_name in (".tmp", "tmp"):
+        tdir = Path(home_dir) / tmp_dir_name
+        if not tdir.exists() or _is_reparse_or_symlink(tdir) or not tdir.is_dir():
+            continue
+        try:
+            ensure_contained_path(home_dir, tdir, reject_symlinks=True)
+        except ValueError:
+            continue
+        for root, dirs, files in os.walk(tdir, topdown=False):
+            root_path = Path(root)
+            if _is_reparse_or_symlink(root_path):
+                continue
+            for fname in files:
+                if fname.endswith(".lock"):
+                    continue
+                fpath = root_path / fname
+                if _is_reparse_or_symlink(fpath):
+                    continue
+                try:
+                    ensure_contained_path(home_dir, fpath, reject_symlinks=True)
+                    sz = fpath.stat().st_size
+                    if not dry_run:
+                        fpath.unlink()
+                    tmp_pruned += 1
+                    bytes_reclaimed += sz
+                except (OSError, ValueError):
+                    continue
+            for dname in dirs:
+                dpath = root_path / dname
+                if _is_reparse_or_symlink(dpath):
+                    continue
+                if not dry_run:
+                    try:
+                        dpath.rmdir()
+                    except OSError:
+                        pass
 
     return {
         "backups_pruned": backups_pruned,
