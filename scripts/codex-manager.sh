@@ -2082,6 +2082,301 @@ EOF
   esac
 }
 
+# [8] RAM / ROM Storage Compaction & Backup Rotation
+select_mandatory_project_dir() {
+  local initial="${1:-}"
+  if [ -n "${initial}" ]; then
+    if [ -L "${initial}" ]; then
+      echo "[FAIL] Security refusal: Project path '${initial}' must not be a symlink." >&2
+      return 1
+    fi
+    if [ ! -d "${initial}" ]; then
+      echo "[FAIL] Project directory does not exist: '${initial}'." >&2
+      return 1
+    fi
+    (cd -P -- "${initial}" && pwd -P)
+    return 0
+  fi
+
+  if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+    echo "[FAIL] Mandatory project directory is required in --non-interactive mode: pass --repo-path <dir>." >&2
+    return 1
+  fi
+
+  local cwd_p=""
+  cwd_p="$(pwd -P 2>/dev/null || pwd)"
+  while true; do
+    echo "" >&2
+    echo "=== BUOC BAT BUOC: CHON THU MUC DU AN (PROJECT DIRECTORY) ===" >&2
+    echo "  [1] ${cwd_p} (Thu muc hien tai)" >&2
+    echo "  [N] Nhap duong dan thu muc du an moi" >&2
+    echo "  [0] Huy (Cancel)" >&2
+    local pick=""
+    printf 'Chon du an [Enter=1 / N / duong dan / 0]: ' >&2
+    IFS= read -r pick || return 1
+    pick="${pick%$'\r'}"
+    case "${pick}" in
+      ""|1)
+        if [ -L "${cwd_p}" ] || [ ! -d "${cwd_p}" ]; then
+          echo "[WARN] Thu muc hien tai khong hop le." >&2
+          continue
+        fi
+        printf '%s\n' "${cwd_p}"
+        return 0
+        ;;
+      0|q|quit|cancel)
+        return 1
+        ;;
+      n|N)
+        printf 'Nhap duong dan thu muc du an: ' >&2
+        IFS= read -r pick || return 1
+        pick="${pick%$'\r'}"
+        ;;
+    esac
+    if [ -n "${pick}" ] && [ ! -L "${pick}" ] && [ -d "${pick}" ]; then
+      (cd -P -- "${pick}" && pwd -P)
+      return 0
+    fi
+    echo "[WARN] Thu muc khong ton tai hoac la symlink: '${pick}'" >&2
+  done
+}
+
+action_cleanup_storage() {
+  echo "=== [8] Quan Ly & Toi Uu Dung Luong RAM / ROM (cleanup-storage) ==="
+  [ "${DRY_RUN}" -eq 1 ] && echo "[DRY-RUN MODE] Inspecting storage without mutating disk."
+
+  if [ -n "${PY_BIN}" ] && [ -f "${KIT_ROOT}/scripts/sync-sessions.py" ] && [ -d "${LANE1_HOME}" ] && [ -d "${LANE2_HOME}" ]; then
+    local c_args=("${KIT_ROOT}/scripts/sync-sessions.py" --source "${LANE1_HOME}" --target "${LANE2_HOME}" --compact-storage --max-backups "${MAX_BACKUPS}")
+    [ "${DRY_RUN}" -eq 1 ] && c_args+=(--dry-run)
+    "${PY_BIN}" -B "${c_args[@]}" >/dev/null 2>&1 || true
+  fi
+
+  if [ -d "${LANE2_HOME}/.sandbox" ] && [ ! -L "${LANE2_HOME}/.sandbox" ] && [ "${DRY_RUN}" -eq 0 ]; then
+    find "${LANE2_HOME}/.sandbox" -maxdepth 1 -type f \( -name '*.tmp' -o -size +5M \) -exec rm -f -- {} + 2>/dev/null || true
+  fi
+  echo "[OK] Storage compaction & backup rotation completed (max_backups=${MAX_BACKUPS})."
+  return 0
+}
+
+action_quick_third_party() {
+  echo "=== [1c] Wizard 1 Cham: Cau Hinh API Ben Thu 3 (Tu Dong A-Z, Khong Mo Editor) ==="
+  [ "${DRY_RUN}" -eq 1 ] && echo "[DRY-RUN MODE] No files on disk will be modified."
+
+  local chosen_repo=""
+  if ! chosen_repo="$(select_mandatory_project_dir "${REPO_PATH}")"; then
+    return 1
+  fi
+  echo "  Project Directory : ${chosen_repo}"
+
+  local eff_url="${GATEWAY_BASE_URL}"
+  if [ -z "${eff_url}" ] && [ "${NON_INTERACTIVE}" -eq 0 ]; then
+    printf '1/3. Nhap Base URL cong API (vd: https://api.xingchiapi.com/v1): ' >&2
+    IFS= read -r eff_url || true
+    eff_url="${eff_url%$'\r'}"
+  fi
+  eff_url="${eff_url%/}"
+  case "${eff_url}" in
+    https://*|http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;;
+    *)
+      echo "[FAIL] Invalid --base-url '${eff_url}'. Must start with https:// (or loopback http:// for local tests)." >&2
+      return 1
+      ;;
+  esac
+
+  local eff_model="${GATEWAY_MODEL}"
+  if [ -z "${eff_model}" ] && [ "${NON_INTERACTIVE}" -eq 0 ]; then
+    printf '2/3. Nhap ten Model [Enter = gpt-5.4]: ' >&2
+    IFS= read -r eff_model || true
+    eff_model="${eff_model%$'\r'}"
+  fi
+  [ -z "${eff_model}" ] && eff_model="gpt-5.4"
+
+  local eff_effort="${REASONING_EFFORT:-high}"
+  local eff_prov="${PROVIDER_NAME:-custom_gw}"
+  if [ "$(to_lower "${eff_prov}")" = "openai" ]; then
+    eff_prov="custom_gw"
+  fi
+  local eff_env="${ENV_KEY_NAME:-CODEX_CLI_API_KEY}"
+
+  local api_key=""
+  if [ "${API_KEY_FROM_STDIN}" -eq 1 ]; then
+    IFS= read -r api_key || true
+    api_key="${api_key#$'\xef\xbb\xbf'}"
+    api_key="${api_key%$'\r'}"
+  elif [ "${NON_INTERACTIVE}" -eq 0 ] && [ "${DRY_RUN}" -eq 0 ]; then
+    printf '3/3. Dan API Key ben thu 3 (an ky tu): ' >&2
+    IFS= read -r -s api_key || true
+    printf '\n' >&2
+    api_key="${api_key%$'\r'}"
+  elif [ "${DRY_RUN}" -eq 0 ]; then
+    echo "[FAIL] --action quick-third-party in --non-interactive mode requires --api-key-from-stdin." >&2
+    return 1
+  fi
+
+  api_key="$(printf '%s' "${api_key}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    if [ "${#api_key}" -lt 8 ] || printf '%s' "${api_key}" | grep -q '[[:space:]]'; then
+      echo "[FAIL] Invalid API key (must be >= 8 chars with no whitespace)." >&2
+      api_key=""
+      return 1
+    fi
+  fi
+
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    echo "  [DRY-RUN] Would configure provider=${eff_prov}, base_url=${eff_url}, model=${eff_model} (${eff_effort}), env_key=${eff_env}, remove stale Lane2/auth.json, and lock 0600."
+    api_key=""
+    return 0
+  fi
+
+  mkdir -p -- "${LANE2_HOME}"
+  chmod 700 "${LANE2_HOME}" 2>/dev/null || true
+  export "${eff_env}=${api_key}"
+  api_key=""
+
+  if [ -f "${LANE2_HOME}/auth.json" ] && [ ! -L "${LANE2_HOME}/auth.json" ]; then
+    backup_file_0600 "${LANE2_HOME}/auth.json"
+    rm -f -- "${LANE2_HOME}/auth.json"
+    echo "  Removed stale Sandbox 2 auth.json (backed up) to prevent ChatGPT OAuth quota collision."
+  fi
+
+  local cfg2="${LANE2_HOME}/config.toml"
+  [ -f "${cfg2}" ] && backup_file_0600 "${cfg2}"
+
+  "${PY_BIN}" -B - "${cfg2}" "${eff_prov}" "${eff_url}" "${eff_env}" "${eff_model}" "${eff_effort}" <<'PY'
+import os, re, sys
+cfg_path, prov, base_url, env_key, model_id, effort = sys.argv[1:7]
+raw = open(cfg_path, "r", encoding="utf-8").read() if os.path.isfile(cfg_path) else ""
+lines = raw.splitlines()
+top, sections, cur_h, cur_b = [], [], "", []
+for ln in lines:
+    m = re.match(r"^\s*\[([^\[\]]+)\]\s*$", ln)
+    if m:
+        if cur_h:
+            sections.append((cur_h, cur_b))
+        cur_h, cur_b = m.group(1).strip(), []
+    elif not cur_h:
+        top.append(ln)
+    else:
+        cur_b.append(ln)
+if cur_h:
+    sections.append((cur_h, cur_b))
+
+out = [
+    f'model_provider = "{prov}"',
+    f'model = "{model_id}"',
+    f'model_reasoning_effort = "{effort}"',
+]
+has_sb = any(re.match(r'^\s*sandbox_mode\s*=', l) for l in top)
+has_ap = any(re.match(r'^\s*approval_policy\s*=', l) for l in top)
+if not has_sb:
+    out.append('sandbox_mode = "workspace-write"')
+if not has_ap:
+    out.append('approval_policy = "on-request"')
+for l in top:
+    if re.match(r'^\s*(model_provider|model|model_reasoning_effort)\s*=', l):
+        continue
+    out.append(l)
+out.append("")
+
+wrote_prov = False
+wrote_feat = False
+cat_url = base_url.rstrip("/") + "/models"
+for h, b in sections:
+    if h.lower() == f"model_providers.{prov.lower()}":
+        out.extend([
+            f"[model_providers.{prov}]",
+            f'name = "{prov}"',
+            f'base_url = "{base_url}"',
+            f'model_catalog_url = "{cat_url}"',
+            'wire_api = "responses"',
+            "requires_openai_auth = false",
+            f'env_key = "{env_key}"',
+            "",
+        ])
+        wrote_prov = True
+    elif h.lower() == "features":
+        out.append("[features]")
+        out.append("daemon_auto_start = false")
+        for bl in b:
+            if not re.match(r"^\s*daemon_auto_start\s*=", bl):
+                out.append(bl)
+        if not any(re.match(r"^\s*api_key_model_discovery\s*=", bl) for bl in b):
+            out.append("api_key_model_discovery = true")
+        if not any(re.match(r"^\s*goals\s*=", bl) for bl in b):
+            out.append("goals = true")
+        out.append("")
+        wrote_feat = True
+    else:
+        out.append(f"[{h}]")
+        out.extend(b)
+        out.append("")
+
+if not wrote_prov:
+    out.extend([
+        f"[model_providers.{prov}]",
+        f'name = "{prov}"',
+        f'base_url = "{base_url}"',
+        f'model_catalog_url = "{cat_url}"',
+        'wire_api = "responses"',
+        "requires_openai_auth = false",
+        f'env_key = "{env_key}"',
+        "",
+    ])
+if not wrote_feat:
+    out.extend([
+        "[features]",
+        "daemon_auto_start = false",
+        "api_key_model_discovery = true",
+        "goals = true",
+        "memories = true",
+        "",
+    ])
+
+tmp = cfg_path + ".tmp"
+with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+    f.write("\n".join(out).rstrip() + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, cfg_path)
+PY
+
+  validate_toml_file "${cfg2}"
+  lock_file_0600 "${cfg2}"
+  run_bidirectional_sync 0
+  action_cleanup_storage >/dev/null 2>&1 || true
+  echo "[OK] Quick 3rd-party gateway configured cleanly for Sandbox 2 (provider=${eff_prov}, model=${eff_model})."
+}
+
+action_launch() {
+  echo "=== [00] Chon Du An (Bat Buoc) & Khoi Chay Codex CLI (Sandbox 2) ==="
+  local chosen_repo=""
+  if ! chosen_repo="$(select_mandatory_project_dir "${REPO_PATH}")"; then
+    return 1
+  fi
+  echo "  Project Directory : ${chosen_repo}"
+
+  local safe_jobs=2
+  export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-${safe_jobs}}"
+
+  if [ ! -x "${LOCAL_BIN}/codex" ] || [ ! -f "${LANE2_HOME}/config.toml" ]; then
+    if [ -f "${KIT_ROOT}/scripts/setup-dual-lane.sh" ]; then
+      local s_args=(--repo "${chosen_repo}")
+      [ -n "${CODEX_PATH}" ] && s_args+=(--codex-path "${CODEX_PATH}")
+      [ "${DRY_RUN}" -eq 1 ] && s_args+=(--dry-run)
+      CODEX_LANE1_HOME="${LANE1_HOME}" CODEX_LANE2_HOME="${LANE2_HOME}" CODEX_LOCAL_BIN="${LOCAL_BIN}" \
+        bash "${KIT_ROOT}/scripts/setup-dual-lane.sh" "${s_args[@]}"
+    fi
+  fi
+
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    echo "[OK] [DRY-RUN] Would cd to '${chosen_repo}' (CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}) and launch '${LOCAL_BIN}/codex'."
+    return 0
+  fi
+
+  action_cleanup_storage >/dev/null 2>&1 || true
+  cd -P -- "${chosen_repo}"
+  exec "${LOCAL_BIN}/codex"
+}
+
 # Interactive Menu
 action_menu() {
   if [ "${NON_INTERACTIVE}" -eq 1 ]; then
@@ -2194,12 +2489,54 @@ DRY_RUN=0
 FORCE=0
 NON_INTERACTIVE=0
 API_KEY_FROM_STDIN=0
+REPO_PATH=""
+GATEWAY_BASE_URL=""
+GATEWAY_MODEL=""
+REASONING_EFFORT="high"
+PROVIDER_NAME="custom_gw"
+ENV_KEY_NAME="CODEX_CLI_API_KEY"
+MAX_BACKUPS=5
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --action)
       require_arg "$1" "$#"
       ACTION="$2"
+      shift 2
+      ;;
+    --repo-path|--repo)
+      require_arg "$1" "$#"
+      REPO_PATH="$2"
+      shift 2
+      ;;
+    --base-url)
+      require_arg "$1" "$#"
+      GATEWAY_BASE_URL="$2"
+      shift 2
+      ;;
+    --model)
+      require_arg "$1" "$#"
+      GATEWAY_MODEL="$2"
+      shift 2
+      ;;
+    --reasoning-effort)
+      require_arg "$1" "$#"
+      REASONING_EFFORT="$2"
+      shift 2
+      ;;
+    --provider-name)
+      require_arg "$1" "$#"
+      PROVIDER_NAME="$2"
+      shift 2
+      ;;
+    --env-key)
+      require_arg "$1" "$#"
+      ENV_KEY_NAME="$2"
+      shift 2
+      ;;
+    --max-backups)
+      require_arg "$1" "$#"
+      MAX_BACKUPS="$2"
       shift 2
       ;;
     --lane1-home|--lane1)
@@ -2345,8 +2682,17 @@ case "${ACTION_LOWER}" in
   set-cli-mode|setclimode)
     action_set_cli_mode
     ;;
+  quick-third-party|quickthirdparty)
+    action_quick_third_party
+    ;;
+  launch)
+    action_launch
+    ;;
+  cleanup-storage|cleanupstorage)
+    action_cleanup_storage
+    ;;
   *)
-    echo "[FAIL] Unknown --action '${ACTION}'. Allowed: menu, api-gpt, api-other, login, check-api-key, check-accounts, sync-history, remove-sandbox2, set-cli-mode." >&2
+    echo "[FAIL] Unknown --action '${ACTION}'. Allowed: menu, api-gpt, api-other, quick-third-party, login, check-api-key, check-accounts, sync-history, remove-sandbox2, set-cli-mode, launch, cleanup-storage." >&2
     exit 1
     ;;
 esac

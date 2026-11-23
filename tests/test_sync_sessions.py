@@ -1851,6 +1851,50 @@ class TestSyncSessionsSafetyAndUpsert(unittest.TestCase):
         self.assertIn("state_db=N/A(FAILED:", out_corrupt.getvalue())
         self.assertEqual(os.listdir(empty_target), [])
 
+    def test_storage_compaction_and_bounded_jsonl_line_reader_prevent_ram_and_rom_bloat(self) -> None:
+        """
+        WHAT: Verifies `compact_codex_home_storage` (and `--compact-storage`) rotates
+              excess `.sync-backup-*`, `config.toml.backup-*`, and `auth.json.backup-*`
+              files, removes leftover `.*.tmp` staging files, checkpoints/truncates
+              SQLite WAL sidecars, and `_iter_bounded_lines` skips oversized >1 MiB
+              corrupt JSONL lines without spiking RAM.
+        PREVENTS: Unbounded disk (ROM) growth from backups/WALs and RAM exhaustion from
+                  malformed single-line multi-megabyte `session_index.jsonl` files.
+        """
+        # 1) Create 6 config backups, 6 auth backups, and 2 stale .tmp files in lane2.
+        for idx in range(6):
+            for base_name in ("config.toml", "auth.json"):
+                bpath = Path(self.lane2, f"{base_name}.backup-20261123-12000{idx}")
+                bpath.write_text(f"backup-{idx}\n", encoding="utf-8")
+                ts_ns = (1700001000 + idx * 10) * 1_000_000_000
+                os.utime(bpath, ns=(ts_ns, ts_ns))
+        Path(self.lane2, ".config.toml.stale1.tmp").write_text("stale", encoding="utf-8")
+        Path(self.lane2, ".state_5.sqlite.stale2.tmp").write_text("stale", encoding="utf-8")
+
+        compact_stats = sync_mod.compact_codex_home_storage(self.lane2, max_backups=3, dry_run=False)
+        self.assertEqual(compact_stats["backups_pruned"], 6)
+        self.assertEqual(compact_stats["tmp_pruned"], 2)
+        self.assertGreaterEqual(compact_stats["dbs_compacted"], 1)
+        self.assertEqual(len(list(Path(self.lane2).glob("config.toml.backup-*"))), 3)
+        self.assertEqual(len(list(Path(self.lane2).glob("auth.json.backup-*"))), 3)
+        self.assertEqual(len(list(Path(self.lane2).glob(".*.tmp"))), 0)
+
+        # 2) Verify `_iter_bounded_lines` skips an oversized line without failing valid lines around it.
+        idx1 = Path(self.lane1, "session_index.jsonl")
+        oversized = "X" * 4096
+        idx1.write_text(
+            json.dumps({"id": "t-pinned-1", "thread_name": "Valid Before"})
+            + "\n"
+            + oversized
+            + "\n"
+            + json.dumps({"id": "t-unpinned-2", "thread_name": "Valid After"})
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        lines = list(sync_mod._iter_bounded_lines(idx1, max_chars=512))
+        self.assertEqual(len(lines), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

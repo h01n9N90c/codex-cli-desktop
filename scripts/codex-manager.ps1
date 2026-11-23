@@ -134,11 +134,21 @@
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'None')]
 param(
-    [ValidateSet('Menu', 'ApiGpt', 'ApiOther', 'Login', 'CheckApiKey', 'CheckAccounts', 'SyncHistory', 'RemoveSandbox2', 'SetCliMode')]
+    [ValidateSet('Menu', 'ApiGpt', 'ApiOther', 'QuickThirdParty', 'Login', 'CheckApiKey', 'CheckAccounts', 'SyncHistory', 'RemoveSandbox2', 'SetCliMode', 'Launch', 'CleanupStorage')]
     [string]$Action = 'Menu',
     [ValidateSet('', 'Ask', 'Config', 'FullAccess')]
     [string]$CliMode = '',
     [switch]$ConfirmFullAccess,
+    [string]$RepoPath = '',
+    [string]$BaseUrl = '',
+    [string]$Model = '',
+    [ValidateSet('', 'low', 'medium', 'high', 'xhigh')]
+    [string]$ReasoningEffort = '',
+    [string]$ProviderName = '',
+    [string]$EnvKeyName = 'CODEX_CLI_API_KEY',
+    [switch]$SkipUserEnvPersist,
+    [ValidateRange(0, 100)]
+    [int]$MaxBackups = 5,
     [string]$Lane1Home = $(if (-not [string]::IsNullOrWhiteSpace($env:CODEX_LANE1_HOME)) { $env:CODEX_LANE1_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$Lane2Home = $(if (-not [string]::IsNullOrWhiteSpace($env:CODEX_LANE2_HOME)) { $env:CODEX_LANE2_HOME } else { Join-Path $env:USERPROFILE '.codex-official' }),
     [string]$LocalBin  = $(if (-not [string]::IsNullOrWhiteSpace($env:CODEX_LOCAL_BIN))  { $env:CODEX_LOCAL_BIN }  else { Join-Path $env:USERPROFILE '.local\bin' }),
@@ -550,6 +560,48 @@ function Get-FileAclStatus([string]$FilePath) {
     }
 }
 
+function Get-ProtectedRollbackBackupNames([string]$ParentDir) {
+    $protected = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if ([string]::IsNullOrWhiteSpace($ParentDir)) { return $protected }
+    $rbDir = Join-Path $ParentDir '.rollback'
+    foreach ($mf in @((Join-Path $rbDir 'latest.json'), (Join-Path $rbDir 'manifest.env'))) {
+        if ((Test-Path -LiteralPath $mf -PathType Leaf) -and (-not (Test-IsReparsePoint $mf))) {
+            $raw = [string](Get-Content -LiteralPath $mf -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+            foreach ($m in [regex]::Matches($raw, '[A-Za-z0-9_.-]+\.(?:backup|pre)-[0-9]{8}-[0-9]{6}(?:-[0-9]+)?')) {
+                [void]$protected.Add($m.Value)
+            }
+        }
+    }
+    return $protected
+}
+
+function Rotate-FileBackups([string]$BaseFilePath, [int]$MaxKeep = 5) {
+    if ($MaxKeep -le 0 -or $script:IsDryRun) { return 0 }
+    $parent = [System.IO.Path]::GetDirectoryName($BaseFilePath)
+    $leaf   = [System.IO.Path]::GetFileName($BaseFilePath)
+    if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path -LiteralPath $parent -PathType Container)) { return 0 }
+    $protectedNames = Get-ProtectedRollbackBackupNames -ParentDir $parent
+    $candidates = @(
+        Get-ChildItem -LiteralPath $parent -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            (-not (Test-IsReparsePoint $_.FullName)) -and
+            (-not $protectedNames.Contains($_.Name)) -and
+            ($_.Name.StartsWith("$leaf.backup-", [System.StringComparison]::OrdinalIgnoreCase) -or
+             $_.Name.StartsWith("$leaf.pre-", [System.StringComparison]::OrdinalIgnoreCase))
+        } |
+        Sort-Object LastWriteTimeUtc, Name -Descending
+    )
+    if ($candidates.Count -le $MaxKeep) { return 0 }
+    $pruned = 0
+    for ($i = $MaxKeep; $i -lt $candidates.Count; $i++) {
+        try {
+            Remove-Item -LiteralPath $candidates[$i].FullName -Force -ErrorAction Stop
+            $pruned++
+        } catch {}
+    }
+    return $pruned
+}
+
 function New-TimestampedBackup([string]$FilePath) {
     if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) { return '' }
     $full = Resolve-CanonicalLongPath -PathValue $FilePath
@@ -564,6 +616,7 @@ function New-TimestampedBackup([string]$FilePath) {
     if (-not $script:IsDryRun) {
         Copy-Item -LiteralPath $full -Destination $candidate -Force
         Protect-SensitiveFileAcl $candidate
+        [void](Rotate-FileBackups -BaseFilePath $full -MaxKeep $MaxBackups)
     }
     return $candidate
 }
@@ -2921,6 +2974,614 @@ function Invoke-ActionSetCliMode {
 }
 
 # ============================================================================
+# Action 8 / 9 / 10: Mandatory Project Picker, 1-Touch 3rd-Party Wizard,
+#                    One-Touch Launch & RAM/ROM Storage Management (v1.5)
+# ============================================================================
+
+function Get-BoundedDirectoryUsage([string]$DirPath, [int]$MaxFileScan = 5000) {
+    <#
+    .SYNOPSIS
+        Calculates local non-reparse disk usage of a directory in O(1) streaming RAM,
+        never traversing NTFS Junctions/symlinks into GPT 1 and capping file scan count.
+    #>
+    $result = [PSCustomObject]@{
+        TotalBytes  = [int64]0
+        BackupBytes = [int64]0
+        SqliteBytes = [int64]0
+        FileCount   = 0
+        Truncated   = $false
+    }
+    if ([string]::IsNullOrWhiteSpace($DirPath) -or -not (Test-Path -LiteralPath $DirPath -PathType Container)) {
+        return $result
+    }
+    if (Test-IsReparsePoint $DirPath) { return $result }
+
+    $stack = New-Object 'System.Collections.Generic.Stack[string]'
+    $stack.Push($DirPath)
+    while ($stack.Count -gt 0) {
+        $cur = $stack.Pop()
+        foreach ($entry in @(Get-ChildItem -LiteralPath $cur -Force -ErrorAction SilentlyContinue)) {
+            if (Test-IsReparsePoint $entry.FullName) { continue }
+            if ($entry.PSIsContainer) {
+                $stack.Push($entry.FullName)
+            } else {
+                $result.FileCount++
+                $len = [int64]$entry.Length
+                $result.TotalBytes += $len
+                if ($entry.Name -match '\.(sync-backup-|backup-|pre-)') {
+                    $result.BackupBytes += $len
+                } elseif ($entry.Name -match '\.sqlite(-wal|-shm|-journal)?$') {
+                    $result.SqliteBytes += $len
+                }
+                if ($result.FileCount -ge $MaxFileScan) {
+                    $result.Truncated = $true
+                    return $result
+                }
+            }
+        }
+    }
+    return $result
+}
+
+function Format-ByteSize([int64]$Bytes) {
+    if ($Bytes -ge 1048576) {
+        return ('{0:N2} MiB' -f ($Bytes / 1048576.0))
+    } elseif ($Bytes -ge 1024) {
+        return ('{0:N1} KiB' -f ($Bytes / 1024.0))
+    }
+    return "$Bytes B"
+}
+
+function Get-DiscoveredProjects {
+    <#
+    .SYNOPSIS
+        Extracts known [projects."..."] paths and trust_level values from Lane 2 and Lane 1
+        config.toml without auto-promoting trust, plus current working directory if valid.
+    #>
+    $projects = New-Object 'System.Collections.Generic.List[object]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    $cwdPath = ''
+    try { $cwdPath = (Get-Location -PSProvider FileSystem).ProviderPath } catch {}
+    if (-not [string]::IsNullOrWhiteSpace($cwdPath) -and (Test-Path -LiteralPath $cwdPath -PathType Container)) {
+        $canonCwd = Resolve-CanonicalLongPath -PathValue $cwdPath
+        if (-not [string]::IsNullOrWhiteSpace($canonCwd) -and $seen.Add($canonCwd)) {
+            $projects.Add([PSCustomObject]@{
+                Path       = $canonCwd
+                TrustLevel = 'current-cwd'
+                Source     = 'Current Directory ($PWD)'
+                Exists     = $true
+            })
+        }
+    }
+
+    foreach ($srcInfo in @(
+        @{ Label = 'Sandbox 2'; Path = (Join-Path $Lane2Home 'config.toml') },
+        @{ Label = 'GPT 1';     Path = (Join-Path $Lane1Home 'config.toml') }
+    )) {
+        $cfgFile = $srcInfo.Path
+        if (-not (Test-Path -LiteralPath $cfgFile -PathType Leaf) -or (Test-IsReparsePoint $cfgFile)) { continue }
+        $raw = [string](Get-Content -LiteralPath $cfgFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+
+        $curProjPath = ''
+        $curTrust = 'unset'
+        foreach ($line in ($raw -split "\r?\n")) {
+            $clean = (Remove-TomlInlineComment $line).Trim()
+            if ([string]::IsNullOrWhiteSpace($clean)) { continue }
+            if ($clean -match '^\[(.+)\]$') {
+                if (-not [string]::IsNullOrWhiteSpace($curProjPath)) {
+                    $ex = Test-Path -LiteralPath $curProjPath -PathType Container
+                    $canonP = if ($ex) { Resolve-CanonicalLongPath -PathValue $curProjPath } else { $curProjPath }
+                    if ($seen.Add($canonP)) {
+                        $projects.Add([PSCustomObject]@{
+                            Path       = $canonP
+                            TrustLevel = $curTrust
+                            Source     = $srcInfo.Label
+                            Exists     = $ex
+                        })
+                    }
+                }
+                $hdr = $Matches[1].Trim()
+                $pm = [regex]::Match($hdr, '^projects\s*\.\s*(?:"((?:[^"\\]|\\.)+)"|''([^'']+)'')\s*$')
+                if ($pm.Success) {
+                    $curProjPath = if ($pm.Groups[1].Success) { Unescape-TomlBasicString $pm.Groups[1].Value } else { $pm.Groups[2].Value }
+                    $curTrust = 'unset'
+                } else {
+                    $curProjPath = ''
+                }
+                continue
+            }
+            if (-not [string]::IsNullOrWhiteSpace($curProjPath) -and $clean -match '^trust_level\s*=\s*(.+)$') {
+                $tl = Parse-TomlQuotedString $Matches[1]
+                if (-not [string]::IsNullOrWhiteSpace($tl)) { $curTrust = $tl }
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($curProjPath)) {
+            $ex = Test-Path -LiteralPath $curProjPath -PathType Container
+            $canonP = if ($ex) { Resolve-CanonicalLongPath -PathValue $curProjPath } else { $curProjPath }
+            if ($seen.Add($canonP)) {
+                $projects.Add([PSCustomObject]@{
+                    Path       = $canonP
+                    TrustLevel = $curTrust
+                    Source     = $srcInfo.Label
+                    Exists     = $ex
+                })
+            }
+        }
+    }
+    return @($projects.ToArray())
+}
+
+function Select-MandatoryProjectDirectory([AllowEmptyString()][string]$InitialRepoPath = '') {
+    <#
+    .SYNOPSIS
+        Enforces mandatory project directory selection & validation (must exist on disk,
+        must be a directory, and must not be a symlink/reparse escape).
+    #>
+    if (-not [string]::IsNullOrWhiteSpace($InitialRepoPath)) {
+        $cand = Resolve-CanonicalLongPath -PathValue $InitialRepoPath
+        Assert-NoControlChars -Value $cand -ParamName 'RepoPath'
+        if (-not (Test-Path -LiteralPath $cand -PathType Container)) {
+            throw "Project directory does not exist: '$cand'. Please provide a valid existing project directory via -RepoPath."
+        }
+        Assert-NotReparsePoint -PathValue $cand -Label '-RepoPath'
+        return $cand
+    }
+
+    if ($NonInteractive) {
+        throw 'Mandatory project directory is required in -NonInteractive mode: pass -RepoPath <project-directory>.'
+    }
+
+    $discovered = @(Get-DiscoveredProjects | Where-Object { $_.Exists })
+    while ($true) {
+        Write-Host ""
+        Write-Host "  === BUOC BAT BUOC: CHON THU MUC DU AN (PROJECT DIRECTORY) ===" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $discovered.Count; $i++) {
+            $p = $discovered[$i]
+            Write-Host ("    [{0}] {1}  (trust={2}, from={3})" -f ($i + 1), $p.Path, $p.TrustLevel, $p.Source) -ForegroundColor White
+        }
+        Write-Host "    [N] Nhap duong dan thu muc du an moi (vd: D:\my-project)" -ForegroundColor Yellow
+        Write-Host "    [0] Huy (Cancel)" -ForegroundColor DarkGray
+        $defaultHint = if ($discovered.Count -ge 1) { ' [Enter = 1]' } else { '' }
+        $pick = Read-Host ("Chon so thu tu du an hoac go truc tiep duong dan$defaultHint")
+        if ($null -eq $pick) { return '' }
+        $trimmed = $pick.Trim().Trim('"').Trim("'")
+        if ($trimmed -eq '0' -or $trimmed -match '^(q|quit|cancel)$') {
+            return ''
+        }
+        if ([string]::IsNullOrWhiteSpace($trimmed) -and $discovered.Count -ge 1) {
+            $chosen = $discovered[0].Path
+            Assert-NotReparsePoint -PathValue $chosen -Label 'Selected project directory'
+            return $chosen
+        }
+        if ($trimmed -match '^\d+$') {
+            $idx = [int]$trimmed
+            if ($idx -ge 1 -and $idx -le $discovered.Count) {
+                $chosen = $discovered[$idx - 1].Path
+                Assert-NotReparsePoint -PathValue $chosen -Label 'Selected project directory'
+                return $chosen
+            }
+            Write-WarnLine "So thu tu khong hop le: $trimmed"
+            continue
+        }
+        if ($trimmed -ieq 'N') {
+            $manual = Read-Host 'Nhap duong dan day du toi thu muc du an (vd: D:\my-project)'
+            if ([string]::IsNullOrWhiteSpace($manual)) { continue }
+            $trimmed = $manual.Trim().Trim('"').Trim("'")
+        }
+        try {
+            $cand = Resolve-CanonicalLongPath -PathValue $trimmed
+            if (-not (Test-Path -LiteralPath $cand -PathType Container)) {
+                Write-WarnLine "Thu muc khong ton tai: '$cand'. Vui long chon thu muc co that tren dia."
+                continue
+            }
+            Assert-NotReparsePoint -PathValue $cand -Label 'Selected project directory'
+            return $cand
+        } catch {
+            Write-WarnLine "Duong dan khong hop le: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Upsert-ThirdPartyGatewayInToml {
+    <#
+    .SYNOPSIS
+        Non-destructively configures top-level model_provider, model, model_reasoning_effort,
+        [model_providers.<ProviderName>], and [features] daemon_auto_start = false in Lane2\config.toml
+        while preserving 100% of existing [projects.*] trust levels, [mcp_servers.*], and [tui].
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$Provider,
+        [Parameter(Mandatory = $true)][string]$GatewayUrl,
+        [Parameter(Mandatory = $true)][string]$EnvKey,
+        [AllowEmptyString()][string]$ModelId = '',
+        [AllowEmptyString()][string]$Effort = ''
+    )
+    Assert-NotReparsePoint -PathValue $ConfigPath -Label 'Lane 2 config.toml'
+    $raw = if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
+        [string](Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+    } else { '' }
+
+    $lines = if ([string]::IsNullOrEmpty($raw)) { @() } else { @($raw -split "\r?\n") }
+    $topLines = New-Object 'System.Collections.Generic.List[string]'
+    $secBlocks = New-Object 'System.Collections.Generic.List[object]'
+    $curHdr = ''
+    $curBody = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($line in $lines) {
+        $clean = (Remove-TomlInlineComment $line).Trim()
+        if ($clean -match '^\[(.+)\]$' -and $clean -notmatch '^\[\[') {
+            if ($curHdr -ne '') {
+                $secBlocks.Add([PSCustomObject]@{ Header = $curHdr; Lines = @($curBody.ToArray()) })
+                $curBody.Clear()
+            }
+            $curHdr = $Matches[1].Trim()
+            continue
+        }
+        if ($curHdr -eq '') {
+            $topLines.Add($line)
+        } else {
+            $curBody.Add($line)
+        }
+    }
+    if ($curHdr -ne '') {
+        $secBlocks.Add([PSCustomObject]@{ Header = $curHdr; Lines = @($curBody.ToArray()) })
+    }
+
+    # Filter out old top-level model_provider / model / model_reasoning_effort to replace cleanly at top
+    $filteredTop = New-Object 'System.Collections.Generic.List[string]'
+    $hasSandbox = $false
+    $hasApproval = $false
+    foreach ($tl in $topLines) {
+        $tc = (Remove-TomlInlineComment $tl).Trim()
+        if ($tc -match '^(?:"?model_provider"?|''model_provider'')\s*=') { continue }
+        if (-not [string]::IsNullOrWhiteSpace($ModelId) -and $tc -match '^(?:"?model"?|''model'')\s*=') { continue }
+        if (-not [string]::IsNullOrWhiteSpace($Effort) -and $tc -match '^(?:"?model_reasoning_effort"?|''model_reasoning_effort'')\s*=') { continue }
+        if ($tc -match '^(?:"?sandbox_mode"?|''sandbox_mode'')\s*=') { $hasSandbox = $true }
+        if ($tc -match '^(?:"?approval_policy"?|''approval_policy'')\s*=') { $hasApproval = $true }
+        $filteredTop.Add($tl)
+    }
+
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $out.Add("model_provider = `"$Provider`"")
+    if (-not [string]::IsNullOrWhiteSpace($ModelId)) {
+        $out.Add("model = `"$ModelId`"")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Effort)) {
+        $out.Add("model_reasoning_effort = `"$Effort`"")
+    }
+    if (-not $hasSandbox)  { $out.Add('sandbox_mode = "workspace-write"') }
+    if (-not $hasApproval) { $out.Add('approval_policy = "on-request"') }
+    foreach ($ft in $filteredTop) { $out.Add($ft) }
+    if ($out.Count -gt 0 -and (-not [string]::IsNullOrWhiteSpace($out[$out.Count - 1]))) {
+        $out.Add('')
+    }
+
+    $catalogUrl = $GatewayUrl.TrimEnd('/') + '/models'
+    $provHdrKey = if ($Provider -match '^[A-Za-z0-9_-]+$') { "model_providers.$Provider" } else { "model_providers.`"$Provider`"" }
+    $wroteProv = $false
+    $wroteFeatures = $false
+
+    foreach ($blk in $secBlocks) {
+        $h = $blk.Header
+        $provName = Get-ModelProviderHeaderName $h
+        if ($null -ne $provName -and $provName.Equals($Provider, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $wroteProv) {
+                $out.Add("[$provHdrKey]")
+                $out.Add("name = `"$Provider`"")
+                $out.Add("base_url = `"$GatewayUrl`"")
+                $out.Add("model_catalog_url = `"$catalogUrl`"")
+                $out.Add('wire_api = "responses"')
+                $out.Add('requires_openai_auth = false')
+                $out.Add("env_key = `"$EnvKey`"")
+                foreach ($bl in $blk.Lines) {
+                    $bc = (Remove-TomlInlineComment $bl).Trim()
+                    if ($bc -match '^(name|base_url|model_catalog_url|wire_api|requires_openai_auth|env_key|api_key|experimental_bearer_token)\s*=') { continue }
+                    $out.Add($bl)
+                }
+                if ($out.Count -gt 0 -and (-not [string]::IsNullOrWhiteSpace($out[$out.Count - 1]))) { $out.Add('') }
+                $wroteProv = $true
+            }
+            continue
+        }
+        if ($h.Trim().Equals('features', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $out.Add('[features]')
+            $out.Add('daemon_auto_start = false')
+            $hasDiscovery = $false
+            $hasGoals = $false
+            $hasMemories = $false
+            foreach ($bl in $blk.Lines) {
+                $bc = (Remove-TomlInlineComment $bl).Trim()
+                if ($bc -match '^daemon_auto_start\s*=') { continue }
+                if ($bc -match '^api_key_model_discovery\s*=') { $hasDiscovery = $true }
+                if ($bc -match '^goals\s*=') { $hasGoals = $true }
+                if ($bc -match '^memories\s*=') { $hasMemories = $true }
+                $out.Add($bl)
+            }
+            if (-not $hasDiscovery) { $out.Add('api_key_model_discovery = true') }
+            if (-not $hasGoals)     { $out.Add('goals = true') }
+            if (-not $hasMemories)  { $out.Add('memories = true') }
+            if ($out.Count -gt 0 -and (-not [string]::IsNullOrWhiteSpace($out[$out.Count - 1]))) { $out.Add('') }
+            $wroteFeatures = $true
+            continue
+        }
+        $out.Add("[$h]")
+        foreach ($bl in $blk.Lines) { $out.Add($bl) }
+        if ($out.Count -gt 0 -and (-not [string]::IsNullOrWhiteSpace($out[$out.Count - 1]))) { $out.Add('') }
+    }
+
+    if (-not $wroteProv) {
+        $out.Add("[$provHdrKey]")
+        $out.Add("name = `"$Provider`"")
+        $out.Add("base_url = `"$GatewayUrl`"")
+        $out.Add("model_catalog_url = `"$catalogUrl`"")
+        $out.Add('wire_api = "responses"')
+        $out.Add('requires_openai_auth = false')
+        $out.Add("env_key = `"$EnvKey`"")
+        $out.Add('')
+    }
+    if (-not $wroteFeatures) {
+        $out.Add('[features]')
+        $out.Add('daemon_auto_start = false')
+        $out.Add('api_key_model_discovery = true')
+        $out.Add('goals = true')
+        $out.Add('memories = true')
+        $out.Add('')
+    }
+
+    $finalText = (($out.ToArray() -join "`r`n").TrimEnd()) + "`r`n"
+    Write-Utf8NoBom -FilePath $ConfigPath -Text $finalText
+}
+
+function Invoke-ActionQuickThirdParty {
+    Write-Section '[1C] Wizard 1 Cham: Cau Hinh API Ben Thu 3 (Tu Dong A-Z, Khong Can Mo Notepad)'
+    try {
+        $selectedRepo = Select-MandatoryProjectDirectory -InitialRepoPath $RepoPath
+    } catch {
+        Write-FailLine $_.Exception.Message
+        return 1
+    }
+    if ([string]::IsNullOrWhiteSpace($selectedRepo)) {
+        Write-Info '[CANCELLED] Chua chon thu muc du an; huy thao tac.'
+        return 1
+    }
+    Write-Ok "Du an da chon (Project): $selectedRepo"
+
+    $effBaseUrl = $BaseUrl.Trim()
+    if ([string]::IsNullOrWhiteSpace($effBaseUrl) -and -not $NonInteractive) {
+        $inUrl = Read-Host '1/3. Nhap Base URL cong API (vd: https://api.xingchiapi.com/v1)'
+        if ($null -ne $inUrl) { $effBaseUrl = $inUrl.Trim() }
+    }
+    if ([string]::IsNullOrWhiteSpace($effBaseUrl) -or $effBaseUrl -notmatch '^https?://[^\s"''<>]+$') {
+        Write-FailLine "Base URL khong hop le ('$effBaseUrl'). Yeu cau URL bat dau bang https:// (hoac http://127.0.0.1 cho test)."
+        return 1
+    }
+    $effBaseUrl = $effBaseUrl.TrimEnd('/')
+
+    $effModel = $Model.Trim()
+    if ([string]::IsNullOrWhiteSpace($effModel) -and -not $NonInteractive) {
+        $inModel = Read-Host '2/3. Nhap ten Model (vd: gpt-6.1-sol hoac gpt-5.4; Enter = gpt-5.4)'
+        $effModel = if (-not [string]::IsNullOrWhiteSpace($inModel)) { $inModel.Trim() } else { 'gpt-5.4' }
+    }
+    if ([string]::IsNullOrWhiteSpace($effModel)) { $effModel = 'gpt-5.4' }
+    Assert-NoControlChars -Value $effModel -ParamName 'Model'
+
+    $effEffort = if (-not [string]::IsNullOrWhiteSpace($ReasoningEffort)) { $ReasoningEffort.Trim().ToLowerInvariant() } else { 'high' }
+    $effProvider = if (-not [string]::IsNullOrWhiteSpace($ProviderName)) { $ProviderName.Trim() } else { 'custom_gw' }
+    if ($effProvider -ieq 'openai') {
+        # Prevent collision with built-in ChatGPT OAuth `openai` provider ID!
+        $effProvider = 'custom_gw'
+    }
+    if ($effProvider -notmatch '^[A-Za-z0-9_-]+$') {
+        Write-FailLine "ProviderName '$effProvider' khong hop le (chi dung chu cai, so, _, -)."
+        return 1
+    }
+    $effEnvKey = if (-not [string]::IsNullOrWhiteSpace($EnvKeyName)) { $EnvKeyName.Trim() } else { 'CODEX_CLI_API_KEY' }
+    if ($effEnvKey -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+        Write-FailLine "EnvKeyName '$effEnvKey' khong hop le."
+        return 1
+    }
+
+    $plainKey = ''
+    try {
+        if ($null -ne $ApiKeySecure) {
+            $plainKey = (ConvertFrom-SecureStringPlain $ApiKeySecure).Trim()
+        } elseif ($ApiKeyFromStdin) {
+            if (-not $script:IsDryRun -or [Console]::IsInputRedirected) {
+                $stdinLine = Read-SingleLineFromStdinNoBom
+                if ($null -ne $stdinLine) { $plainKey = $stdinLine.Trim() }
+            }
+        } elseif (-not $NonInteractive) {
+            if ($script:IsDryRun) {
+                Write-Info '[DRY-RUN] Would prompt securely for 3rd-party API key.'
+            } else {
+                $secIn = Read-Host -Prompt '3/3. Dan API Key ben thu 3 (an ky tu, tu dong Trim)' -AsSecureString
+                $plainKey = (ConvertFrom-SecureStringPlain $secIn).Trim()
+            }
+        } elseif (-not $script:IsDryRun) {
+            Write-FailLine 'NonInteractive QuickThirdParty requires -ApiKeySecure or -ApiKeyFromStdin.'
+            return 1
+        }
+
+        if (-not $script:IsDryRun) {
+            if ([string]::IsNullOrWhiteSpace($plainKey) -or $plainKey.Length -lt 8 -or $plainKey -match '\s') {
+                Write-FailLine 'API Key khong hop le (trong, ngan hon 8 ky tu, hoac chua khoang trang).'
+                return 1
+            }
+        }
+
+        $masked = if ($plainKey) { Format-MaskedSecret $plainKey } else { 'DRY-RUN-KEY' }
+        Write-Info "Provider=$effProvider | BaseUrl=$effBaseUrl | Model=$effModel ($effEffort) | EnvKey=$effEnvKey ($masked)"
+
+        if ($script:IsDryRun) {
+            Write-Info "[DRY-RUN] Would store key into env '$effEnvKey', remove stale Lane2\auth.json (after backup), write '$Lane2Home\config.toml' with daemon_auto_start=false, lock NTFS DACL, and compact storage."
+            return 0
+        }
+
+        if (-not (Test-Path -LiteralPath $Lane2Home)) {
+            [void][System.IO.Directory]::CreateDirectory($Lane2Home)
+        }
+        [System.Environment]::SetEnvironmentVariable($effEnvKey, $plainKey, 'Process')
+        if (-not $SkipUserEnvPersist) {
+            [System.Environment]::SetEnvironmentVariable($effEnvKey, $plainKey, 'User')
+            Write-Ok "Da luu API Key an toan vao bien moi truong User & Process: $effEnvKey ($masked)"
+        } else {
+            Write-Ok "Da nap API Key vao bien moi truong Process: $effEnvKey ($masked)"
+        }
+
+        # Disconnect stale ChatGPT OAuth from Sandbox 2 (ONLY Lane2\auth.json; GPT 1 is untouched!)
+        $lane2Auth = Join-Path $Lane2Home 'auth.json'
+        if (Test-Path -LiteralPath $lane2Auth -PathType Leaf) {
+            Assert-NotReparsePoint -PathValue $lane2Auth -Label 'Lane 2 auth.json'
+            $authBkp = New-TimestampedBackup -FilePath $lane2Auth
+            Remove-Item -LiteralPath $lane2Auth -Force
+            Write-Ok "Da tach phien ChatGPT OAuth khoi Sandbox 2 (backup: $authBkp) de khong an nham quota tuan GPT 1."
+        }
+
+        $lane2Cfg = Join-Path $Lane2Home 'config.toml'
+        if (Test-Path -LiteralPath $lane2Cfg -PathType Leaf) {
+            $cfgBkp = New-TimestampedBackup -FilePath $lane2Cfg
+            Write-Ok "Backup config.toml Sandbox 2: $cfgBkp"
+        }
+
+        Upsert-ThirdPartyGatewayInToml -ConfigPath $lane2Cfg -Provider $effProvider -GatewayUrl $effBaseUrl -EnvKey $effEnvKey -ModelId $effModel -Effort $effEffort
+        $tomlRes = Test-TomlSyntax -ConfigPath $lane2Cfg
+        if (-not $tomlRes.Valid) {
+            Write-FailLine "TOML syntax check failed on '$lane2Cfg': $($tomlRes.Message)"
+            return 1
+        }
+        Protect-SensitiveFileAcl $lane2Cfg
+        Write-Ok "Da cap nhat & khoa 2-step NTFS DACL cho: $lane2Cfg (daemon_auto_start=false, zero plaintext key)"
+
+        [void](Invoke-HistorySync -SourceHome $Lane1Home -TargetHome $Lane2Home -Bidirectional)
+        [void](Invoke-ActionCleanupStorage)
+        return 0
+    } finally {
+        $plainKey = $null
+    }
+}
+
+function Invoke-ActionCleanupStorage {
+    Write-Section '[8] Quan Ly & Toi Uu Dung Luong RAM / ROM (CleanupStorage)'
+    $beforeUsage = Get-BoundedDirectoryUsage -DirPath $Lane2Home
+    Write-Info ("Dung luong Sandbox 2 truoc don dep: total={0} (sqlite={1}, backups={2}, files={3})" -f (Format-ByteSize $beforeUsage.TotalBytes), (Format-ByteSize $beforeUsage.SqliteBytes), (Format-ByteSize $beforeUsage.BackupBytes), $beforeUsage.FileCount)
+
+    $prunedCfg = Rotate-FileBackups -BaseFilePath (Join-Path $Lane2Home 'config.toml') -MaxKeep $MaxBackups
+    $prunedAuth = Rotate-FileBackups -BaseFilePath (Join-Path $Lane2Home 'auth.json') -MaxKeep $MaxBackups
+
+    # Prune oversized .sandbox temp logs (> 5 MiB) inside Sandbox 2 without touching active locks
+    $sbxDir = Join-Path $Lane2Home '.sandbox'
+    $prunedLogs = 0
+    if ((Test-Path -LiteralPath $sbxDir -PathType Container) -and (-not (Test-IsReparsePoint $sbxDir))) {
+        foreach ($lf in @(Get-ChildItem -LiteralPath $sbxDir -File -ErrorAction SilentlyContinue)) {
+            if (-not (Test-IsReparsePoint $lf.FullName) -and ($lf.Length -gt 5242880 -or $lf.Name -like '*.tmp')) {
+                if (-not $script:IsDryRun) {
+                    try { Remove-Item -LiteralPath $lf.FullName -Force -ErrorAction Stop; $prunedLogs++ } catch {}
+                } else {
+                    $prunedLogs++
+                }
+            }
+        }
+    }
+
+    $py = Find-Python3Executable
+    $syncScript = Join-Path $script:KitRoot 'scripts\sync-sessions.py'
+    if ($py -and (Test-Path -LiteralPath $syncScript -PathType Leaf) -and (Test-Path -LiteralPath $Lane1Home -PathType Container) -and (Test-Path -LiteralPath $Lane2Home -PathType Container)) {
+        $cArgs = @('-B', $syncScript, '--source', $Lane1Home, '--target', $Lane2Home, '--compact-storage', '--max-backups', "$MaxBackups")
+        if ($script:IsDryRun) { $cArgs += '--dry-run' }
+        $prevPref = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $null = @(& $py @cArgs 2>&1)
+        } finally {
+            $ErrorActionPreference = $prevPref
+            $global:LASTEXITCODE = 0
+        }
+    }
+
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+    $afterUsage = Get-BoundedDirectoryUsage -DirPath $Lane2Home
+    $savedBytes = [Math]::Max([int64]0, ($beforeUsage.TotalBytes - $afterUsage.TotalBytes))
+    Write-Ok ("Hoan tat toi uu RAM/ROM: total={0} (sqlite={1}, backups={2}) | pruned_backups={3}, pruned_sandbox_logs={4}, reclaimed={5}" -f (Format-ByteSize $afterUsage.TotalBytes), (Format-ByteSize $afterUsage.SqliteBytes), (Format-ByteSize $afterUsage.BackupBytes), ($prunedCfg + $prunedAuth), $prunedLogs, (Format-ByteSize $savedBytes))
+    return 0
+}
+
+function Invoke-ActionLaunch {
+    Write-Section '[00] Chon Du An (Bat Buoc) & Khoi Chay Codex CLI (Sandbox 2) 1 Cham'
+    try {
+        $selectedRepo = Select-MandatoryProjectDirectory -InitialRepoPath $RepoPath
+    } catch {
+        Write-FailLine $_.Exception.Message
+        return 1
+    }
+    if ([string]::IsNullOrWhiteSpace($selectedRepo)) {
+        Write-Info '[CANCELLED] Chua chon thu muc du an; huy khoi chay.'
+        return 1
+    }
+    Write-Ok "Thu muc du an (Project CWD): $selectedRepo"
+
+    # Compute safe CARGO_BUILD_JOBS cap (max(1, min(4, CPU/2))) so Rust/Cargo subshells cannot exhaust RAM
+    $cpuCount = try { [int][System.Environment]::ProcessorCount } catch { 4 }
+    if ($cpuCount -lt 1) { $cpuCount = 2 }
+    $safeJobs = [Math]::Max(1, [Math]::Min(4, [int][Math]::Floor($cpuCount / 2.0)))
+    $env:CARGO_BUILD_JOBS = "$safeJobs"
+
+    # Auto-install Dual-Lane bridge if Lane2Home\config.toml or LocalBin\codex.cmd is missing
+    $codexWrapper = Join-Path $LocalBin 'codex.cmd'
+    $lane2Cfg = Join-Path $Lane2Home 'config.toml'
+    $setupScript = Join-Path $script:KitRoot 'scripts\setup-dual-lane.ps1'
+    if ((-not (Test-Path -LiteralPath $codexWrapper -PathType Leaf) -or -not (Test-Path -LiteralPath $lane2Cfg -PathType Leaf)) -and (Test-Path -LiteralPath $setupScript -PathType Leaf)) {
+        Write-Info "Sandbox 2 chua duoc khoi tao day du; tu dong chay setup-dual-lane.ps1 cho '$selectedRepo'..."
+        $sArgs = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $setupScript,
+            '-RepoPath', $selectedRepo, '-Lane1Home', $Lane1Home, '-Lane2Home', $Lane2Home,
+            '-LocalBin', $LocalBin, '-SkipPathUpdate'
+        )
+        if ($script:ExplicitCodexPath) { $sArgs += @('-CodexPath', $CodexPath) }
+        if ($script:IsDryRun) { $sArgs += '-DryRun' }
+        & $script:CurrentPsExe @sArgs
+        if ($LASTEXITCODE -ne 0) {
+            $global:LASTEXITCODE = 0
+            Write-FailLine 'Tu dong khoi tao Sandbox 2 that bai.'
+            return 1
+        }
+        $global:LASTEXITCODE = 0
+    }
+
+    if ($script:IsDryRun) {
+        Write-Ok "[DRY-RUN] Would cd to '$selectedRepo' (CARGO_BUILD_JOBS=$safeJobs) and launch Sandbox 2 Codex CLI ('$codexWrapper')."
+        return 0
+    }
+
+    [void](Invoke-ActionCleanupStorage)
+    Push-Location -LiteralPath $selectedRepo
+    try {
+        if (Test-Path -LiteralPath $codexWrapper -PathType Leaf) {
+            Write-Info "Dang mo Codex CLI (Sandbox 2) tai '$selectedRepo' (CARGO_BUILD_JOBS=$safeJobs)..."
+            & $codexWrapper
+            $exitCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            return $exitCode
+        }
+        $codexInfo = Resolve-CodexExecutable -ExplicitPath $(if ($script:ExplicitCodexPath) { $CodexPath } else { '' }) -ExcludedDir $LocalBin -AllowMissing
+        if ($null -eq $codexInfo) {
+            Write-FailLine 'Khong tim thay codex wrapper hoac codex binary tren may.'
+            return 1
+        }
+        $env:CODEX_HOME = $Lane2Home
+        & $codexInfo.Path
+        $exitCode = $LASTEXITCODE
+        $global:LASTEXITCODE = 0
+        return $exitCode
+    } finally {
+        Pop-Location
+    }
+}
+
+# ============================================================================
 # Interactive Menu Loop (-Action Menu)
 # ============================================================================
 
@@ -2931,41 +3592,54 @@ function Invoke-InteractiveMenu {
     }
     while ($true) {
         $activeCliMode = Get-CliPermissionModeInfo -ConfigPath (Join-Path $Lane2Home 'config.toml')
+        $usage = Get-BoundedDirectoryUsage -DirPath $Lane2Home
         Write-Host ""
         Write-Host "========================================================================" -ForegroundColor Cyan
-        Write-Host "  CODEX DUAL-LANE CONTROL CENTER -- Quan ly Sandbox 2 (Codex CLI) v1.4" -ForegroundColor Cyan
+        Write-Host "  CODEX DUAL-LANE CONTROL CENTER -- 1-Touch Sandbox 2 CLI (v1.5)" -ForegroundColor Cyan
         Write-Host "========================================================================" -ForegroundColor Cyan
         Write-Host "  GPT 1 (Codex Desktop) : $Lane1Home" -ForegroundColor Green
-        Write-Host "  Sandbox 2 (Codex CLI) : $Lane2Home" -ForegroundColor Yellow
+        Write-Host "  Sandbox 2 (Codex CLI) : $Lane2Home (ROM: $(Format-ByteSize $usage.TotalBytes))" -ForegroundColor Yellow
         Write-Host "  Sandbox 2 Mode        : $($activeCliMode.DisplayLabel)" -ForegroundColor $activeCliMode.Color
+        if (-not [string]::IsNullOrWhiteSpace($RepoPath)) {
+            Write-Host "  Active Project (-Repo): $RepoPath" -ForegroundColor Cyan
+        }
         if ($script:IsDryRun) {
             Write-Host "  [DRY-RUN MODE ACTIVE -- preview only, zero mutations]" -ForegroundColor Yellow
         }
         Write-Host "------------------------------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host "  [00] CHON DU AN (BAT BUOC) & CHAY CODEX CLI NGAY (1 Cham) [Enter]" -ForegroundColor Green
         Write-Host "  [1]  Xac thuc API Key cho Sandbox 2 (Codex CLI)"
         Write-Host "       [1A] OpenAI / GPT chinh chu (nhap 1 API key -> codex login --with-api-key)"
-        Write-Host "       [1B] Ben thu 3 / Custom Provider (mo truc tiep config.toml + khoa ACL)"
+        Write-Host "       [1B] Mo truc tiep Lane2\config.toml (chinh tay + khoa ACL)"
+        Write-Host "       [1C] WIZARD 1 CHAM API BEN THU 3 (Hoi 3 dong -> Tu dong A-Z, KHONG mo Notepad!)" -ForegroundColor Yellow
         Write-Host "  [2]  Dang nhap chinh thuc OpenAI / ChatGPT cho Sandbox 2 (codex login)"
         Write-Host "  [3]  Check API Key (kiem tra cuc bo + tuy chon probe /models truc tuyen)"
         Write-Host "  [4]  Check Tai khoan Hien co (chi-doc: GPT 1 Desktop + Sandbox 2 CLI)"
         Write-Host "  [5]  Dong bo Lich su Chat 2 chieu (GPT 1 <-> Sandbox 2)"
         Write-Host "  [6]  Xoa Sandbox 2 (Codex CLI) An toan -- KHONG xoa lich su chat GPT 1"
         Write-Host "  [7]  Chon che do quyen Sandbox 2 (Codex CLI): Xin yeu cau / Config / Toan quyen"
+        Write-Host "  [8]  Don dep & Toi uu Dung luong RAM / ROM (CleanupStorage)"
         Write-Host "  [0]  Thoat (Exit)"
         Write-Host "------------------------------------------------------------------------" -ForegroundColor DarkGray
 
-        $choice = Read-Host 'Chon chuc nang (1, 1A, 1B, 2, 3, 4, 5, 6, 7, 0)'
+        $choice = Read-Host 'Chon chuc nang (Enter/00=Chay ngay, 1C=Wizard API, 1A, 1B, 2..8, 0=Thoat)'
         if ($null -eq $choice) { break }
         $c = $choice.Trim().ToUpperInvariant()
+        if ($c -eq '') { $c = '00' }
 
         switch ($c) {
+            '00' { [void](Invoke-ActionLaunch) }
+            'LAUNCH' { [void](Invoke-ActionLaunch) }
             '1' {
                 Write-Host "    [A] OpenAI / GPT chinh chu (nhap 1 API key)" -ForegroundColor Cyan
-                Write-Host "    [B] Ben thu 3 / Custom Provider (mo truc tiep Lane2\config.toml)" -ForegroundColor Cyan
-                $sub = Read-Host 'Chon [A/B]'
+                Write-Host "    [B] Mo truc tiep Lane2\config.toml (Notepad)" -ForegroundColor Cyan
+                Write-Host "    [C] Wizard 1 Cham API Ben thu 3 (Tu dong A-Z, khong mo Notepad)" -ForegroundColor Yellow
+                $sub = Read-Host 'Chon [A/B/C, mac dinh C]'
                 if ($null -eq $sub) { continue }
                 $sc = $sub.Trim().ToUpperInvariant()
-                if ($sc -eq 'A' -or $sc -eq '1A') {
+                if ($sc -eq '' -or $sc -eq 'C' -or $sc -eq '1C') {
+                    [void](Invoke-ActionQuickThirdParty)
+                } elseif ($sc -eq 'A' -or $sc -eq '1A') {
                     [void](Invoke-ActionApiGpt)
                 } elseif ($sc -eq 'B' -or $sc -eq '1B') {
                     [void](Invoke-ActionApiOther)
@@ -2975,6 +3649,8 @@ function Invoke-InteractiveMenu {
             }
             '1A' { [void](Invoke-ActionApiGpt) }
             '1B' { [void](Invoke-ActionApiOther) }
+            '1C' { [void](Invoke-ActionQuickThirdParty) }
+            '8'  { [void](Invoke-ActionCleanupStorage) }
             '2' {
                 if (-not $DeviceAuth) {
                     Write-Host "    [1] Dang nhap qua trinh duyet (codex login)" -ForegroundColor Cyan
@@ -3034,15 +3710,18 @@ foreach ($rootCheck in @(@('Lane1Home', $Lane1Home), @('Lane2Home', $Lane2Home),
 }
 
 $rc = switch ($Action) {
-    'Menu'           { Invoke-InteractiveMenu }
-    'ApiGpt'         { Invoke-ActionApiGpt }
-    'ApiOther'       { Invoke-ActionApiOther }
-    'Login'          { Invoke-ActionLogin }
-    'CheckApiKey'    { Invoke-ActionCheckApiKey }
-    'CheckAccounts'  { Invoke-ActionCheckAccounts }
-    'SyncHistory'    { Invoke-ActionSyncHistory }
-    'RemoveSandbox2' { Invoke-ActionRemoveSandbox2 }
-    'SetCliMode'     { Invoke-ActionSetCliMode }
+    'Menu'             { Invoke-InteractiveMenu }
+    'ApiGpt'           { Invoke-ActionApiGpt }
+    'ApiOther'         { Invoke-ActionApiOther }
+    'QuickThirdParty'  { Invoke-ActionQuickThirdParty }
+    'Login'            { Invoke-ActionLogin }
+    'CheckApiKey'      { Invoke-ActionCheckApiKey }
+    'CheckAccounts'    { Invoke-ActionCheckAccounts }
+    'SyncHistory'      { Invoke-ActionSyncHistory }
+    'RemoveSandbox2'   { Invoke-ActionRemoveSandbox2 }
+    'SetCliMode'       { Invoke-ActionSetCliMode }
+    'Launch'           { Invoke-ActionLaunch }
+    'CleanupStorage'   { Invoke-ActionCleanupStorage }
 }
 
 exit ([int]$rc)

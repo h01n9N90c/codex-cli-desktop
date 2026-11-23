@@ -2860,7 +2860,44 @@ theme = "dark"
             Assert-True ($cfg13gSetupFull -match '(?m)^\s*multi_agent_v2\s*=\s*true\s*$') 'setup -CliMode FullAccess lost user [features]!'
             Assert-True ([bool](Get-Acl -LiteralPath $p13gCfg2Path).AreAccessRulesProtected) 'setup -CliMode FullAccess did not lock NTFS DACL!'
 
-            Write-Host "    [OK] Stage 13g verified (SetCliMode Ask/Config/FullAccess fail-closed gate, setup -CliMode Config/FullAccess, native [features] preservation, and doctor.ps1 CLI mode audit)" -ForegroundColor Green
+            # (viii) v1.5 One-Touch QuickThirdParty Wizard + Mandatory Project Selection + CleanupStorage + START-CODEX.cmd:
+            #        - Mandatory -RepoPath in NonInteractive mode: missing/invalid -RepoPath MUST fail closed (exit 1).
+            $res13gNoRepo = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'Launch', '-NonInteractive',
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin
+            )
+            Assert-True ($res13gNoRepo.ExitCode -ne 0) 'Launch -NonInteractive WITHOUT -RepoPath MUST fail closed!'
+
+            #        - QuickThirdParty with -SkipUserEnvPersist: removes Lane2\auth.json (after backup), sets custom_gw + daemon_auto_start=false, preserves [projects.*], locks ACL!
+            $p13gQuickKey = ConvertTo-SecureString 'sk-QUICK-3RDPARTY-WIZARD-TEST-KEY-998877665544' -AsPlainText -Force
+            $res13gQuick = & $CurrentPsExe -NoProfile -ExecutionPolicy Bypass -Command "
+                `$sec = ConvertTo-SecureString 'sk-QUICK-3RDPARTY-WIZARD-TEST-KEY-998877665544' -AsPlainText -Force
+                & '$ManagerScript' -Action QuickThirdParty -RepoPath '$p13gRepo' -BaseUrl 'https://api.xingchiapi.example/v1' -Model 'gpt-6.1-sol' -ReasoningEffort 'xhigh' -ProviderName 'OpenAI' -EnvKeyName 'TEST_QUICK_GW_KEY' -ApiKeySecure `$sec -SkipUserEnvPersist -NonInteractive -Lane1Home '$p13gL1' -Lane2Home '$p13gL2' -LocalBin '$p13gBin'
+                exit `$LASTEXITCODE
+            " 2>&1
+            $quickExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            $quickOut = ($res13gQuick -join "`n")
+            Assert-True ($quickExit -eq 0) "QuickThirdParty failed (exit=$quickExit):`n$quickOut"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $p13gL2 'auth.json'))) 'QuickThirdParty must remove Lane2\auth.json (after backup) to prevent ChatGPT OAuth quota collision!'
+            Assert-True (Test-Path -LiteralPath (Join-Path $p13gL1 'auth.json') -PathType Leaf) 'CRITICAL: QuickThirdParty touched GPT 1 auth.json!'
+            $cfg13gQuick = Get-Content -LiteralPath $p13gCfg2Path -Raw -Encoding UTF8
+            Assert-True ($cfg13gQuick -match '(?m)^\s*model_provider\s*=\s*"custom_gw"\s*$') 'QuickThirdParty did not normalize "OpenAI" provider name to "custom_gw"!'
+            Assert-True ($cfg13gQuick -match '(?m)^\s*model\s*=\s*"gpt-6.1-sol"\s*$' -and $cfg13gQuick -match '(?m)^\s*model_reasoning_effort\s*=\s*"xhigh"\s*$') 'QuickThirdParty did not write model and model_reasoning_effort!'
+            Assert-True ($cfg13gQuick -match '(?m)^\s*daemon_auto_start\s*=\s*false\s*$') 'QuickThirdParty did not enforce daemon_auto_start = false!'
+            Assert-True ($cfg13gQuick -match '(?m)^\s*env_key\s*=\s*"TEST_QUICK_GW_KEY"\s*$') 'QuickThirdParty did not write env_key!'
+            $p13gQuickMap = & $parseProjectSections $cfg13gQuick
+            Assert-True ($p13gQuickMap.ContainsKey('c:\p13g\untrusted') -and $p13gQuickMap['c:\p13g\untrusted'].Body -match 'trust_level\s*=\s*"untrusted"') 'QuickThirdParty altered untrusted project!'
+
+            #        - CleanupStorage + Launch -DryRun via START-CODEX.cmd:
+            $startCmdPath = Join-Path $KitRoot 'START-CODEX.cmd'
+            Assert-True (Test-Path -LiteralPath $startCmdPath -PathType Leaf) 'Root 1-click launcher START-CODEX.cmd is missing!'
+            $res13gLaunchDry = & $startCmdPath -Action Launch -RepoPath $p13gRepo -Lane1Home $p13gL1 -Lane2Home $p13gL2 -LocalBin $p13gBin -CodexPath $p13gMockCmd -DryRun -NonInteractive 2>&1
+            $launchDryExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            Assert-True ($launchDryExit -eq 0 -and (($res13gLaunchDry -join "`n") -match 'CARGO_BUILD_JOBS=')) "START-CODEX.cmd Launch -DryRun failed (exit=$launchDryExit):`n$($res13gLaunchDry -join "`n")"
+
+            Write-Host "    [OK] Stage 13g verified (SetCliMode Ask/Config/FullAccess fail-closed gate, setup -CliMode Config/FullAccess, native [features] preservation, doctor.ps1 CLI mode audit, and v1.5 QuickThirdParty + Mandatory Project Selection + CleanupStorage + START-CODEX.cmd)" -ForegroundColor Green
         } finally {
             Remove-TempTreeSafely -RootDir $null -Lane2Dir $p13gL2
         }

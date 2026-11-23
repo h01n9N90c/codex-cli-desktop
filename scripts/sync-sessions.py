@@ -69,6 +69,16 @@ __license__ = "Apache-2.0"
 DEFAULT_BUSY_TIMEOUT_SEC: float = 15.0
 DEFAULT_BUSY_TIMEOUT_MS: int = int(DEFAULT_BUSY_TIMEOUT_SEC * 1000)
 
+# Hard RAM & Disk safety bounds.
+# - MAX_JSONL_LINE_CHARS caps per-line memory allocation when reading session_index.jsonl
+#   so a corrupt single-line multi-hundred-MB file without newlines can never spike RAM.
+# - SQLITE_CACHE_SIZE_KIB (-8192 = 8 MiB) caps per-connection SQLite page cache in RAM.
+# - SQLITE_VACUUM_MIN_FREE_PAGES triggers a page-reclaiming VACUUM during storage compaction
+#   only when freelist_count exceeds this threshold.
+MAX_JSONL_LINE_CHARS: int = 1024 * 1024
+SQLITE_CACHE_SIZE_KIB: int = -8192
+SQLITE_VACUUM_MIN_FREE_PAGES: int = 64
+
 # Explicit sync outcome statuses (replaces raw integer-only reporting).
 SYNC_STATUS_SUCCESS: str = "SUCCESS"
 SYNC_STATUS_PARTIAL: str = "PARTIAL"
@@ -355,6 +365,7 @@ def connect_readonly(
     try:
         timeout_ms = max(0, int(effective_timeout * 1000))
         conn.execute(f"PRAGMA busy_timeout = {timeout_ms}")
+        conn.execute(f"PRAGMA cache_size = {SQLITE_CACHE_SIZE_KIB}")
         conn.execute("PRAGMA query_only = ON")
         return conn
     except Exception:
@@ -380,6 +391,7 @@ def connect_readwrite(
     try:
         timeout_ms = max(0, int(effective_timeout * 1000))
         conn.execute(f"PRAGMA busy_timeout = {timeout_ms}")
+        conn.execute(f"PRAGMA cache_size = {SQLITE_CACHE_SIZE_KIB}")
         return conn
     except Exception:
         conn.close()
@@ -1034,33 +1046,52 @@ def _snapshot_goals_keys(
     return (len(rows), {tuple(r) for r in rows})
 
 
+def _iter_bounded_lines(path: Path, max_chars: int = MAX_JSONL_LINE_CHARS):
+    """
+    Yield lines from a UTF-8 file while capping single-line memory allocation
+    at `max_chars` so a corrupt multi-hundred-MB line without newlines cannot
+    spike RAM. Oversized lines are drained in 64 KiB chunks and skipped.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        while True:
+            chunk = handle.readline(max_chars + 1)
+            if not chunk:
+                break
+            if len(chunk) > max_chars and not chunk.endswith("\n"):
+                while True:
+                    drain = handle.readline(65536)
+                    if not drain or drain.endswith("\n"):
+                        break
+                continue
+            yield chunk
+
+
 def _snapshot_session_index_ids(
     path: Path, *, allowed_ids: set[str] | None = None
 ) -> set[str]:
-    """Read valid thread IDs from a `session_index.jsonl` file."""
+    """Read valid thread IDs from a `session_index.jsonl` file with bounded RAM."""
     ids: set[str] = set()
     if not path.exists():
         return ids
-    with open(path, "r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            raw_id = obj.get("id")
-            if not isinstance(raw_id, (str, int)) or isinstance(raw_id, bool):
-                continue
-            tid = str(raw_id).strip()
-            if not tid:
-                continue
-            if allowed_ids is not None and tid not in allowed_ids:
-                continue
-            ids.add(tid)
+    for raw_line in _iter_bounded_lines(path):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        raw_id = obj.get("id")
+        if not isinstance(raw_id, (str, int)) or isinstance(raw_id, bool):
+            continue
+        tid = str(raw_id).strip()
+        if not tid:
+            continue
+        if allowed_ids is not None and tid not in allowed_ids:
+            continue
+        ids.add(tid)
     return ids
 
 
@@ -1155,34 +1186,33 @@ def sync_session_index_detailed(
         if not path.exists():
             continue
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                for raw_line in handle:
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-                    raw_id = obj.get("id")
-                    if not isinstance(raw_id, (str, int)) or isinstance(raw_id, bool):
-                        continue
-                    tid = str(raw_id).strip()
-                    if not tid:
-                        continue
-                    if is_source and allowed_ids is not None and tid not in allowed_ids:
-                        continue
-                    if is_source:
-                        source_eligible_ids.add(tid)
-                    else:
-                        target_before_ids.add(tid)
-                    if tid not in by_id:
-                        by_id[tid] = (obj, line)
-                    else:
-                        dst_obj, dst_line = by_id[tid]
-                        by_id[tid] = _merge_index_entry(dst_obj, dst_line, obj, line)
+            for raw_line in _iter_bounded_lines(path):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                raw_id = obj.get("id")
+                if not isinstance(raw_id, (str, int)) or isinstance(raw_id, bool):
+                    continue
+                tid = str(raw_id).strip()
+                if not tid:
+                    continue
+                if is_source and allowed_ids is not None and tid not in allowed_ids:
+                    continue
+                if is_source:
+                    source_eligible_ids.add(tid)
+                else:
+                    target_before_ids.add(tid)
+                if tid not in by_id:
+                    by_id[tid] = (obj, line)
+                else:
+                    dst_obj, dst_line = by_id[tid]
+                    by_id[tid] = _merge_index_entry(dst_obj, dst_line, obj, line)
         except (OSError, UnicodeDecodeError) as exc:
             print(
                 f"[WARN] Could not read {path.name} cleanly ({type(exc).__name__}); aborting session_index sync to preserve target.",
@@ -1479,6 +1509,163 @@ def _checkpoint_wal_best_effort(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except sqlite3.OperationalError:
         pass
+
+
+def compact_codex_home_storage(
+    home_dir: str,
+    *,
+    max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """
+    Safely compact and bound disk (ROM) and SQLite WAL usage inside `home_dir`
+    without following symlinks/junctions or touching active sessions:
+      1. Rotates `.sync-backup-*`, `config.toml.backup-*`, `config.toml.pre-*`,
+         `auth.json.backup-*`, and `auth.json.pre-*` keeping at most
+         `max_backups` newest regular files per family.
+      2. Removes stale leftover `.*.tmp` staging files in `home_dir`.
+      3. Checkpoints and truncates `-wal` sidecars (`PRAGMA wal_checkpoint(TRUNCATE)`)
+         and runs `PRAGMA optimize` (plus `VACUUM` when free pages >=
+         `SQLITE_VACUUM_MIN_FREE_PAGES`) on `state_*.sqlite` and `goals_*.sqlite`.
+
+    Returns:
+        `{"backups_pruned": int, "tmp_pruned": int, "dbs_compacted": int, "bytes_reclaimed": int}`
+    """
+    if not home_dir or not os.path.isdir(home_dir) or _is_reparse_or_symlink(home_dir):
+        return {"backups_pruned": 0, "tmp_pruned": 0, "dbs_compacted": 0, "bytes_reclaimed": 0}
+
+    backups_pruned = 0
+    tmp_pruned = 0
+    dbs_compacted = 0
+    bytes_reclaimed = 0
+
+    protected_backup_names: set[str] = set()
+    rb_dir = Path(home_dir) / ".rollback"
+    if rb_dir.is_dir() and not _is_reparse_or_symlink(rb_dir):
+        for mf_name in ("latest.json", "manifest.env"):
+            mf_path = rb_dir / mf_name
+            if mf_path.is_file() and not _is_reparse_or_symlink(mf_path):
+                try:
+                    raw_mf = mf_path.read_text(encoding="utf-8", errors="ignore")
+                    for m in re.findall(
+                        r"[A-Za-z0-9_.-]+\.(?:backup|pre)-[0-9]{8}-[0-9]{6}(?:-[0-9]+)?",
+                        raw_mf,
+                    ):
+                        protected_backup_names.add(m)
+                except OSError:
+                    pass
+
+    backup_families: dict[str, list[tuple[int, str, Path, int]]] = {}
+    tmp_candidates: list[tuple[Path, int]] = []
+    try:
+        with os.scandir(home_dir) as it:
+            for entry in it:
+                if entry.is_symlink() or _is_reparse_or_symlink(entry.path):
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                name = entry.name
+                if name in protected_backup_names:
+                    continue
+                if name.startswith(".") and name.endswith(".tmp"):
+                    tmp_candidates.append((Path(entry.path), int(st.st_size)))
+                    continue
+                family_key: str | None = None
+                if ".sync-backup-" in name:
+                    family_key = name.split(".sync-backup-", 1)[0] + ".sync-backup-"
+                elif name.startswith("config.toml.backup-") or name.startswith("config.toml.pre-"):
+                    family_key = "config.toml.backup"
+                elif name.startswith("auth.json.backup-") or name.startswith("auth.json.pre-"):
+                    family_key = "auth.json.backup"
+                if family_key is not None:
+                    backup_families.setdefault(family_key, []).append(
+                        (int(st.st_mtime_ns), name, Path(entry.path), int(st.st_size))
+                    )
+    except OSError:
+        return {"backups_pruned": 0, "tmp_pruned": 0, "dbs_compacted": 0, "bytes_reclaimed": 0}
+
+    if max_backups > 0:
+        for _, items in backup_families.items():
+            if len(items) <= max_backups:
+                continue
+            items.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            for _, _, old_path, sz in items[max_backups:]:
+                try:
+                    ensure_contained_path(home_dir, old_path, reject_symlinks=True)
+                    if not dry_run:
+                        os.unlink(old_path)
+                    backups_pruned += 1
+                    bytes_reclaimed += sz
+                except (OSError, ValueError):
+                    continue
+
+    for tmp_path, sz in tmp_candidates:
+        try:
+            ensure_contained_path(home_dir, tmp_path, reject_symlinks=True)
+            if not dry_run:
+                os.unlink(tmp_path)
+            tmp_pruned += 1
+            bytes_reclaimed += sz
+        except (OSError, ValueError):
+            continue
+
+    for prefix in ("state", "goals"):
+        db_file = find_latest_versioned_db(home_dir, prefix)
+        if not db_file:
+            continue
+        try:
+            _validate_sqlite_and_sidecars(home_dir, db_file)
+        except ValueError:
+            continue
+        if dry_run:
+            dbs_compacted += 1
+            continue
+        before_sz = 0
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(db_file) + suffix)
+            if p.exists() and not _is_reparse_or_symlink(p):
+                try:
+                    before_sz += p.stat().st_size
+                except OSError:
+                    pass
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = connect_readwrite(db_file, timeout=1.0)
+            _verify_sqlite_readable(conn)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA optimize")
+            free_row = conn.execute("PRAGMA freelist_count").fetchone()
+            free_pages = int(free_row[0]) if free_row and free_row[0] is not None else 0
+            if free_pages >= SQLITE_VACUUM_MIN_FREE_PAGES:
+                conn.execute("VACUUM")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            dbs_compacted += 1
+        except sqlite3.Error:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
+        after_sz = 0
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(db_file) + suffix)
+            if p.exists() and not _is_reparse_or_symlink(p):
+                try:
+                    after_sz += p.stat().st_size
+                except OSError:
+                    pass
+        if before_sz > after_sz:
+            bytes_reclaimed += before_sz - after_sz
+
+    return {
+        "backups_pruned": backups_pruned,
+        "tmp_pruned": tmp_pruned,
+        "dbs_compacted": dbs_compacted,
+        "bytes_reclaimed": bytes_reclaimed,
+    }
 
 
 def sync_state_db_detailed(
@@ -2815,6 +3002,11 @@ def main() -> int:
         help="Emit secret-free structured JSON summary instead of plain text",
     )
     parser.add_argument(
+        "--compact-storage",
+        action="store_true",
+        help="Compact target SQLite WAL/free pages and prune excess rotated backups & temp files to bound disk/RAM usage",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Inspect schemas and report what would be synced without writing any file",
@@ -2837,6 +3029,7 @@ def main() -> int:
         # When rescuing back to GPT 1 (unidirectional --rescue-shared-files), preserve
         # target's existing model_provider instead of forcing "openai".
         fwd_force_openai = not args.rescue_shared_files or args.bidirectional
+        rev_stats: dict[str, object] | None = None
         fwd_stats = _run_directional_sync(
             args.lane1,
             args.lane2,
@@ -2867,6 +3060,17 @@ def main() -> int:
                 force_openai_provider=False,
                 require_source_dbs=require_source_dbs,
             )
+
+        if args.compact_storage:
+            fwd_stats["compaction"] = compact_codex_home_storage(
+                args.lane2, max_backups=args.max_backups, dry_run=args.dry_run
+            )
+            if args.bidirectional and rev_stats is not None:
+                rev_stats["compaction"] = compact_codex_home_storage(
+                    args.lane1, max_backups=args.max_backups, dry_run=args.dry_run
+                )
+
+        if args.bidirectional and rev_stats is not None:
             overall_status = _aggregate_sync_status(
                 [str(fwd_stats["status"]), str(rev_stats["status"])]
             )
