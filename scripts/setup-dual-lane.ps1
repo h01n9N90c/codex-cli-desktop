@@ -80,8 +80,27 @@
     Optional explicit `service_tier` value for Lane 2 (e.g. priority) if your account supports it.
 
 .PARAMETER ApprovalPolicy
-    Codex approval policy written to managed configs: 'on-request' (secure default) or 'never'
-    (unattended isolated runs only).
+    Codex approval policy written to managed configs in Ask mode (or fresh Config mode):
+    'on-request' (secure default) or 'never' (unattended isolated runs only).
+
+.PARAMETER CliMode
+    Selects the Sandbox 2 (Lane 2 Codex CLI) permission mode in ~/.codex-official/config.toml
+    (never restricts Lane 1 Desktop):
+      - 'Ask' (default, Xin yêu cầu): writes approval_policy = "on-request" (or explicit
+        -ApprovalPolicy) and sandbox_mode = "workspace-write" (neatly contained inside the
+        project directory; external algorithms/docs may be referenced strictly read-only).
+      - 'Config' (Thuộc cấu hình config.toml): respects existing approval_policy, sandbox_mode,
+        and [sandbox_workspace_write] from Lane2\config.toml untouched (defaulting to
+        on-request + workspace-write only when missing on a brand-new config).
+      - 'FullAccess' (Toàn quyền — DANGER): writes approval_policy = "never" and
+        sandbox_mode = "danger-full-access". Always displays a high-visibility RED/YELLOW danger
+        warning and refuses fail-closed (exit 1, zero mutations) unless -ConfirmFullAccess is
+        explicitly passed (or the user types exact confirmation phrase 'TOAN QUYEN' /
+        'I UNDERSTAND' interactively).
+
+.PARAMETER ConfirmFullAccess
+    Explicit acknowledgement switch required for non-interactive/scripted -CliMode FullAccess
+    runs after reviewing host-wide risks (bypasses workspace-write sandbox and approval prompts).
 
 .PARAMETER AllowSandboxNetwork
     When specified, sets `[sandbox_workspace_write] network_access = true`. Default is `false`
@@ -213,6 +232,9 @@ param(
     [string]$OfficialServiceTier = '',
     [ValidateSet('on-request', 'never')]
     [string]$ApprovalPolicy = 'on-request',
+    [ValidateSet('Ask', 'Config', 'FullAccess')]
+    [string]$CliMode = 'Ask',
+    [switch]$ConfirmFullAccess,
     [switch]$AllowSandboxNetwork,
     [switch]$UseGitWorktree,
     [string]$Lane2WorktreePath = '',
@@ -251,6 +273,8 @@ $ErrorActionPreference = 'Stop'
 # prevents `finally` cleanup of our disposable feature-probe temp folder.
 $script:IsDryRun = $DryRun.IsPresent -or [bool]$WhatIfPreference
 $WhatIfPreference = $false
+$script:ExplicitApprovalPolicy      = $PSBoundParameters.ContainsKey('ApprovalPolicy')
+$script:ExplicitAllowSandboxNetwork = $PSBoundParameters.ContainsKey('AllowSandboxNetwork')
 $script:SnapshotEntries    = New-Object 'System.Collections.Generic.List[object]'
 $script:TrackedJunctions   = New-Object 'System.Collections.Generic.List[string]'
 $script:SharedLinkRecords  = New-Object 'System.Collections.Generic.List[object]'
@@ -1629,7 +1653,8 @@ function Merge-CodexConfigToml {
                         $isManagedProject = $true
                     }
                 }
-                if ($secSet.Contains($normSecName) -or $isManagedProject) {
+                $isManagedSubtable = ($secSet.Contains('approval_policy') -and $normSecName -like 'approval_policy.*')
+                if ($secSet.Contains($normSecName) -or $isManagedProject -or $isManagedSubtable) {
                     $keepCurrentSection = $false
                 } else {
                     $keepCurrentSection = $true
@@ -1682,6 +1707,226 @@ function Merge-CodexConfigToml {
         $result += "`r`n`r`n# Preserved custom user sections`r`n" + ($preservedSections -join "`r`n`r`n")
     }
     return ($result.TrimEnd() + "`r`n")
+}
+
+function Show-FullAccessDangerWarning {
+    <#
+    .SYNOPSIS
+        Displays a high-visibility RED/YELLOW danger warning modeled on Codex CLI's
+        `--dangerously-bypass-approvals-and-sandbox` ("EXTREMELY DANGEROUS") banner.
+    #>
+    Write-Host ""
+    Write-Host "========================================================================" -ForegroundColor Red
+    Write-Host "  [!] CANH BAO NGUY HIEM -- EXTREMELY DANGEROUS (FULL ACCESS / TOAN QUYEN)" -ForegroundColor Red
+    Write-Host "========================================================================" -ForegroundColor Red
+    Write-Host "  Che do nay se ghi vao Sandbox 2 (~/.codex-official/config.toml):" -ForegroundColor Yellow
+    Write-Host '    approval_policy = "never"               (TAT HOAN TOAN hoi duyet lenh)' -ForegroundColor Red
+    Write-Host '    sandbox_mode    = "danger-full-access"  (TAT HOAN TOAN OS sandbox)' -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  RUI RO TREN TOAN MAY (HOST-WIDE RISKS):" -ForegroundColor Yellow
+    Write-Host "    - Bo qua ranh gioi workspace-write: Codex CLI co toan quyen DOC / GHI / XOA" -ForegroundColor Yellow
+    Write-Host "      file, CHAY LENH shell va truy cap MANG tren TOAN MAY theo quyen user OS." -ForegroundColor Yellow
+    Write-Host "    - Khong hoi duyet truoc khi thuc thi lenh hay sua file ngoai thu muc du an." -ForegroundColor Yellow
+    Write-Host "    - rules\default.rules chi kiem tra prefix lenh truc tiep (argv), KHONG the" -ForegroundColor Yellow
+    Write-Host "      chan het lenh long trong powershell -Command / cmd /c / bash -c." -ForegroundColor Yellow
+    Write-Host "    - Prompt injection hoac loi AI co the lam mat du lieu ngoai du an." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  KHUYEN NGHI AN TOAN:" -ForegroundColor Yellow
+    Write-Host "    - Tao Git commit checkpoint (hoac dung -UseGitWorktree / VM co lap) truoc!" -ForegroundColor Yellow
+    Write-Host "    - Chuyen lai ve che do Ask (Xin yeu cau) ngay khi xong viec bang codex-manage." -ForegroundColor Yellow
+    Write-Host "========================================================================" -ForegroundColor Red
+    Write-Host ""
+}
+
+function Confirm-FullAccessOrExit {
+    <#
+    .SYNOPSIS
+        Fail-closed pre-flight confirmation gate for -CliMode FullAccess.
+        Always displays Show-FullAccessDangerWarning; requires explicit -ConfirmFullAccess in
+        non-interactive/non-TTY sessions, or exact typed phrase 'TOAN QUYEN' / 'I UNDERSTAND'
+        in interactive terminals. Exits 1 with zero filesystem mutations if unconfirmed.
+    #>
+    Show-FullAccessDangerWarning
+    if ($ConfirmFullAccess.IsPresent) {
+        Write-Host "[WARN] -ConfirmFullAccess acknowledged: proceeding with Full Access (danger-full-access / never)." -ForegroundColor Yellow
+        return
+    }
+    $isNonInteractiveHost = $false
+    try {
+        if ([Console]::IsInputRedirected -or (-not [System.Environment]::UserInteractive)) {
+            $isNonInteractiveHost = $true
+        }
+    } catch {
+        $isNonInteractiveHost = $true
+    }
+    if ($isNonInteractiveHost) {
+        Write-Host "[FAIL] REFUSED (fail-closed): -CliMode FullAccess requires explicit -ConfirmFullAccess in non-interactive/non-TTY sessions. Zero files modified." -ForegroundColor Red
+        exit 1
+    }
+    $typed = Read-Host "Nhap chinh xac 'TOAN QUYEN' hoac 'I UNDERSTAND' de xac nhan bat Toan quyen (de trong de huy)"
+    $trimmed = if ($null -ne $typed) { $typed.Trim() } else { '' }
+    if (($trimmed -cne 'TOAN QUYEN') -and ($trimmed -cne 'I UNDERSTAND')) {
+        Write-Host "[FAIL] REFUSED / CANCELLED (fail-closed): Cum tu xac nhan khong khop (yeu cau chinh xac 'TOAN QUYEN' hoac 'I UNDERSTAND'). Zero files modified." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[WARN] Interactive Full Access confirmation accepted: proceeding with danger-full-access / never." -ForegroundColor Yellow
+}
+
+function Get-ExistingLane2CliSettings([string]$ConfigPath) {
+    <#
+    .SYNOPSIS
+        Strictly read-only parser for existing Lane 2 approval_policy, sandbox_mode, and
+        [sandbox_workspace_write] presence so -CliMode Config preserves user settings verbatim.
+    #>
+    $info = [PSCustomObject]@{
+        Exists                          = $false
+        HasSandboxMode                  = $false
+        SandboxModeValue                = ''
+        HasApprovalPolicy               = $false
+        ApprovalPolicyValue             = ''
+        HasSandboxWorkspaceWriteSection = $false
+    }
+    if ([string]::IsNullOrWhiteSpace($ConfigPath) -or -not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        return $info
+    }
+    Assert-NotReparsePoint -PathValue $ConfigPath -Label 'existing Lane 2 config.toml'
+    $info.Exists = $true
+    $raw = [string](Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+    if ([string]::IsNullOrEmpty($raw)) { return $info }
+
+    $inSection = $false
+    $inMultiline = $false
+    $bracketDepth = 0
+    $multilineQuote = ''
+
+    foreach ($line in ($raw -split "\r?\n")) {
+        if ($inMultiline) {
+            Update-TomlMultilineState -Text $line -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
+            if ($bracketDepth -eq 0 -and $multilineQuote -eq '') { $inMultiline = $false }
+            continue
+        }
+        $noComment = (Remove-TomlInlineComment $line).Trim()
+        if ([string]::IsNullOrWhiteSpace($noComment)) { continue }
+
+        if ($noComment -match '^\[\[(.+)\]\]$') {
+            $inSection = $true
+            continue
+        }
+        if ($noComment -match '^\[(.+)\]$') {
+            $inSection = $true
+            $hdr = $Matches[1].Trim().ToLowerInvariant()
+            if ($hdr -eq 'sandbox_workspace_write') {
+                $info.HasSandboxWorkspaceWriteSection = $true
+            } elseif ($hdr -eq 'approval_policy' -or $hdr -like 'approval_policy.*') {
+                $info.HasApprovalPolicy = $true
+                if ([string]::IsNullOrEmpty($info.ApprovalPolicyValue)) { $info.ApprovalPolicyValue = 'granular' }
+            }
+            continue
+        }
+
+        if (-not $inSection) {
+            $kv = [regex]::Match($line, '^\s*([A-Za-z0-9_-]+)\s*=(.*)$')
+            if ($kv.Success) {
+                $k = $kv.Groups[1].Value
+                $rhs = $kv.Groups[2].Value
+                $bracketDepth = 0
+                $multilineQuote = ''
+                Update-TomlMultilineState -Text $rhs -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
+                $startsMultiline = ($bracketDepth -gt 0 -or $multilineQuote -ne '')
+                if ($startsMultiline) { $inMultiline = $true }
+
+                $rhsClean = (Remove-TomlInlineComment $rhs).Trim()
+                $valStr = ''
+                $vm = [regex]::Match($rhsClean, '^(?:"((?:[^"\\]|\\.)*)"|''([^'']*)'')\s*$')
+                if ($vm.Success) {
+                    $valStr = if ($vm.Groups[1].Success) { Unescape-TomlBasicString $vm.Groups[1].Value } else { $vm.Groups[2].Value }
+                } elseif ($rhsClean.StartsWith('{')) {
+                    $valStr = 'granular'
+                }
+
+                if ($k -ceq 'sandbox_mode') {
+                    $info.HasSandboxMode = $true
+                    $info.SandboxModeValue = $valStr
+                } elseif ($k -ceq 'approval_policy') {
+                    $info.HasApprovalPolicy = $true
+                    $info.ApprovalPolicyValue = if ($valStr) { $valStr } else { 'custom' }
+                }
+            }
+        }
+    }
+    return $info
+}
+
+function Get-MergedFeaturesSectionLines {
+    <#
+    .SYNOPSIS
+        Non-destructively merges managed Codex [features] flags with any pre-existing user
+        [features] entries (e.g., multi_agent_v2, plugins, hooks, fast_mode, apps, browser_use)
+        so native user feature toggles are never wiped during setup.
+    #>
+    param(
+        [AllowEmptyString()][string]$ExistingConfigPath = '',
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$ManagedFeatureMap
+    )
+    $managedKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $outLines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($mk in $ManagedFeatureMap.Keys) {
+        [void]$managedKeys.Add([string]$mk)
+        $outLines.Add("$mk = $($ManagedFeatureMap[$mk])")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ExistingConfigPath) -or -not (Test-Path -LiteralPath $ExistingConfigPath -PathType Leaf)) {
+        return , $outLines
+    }
+    Assert-NotReparsePoint -PathValue $ExistingConfigPath -Label 'existing config.toml [features] merge'
+    $raw = [string](Get-Content -LiteralPath $ExistingConfigPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+    if ([string]::IsNullOrEmpty($raw)) { return , $outLines }
+
+    $seenUserKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $inFeatures = $false
+    $inMultiline = $false
+    $keepMultiline = $false
+    $bracketDepth = 0
+    $multilineQuote = ''
+
+    foreach ($line in ($raw -split "\r?\n")) {
+        if ($inMultiline) {
+            if ($keepMultiline) { $outLines.Add($line) }
+            Update-TomlMultilineState -Text $line -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
+            if ($bracketDepth -eq 0 -and $multilineQuote -eq '') {
+                $inMultiline = $false
+                $keepMultiline = $false
+            }
+            continue
+        }
+        $noComment = (Remove-TomlInlineComment $line).Trim()
+        if ($noComment -match '^\[\[(.+)\]\]$') {
+            $inFeatures = $false
+            continue
+        }
+        if ($noComment -match '^\[(.+)\]$') {
+            $inFeatures = ($Matches[1].Trim().ToLowerInvariant() -eq 'features')
+            continue
+        }
+        if (-not $inFeatures) { continue }
+        if ([string]::IsNullOrWhiteSpace($noComment)) { continue }
+
+        $kv = [regex]::Match($line, '^\s*([A-Za-z0-9_-]+|"[^"]+"|''[^'']+'')\s*=(.*)$')
+        if ($kv.Success) {
+            $kName = $kv.Groups[1].Value.Trim('"', "'")
+            $rhs = $kv.Groups[2].Value
+            $keep = (-not $managedKeys.Contains($kName)) -and $seenUserKeys.Add($kName)
+            if ($keep) { $outLines.Add($line.Trim()) }
+            $bracketDepth = 0
+            $multilineQuote = ''
+            Update-TomlMultilineState -Text $rhs -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
+            if ($bracketDepth -gt 0 -or $multilineQuote -ne '') {
+                $inMultiline = $true
+                $keepMultiline = $keep
+            }
+        }
+    }
+    return , $outLines
 }
 
 # ============================================================================
@@ -1789,6 +2034,11 @@ if ($ConfigureGateway) {
     if (-not ($GatewayApiKeyEnv -match '^[A-Za-z_][A-Za-z0-9_]*$')) {
         throw "Invalid environment variable name for -GatewayApiKeyEnv: $GatewayApiKeyEnv"
     }
+}
+
+# Fail-closed Full Access danger warning & confirmation gate BEFORE any disk activity.
+if ($CliMode -eq 'FullAccess') {
+    Confirm-FullAccessOrExit
 }
 
 # Verify required kit templates are present before starting any installation mutations.
@@ -2188,8 +2438,10 @@ if ($configureGatewayLane2) {
     }
 }
 
+$existingCliSettings = Get-ExistingLane2CliSettings -ConfigPath $lane2ConfigPath
+
 $managedTopKeys = New-Object 'System.Collections.Generic.List[string]'
-$managedTopKeys.AddRange([string[]]@('sandbox_mode', 'approval_policy', 'windows_wsl_setup_acknowledged'))
+$managedTopKeys.Add('windows_wsl_setup_acknowledged')
 
 $lane2TopLines = New-Object 'System.Collections.Generic.List[string]'
 if ($configureGatewayLane2) {
@@ -2213,8 +2465,50 @@ if ($configureGatewayLane2) {
         $managedTopKeys.Add('model')
     }
 }
-$lane2TopLines.Add('sandbox_mode = "workspace-write"')
-$lane2TopLines.Add("approval_policy = `"$ApprovalPolicy`"")
+
+$manageSandboxWorkspaceWrite = $true
+$dropGranularApprovalSection = $false
+$effectiveApprovalForSync = $ApprovalPolicy
+$cliModeDesc = ''
+
+switch ($CliMode) {
+    'FullAccess' {
+        $managedTopKeys.Add('sandbox_mode')
+        $managedTopKeys.Add('approval_policy')
+        $lane2TopLines.Add('sandbox_mode = "danger-full-access"')
+        $lane2TopLines.Add('approval_policy = "never"')
+        $dropGranularApprovalSection = $true
+        $effectiveApprovalForSync = 'never'
+        $cliModeDesc = 'FullAccess (Toan quyen -- DANGER: approval_policy=never, sandbox_mode=danger-full-access)'
+    }
+    'Config' {
+        if (-not $existingCliSettings.HasSandboxMode) {
+            $managedTopKeys.Add('sandbox_mode')
+            $lane2TopLines.Add('sandbox_mode = "workspace-write"')
+        }
+        if (-not $existingCliSettings.HasApprovalPolicy) {
+            $managedTopKeys.Add('approval_policy')
+            $lane2TopLines.Add("approval_policy = `"$ApprovalPolicy`"")
+        }
+        if ($existingCliSettings.HasSandboxWorkspaceWriteSection -and (-not $script:ExplicitAllowSandboxNetwork)) {
+            $manageSandboxWorkspaceWrite = $false
+        }
+        $effectiveApprovalForSync = if ($existingCliSettings.HasApprovalPolicy) { $existingCliSettings.ApprovalPolicyValue } else { $ApprovalPolicy }
+        $effSbLabel = if ($existingCliSettings.HasSandboxMode) { $existingCliSettings.SandboxModeValue } else { 'workspace-write (default)' }
+        $effApLabel = if ($existingCliSettings.HasApprovalPolicy) { $existingCliSettings.ApprovalPolicyValue } else { "$ApprovalPolicy (default)" }
+        $cliModeDesc = "Config (Thuoc cau hinh config.toml: approval_policy=$effApLabel, sandbox_mode=$effSbLabel)"
+    }
+    default {
+        # Ask (Xin yeu cau -- default): workspace-write + on-request (or explicit -ApprovalPolicy if passed)
+        $managedTopKeys.Add('sandbox_mode')
+        $managedTopKeys.Add('approval_policy')
+        $lane2TopLines.Add('sandbox_mode = "workspace-write"')
+        $lane2TopLines.Add("approval_policy = `"$ApprovalPolicy`"")
+        $dropGranularApprovalSection = $true
+        $effectiveApprovalForSync = $ApprovalPolicy
+        $cliModeDesc = "Ask (Xin yeu cau: approval_policy=$ApprovalPolicy, sandbox_mode=workspace-write)"
+    }
+}
 $lane2TopLines.Add('windows_wsl_setup_acknowledged = true')
 
 if ($OfficialReasoning) {
@@ -2226,38 +2520,45 @@ if ($OfficialServiceTier) {
     $managedTopKeys.Add('service_tier')
 }
 
-# Only enable feature flags confirmed by the real binary (or safe defaults when probing is unsupported).
-$featureLines = New-Object 'System.Collections.Generic.List[string]'
+# Preserve native official Codex capabilities and merge non-destructively with any user [features] flags.
+$lane2ManagedFeatures = [ordered]@{}
 if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('daemon_auto_start')) {
-    $featureLines.Add('daemon_auto_start = false')
+    $lane2ManagedFeatures['daemon_auto_start'] = 'false'
 }
 if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('memories')) {
-    $featureLines.Add('memories = true')
-}
-if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('js_repl')) {
-    $featureLines.Add('js_repl = false')
-}
-if ($configureGatewayLane2) {
-    if ($supportedFeatures.ContainsKey('api_key_model_discovery')) { $featureLines.Add('api_key_model_discovery = true') }
-    if ($supportedFeatures.ContainsKey('image_generation')) { $featureLines.Add('image_generation = true') }
+    $lane2ManagedFeatures['memories'] = 'true'
 }
 if ($supportedFeatures.ContainsKey('goals')) {
-    $featureLines.Add('goals = true')
+    $lane2ManagedFeatures['goals'] = 'true'
 }
+if ($supportedFeatures.ContainsKey('image_generation')) {
+    $lane2ManagedFeatures['image_generation'] = 'true'
+}
+if ($supportedFeatures.ContainsKey('api_key_model_discovery')) {
+    $lane2ManagedFeatures['api_key_model_discovery'] = 'true'
+}
+$featureLines = Get-MergedFeaturesSectionLines -ExistingConfigPath $lane2ConfigPath -ManagedFeatureMap $lane2ManagedFeatures
 
 $lane2ProjectsSection = if ($lane2ProjectState.ProjectsBlock) { "`r`n`r`n" + $lane2ProjectState.ProjectsBlock } else { '' }
 
 $sandboxNetworkValue = if ($AllowSandboxNetwork) { 'true' } else { 'false' }
 $lane2TopBlock = $lane2TopLines -join "`r`n"
 
-$managedSectionNames = @(
+$managedSectionList = New-Object 'System.Collections.Generic.List[string]'
+$managedSectionList.AddRange([string[]]@(
     'windows',
     'features',
     'memories',
-    'sandbox_workspace_write',
     'shell_environment_policy',
     'shell_environment_policy.set'
-)
+))
+if ($manageSandboxWorkspaceWrite) {
+    $managedSectionList.Add('sandbox_workspace_write')
+}
+if ($dropGranularApprovalSection) {
+    $managedSectionList.Add('approval_policy')
+}
+$managedSectionNames = $managedSectionList.ToArray()
 
 $lane2ProviderBlock = ''
 $lane2ManagedSectionNames = $managedSectionNames
@@ -2276,6 +2577,10 @@ env_key = "$(Escape-TomlBasicString $GatewayApiKeyEnv)"
     $lane2ManagedSectionNames = $managedSectionNames + @($provHeaderL2, "model_providers.$GatewayProviderName", "model_providers.'$GatewayProviderName'")
 }
 
+$sandboxWorkspaceWriteBlock = if ($manageSandboxWorkspaceWrite) {
+    "`r`n`r`n[sandbox_workspace_write]`r`nnetwork_access = $sandboxNetworkValue"
+} else { '' }
+
 $lane2SectionsBlock = $lane2ProviderBlock + @"
 [windows]
 sandbox = "elevated"$lane2ProjectsSection
@@ -2285,10 +2590,7 @@ $($featureLines -join "`r`n")
 
 [memories]
 generate_memories = true
-use_memories = true
-
-[sandbox_workspace_write]
-network_access = $sandboxNetworkValue
+use_memories = true$sandboxWorkspaceWriteBlock
 
 [shell_environment_policy]
 exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]
@@ -2321,7 +2623,8 @@ if (-not $script:IsDryRun) {
     Protect-SensitiveFileAcl $lane2ConfigPath
     Save-RollbackManifestCheckpoint -Stage 'write:lane2-config.toml'
 }
-Write-Host "    Wrote: $lane2ConfigPath (preserved custom sections; $($lane2ProjectState.TrustedCount) trusted, $($lane2ProjectState.UntrustedCount) untrusted project(s))"
+Write-Host "    CLI Mode: $cliModeDesc"
+Write-Host "    Wrote: $lane2ConfigPath (preserved custom sections & user [features]; $($lane2ProjectState.TrustedCount) trusted, $($lane2ProjectState.UntrustedCount) untrusted project(s))"
 
 if ($ShareAuthToLane2) {
     Write-Step "Sharing authenticated session (auth.json) from Lane 1 to Lane 2 (-ShareAuthToLane2)..."
@@ -2387,12 +2690,12 @@ if ($configureGatewayLane1) {
     $lane1TopLines.Add('disable_response_storage = true')
     $lane1TopLines.Add('windows_wsl_setup_acknowledged = true')
 
-    $gwFeatureLines = New-Object 'System.Collections.Generic.List[string]'
-    if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('memories')) { $gwFeatureLines.Add('memories = true') }
-    if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('js_repl')) { $gwFeatureLines.Add('js_repl = false') }
-    if ($supportedFeatures.ContainsKey('api_key_model_discovery')) { $gwFeatureLines.Add('api_key_model_discovery = true') }
-    if ($supportedFeatures.ContainsKey('image_generation')) { $gwFeatureLines.Add('image_generation = true') }
-    if ($supportedFeatures.ContainsKey('goals')) { $gwFeatureLines.Add('goals = true') }
+    $gwManagedFeatures = [ordered]@{}
+    if ($supportedFeatures.Count -eq 0 -or $supportedFeatures.ContainsKey('memories')) { $gwManagedFeatures['memories'] = 'true' }
+    if ($supportedFeatures.ContainsKey('api_key_model_discovery')) { $gwManagedFeatures['api_key_model_discovery'] = 'true' }
+    if ($supportedFeatures.ContainsKey('image_generation')) { $gwManagedFeatures['image_generation'] = 'true' }
+    if ($supportedFeatures.ContainsKey('goals')) { $gwManagedFeatures['goals'] = 'true' }
+    $gwFeatureLines = Get-MergedFeaturesSectionLines -ExistingConfigPath $lane1ConfigPath -ManagedFeatureMap $gwManagedFeatures
 
     $provHeader = "model_providers.`"$(Escape-TomlBasicString $GatewayProviderName)`""
     $lane1TopBlock = $lane1TopLines -join "`r`n"
@@ -2851,7 +3154,10 @@ if ($SyncSessions) {
         if (-not (Test-Path -LiteralPath $syncScript -PathType Leaf)) {
             Write-Warning "Session sync script not found at $syncScript; skipping."
         } else {
-            $pyArgs = @($syncScript, '--lane1', $Lane1Home, '--lane2', $Lane2Home, '--repo', $effectiveLane2Repo, '--approval-mode', $ApprovalPolicy)
+            $pyArgs = @($syncScript, '--lane1', $Lane1Home, '--lane2', $Lane2Home, '--repo', $effectiveLane2Repo)
+            if ($effectiveApprovalForSync -in @('on-request', 'never')) {
+                $pyArgs += @('--approval-mode', $effectiveApprovalForSync)
+            }
             if ($PinnedOnlySync) { $pyArgs += '--pinned-only' }
             if ($script:IsDryRun) { $pyArgs += '--dry-run' }
             $prevSyncPref = $ErrorActionPreference

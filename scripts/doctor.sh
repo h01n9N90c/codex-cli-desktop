@@ -116,7 +116,12 @@ mode_has_group_or_other_bits() {
   if ! printf '%s' "${mode}" | grep -Eq '^[0-7]{3,4}$'; then
     return 1
   fi
-  local go_bits="${mode: -2}"
+  local go_bits=""
+  if [ "${#mode}" -eq 4 ]; then
+    go_bits="${mode:2:2}"
+  else
+    go_bits="${mode:1:2}"
+  fi
   [ "${go_bits}" != "00" ]
 }
 
@@ -419,6 +424,108 @@ check_lane() {
 
 check_lane "Lane 1" "${LANE1_HOME}"
 check_lane "Lane 2" "${LANE2_HOME}"
+
+# Read ONLY allowlisted top-level `sandbox_mode` and `approval_policy` values
+# (plus `[approval_policy]` granular detection) from Lane 2 config.toml without
+# ever echoing raw config lines or secrets.
+read_lane2_cli_mode_fields() {
+  local cfg_file="$1"
+  awk '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    function unquote(v) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      gsub(/^["\047]|["\047]$/, "", v)
+      return v
+    }
+    BEGIN { in_sec = 0; sb = ""; ap = "" }
+    {
+      sub(/\r$/, "", $0)
+      clean = strip_comment($0)
+    }
+    clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ {
+      in_sec = 1
+      sec = clean
+      sub(/^[[:space:]]*\[/, "", sec)
+      sub(/\][[:space:]]*$/, "", sec)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
+      lsec = tolower(sec)
+      if (ap == "" && (lsec == "approval_policy" || index(lsec, "approval_policy.") == 1)) {
+        ap = "granular"
+      }
+      next
+    }
+    !in_sec && clean ~ /^[[:space:]]*["\047]?sandbox_mode["\047]?[[:space:]]*=/ {
+      v = clean; sub(/^[^=]*=/, "", v); sb = unquote(v)
+    }
+    !in_sec && clean ~ /^[[:space:]]*["\047]?approval_policy["\047]?[[:space:]]*=/ {
+      v = clean; sub(/^[^=]*=/, "", v)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      if (substr(v, 1, 1) == "{") ap = "granular"
+      else ap = unquote(v)
+    }
+    END {
+      if (sb ~ /^[A-Za-z0-9_.-]{1,32}$/ && sb !~ /^(sk-|eyJ|Bearer|ghp_|gho_|xox)/) print "SB=" sb
+      if (ap ~ /^[A-Za-z0-9_.-]{1,32}$/ && ap !~ /^(sk-|eyJ|Bearer|ghp_|gho_|xox)/) print "AP=" ap
+    }
+  ' "${cfg_file}" 2>/dev/null || true
+}
+
+check_lane2_cli_mode() {
+  local cfg="${LANE2_HOME}/config.toml"
+  if [ -L "${cfg}" ]; then
+    report "WARN" "Sandbox 2 CLI Mode" "config.toml is a symlink; refusing to trust active CLI mode"
+    return 0
+  fi
+  if [ ! -f "${cfg}" ]; then
+    report "WARN" "Sandbox 2 CLI Mode" "config.toml missing (default Ask mode applies after setup)"
+    return 0
+  fi
+  local sb="" ap="" parsed="" line=""
+  parsed="$(read_lane2_cli_mode_fields "${cfg}")"
+  if [ -n "${parsed}" ]; then
+    while IFS= read -r line; do
+      line="${line%$'\r'}"
+      case "${line}" in
+        SB=*) sb="${line#SB=}" ;;
+        AP=*) ap="${line#AP=}" ;;
+      esac
+    done <<< "${parsed}"
+  fi
+
+  if [ "${sb}" = "danger-full-access" ]; then
+    if [ "${ap}" = "never" ]; then
+      report "WARN" "Sandbox 2 CLI Mode" "Full Access (danger-full-access, approval_policy=never) — OS sandbox & approval prompts disabled"
+    else
+      report "WARN" "Sandbox 2 CLI Mode" "Config (sandbox_mode=danger-full-access, approval_policy=${ap:-unset}) — OS sandbox disabled"
+    fi
+  elif [ "${sb}" = "workspace-write" ] && [ "${ap}" = "on-request" ]; then
+    report "PASS" "Sandbox 2 CLI Mode" "Ask (sandbox_mode=workspace-write, approval_policy=on-request)"
+  else
+    report "PASS" "Sandbox 2 CLI Mode" "Config (config.toml: approval_policy=${ap:-unset}, sandbox_mode=${sb:-unset})"
+  fi
+}
+
+check_lane2_cli_mode
 
 # ------------------------------------------------------------------------------
 # 6. Auth Isolation & POSIX Permission Hygiene (NEVER Echoes Secrets/Tokens)

@@ -45,10 +45,32 @@
                             NTFS Junctions first, verify zero reparse points at all depths, and
                             remove Sandbox 2 + CLI wrappers cleanly.
                             Step 3: verifies GPT 1 chat history remains 100% intact.
+      [7]  SetCliMode     : Interactive & scriptable 3-mode Sandbox 2 (Codex CLI) permission
+                            selector (`-CliMode Ask|Config|FullAccess`):
+                              - [1] Xin yeu cau (Ask): approval_policy="on-request",
+                                    sandbox_mode="workspace-write" (project-contained, read-only
+                                    external reference).
+                              - [2] Thuoc cau hinh config.toml (Config): preserves your custom
+                                    approval_policy & sandbox_mode in ~/.codex-official/config.toml
+                                    (optional direct editor open + TOML validation + ACL lock).
+                              - [3] Toan quyen (Full Access -- DANGER): displays a high-visibility
+                                    RED/YELLOW Codex danger warning and requires exact interactive
+                                    confirmation ('TOAN QUYEN' or 'I UNDERSTAND') or explicit
+                                    -ConfirmFullAccess (-Force alone does NOT bypass); refuses
+                                    fail-closed (exit 1, zero mutations) if unconfirmed.
 
 .PARAMETER Action
     Operation to execute: Menu (default), ApiGpt, ApiOther, Login, CheckApiKey, CheckAccounts,
-    SyncHistory, or RemoveSandbox2.
+    SyncHistory, RemoveSandbox2, or SetCliMode.
+
+.PARAMETER CliMode
+    Target Sandbox 2 (Codex CLI) permission mode for -Action SetCliMode:
+    Ask (Xin yeu cau), Config (Thuoc cau hinh config.toml), or FullAccess (Toan quyen -- DANGER).
+
+.PARAMETER ConfirmFullAccess
+    Explicit acknowledgement switch required to enable FullAccess (approval_policy="never",
+    sandbox_mode="danger-full-access") in non-interactive/scripted runs. -Force alone does NOT
+    bypass this safety gate.
 
 .PARAMETER Lane1Home
     CODEX_HOME directory for GPT 1 (Codex Desktop). Defaults to $env:CODEX_LANE1_HOME or %USERPROFILE%\.codex.
@@ -112,8 +134,11 @@
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'None')]
 param(
-    [ValidateSet('Menu', 'ApiGpt', 'ApiOther', 'Login', 'CheckApiKey', 'CheckAccounts', 'SyncHistory', 'RemoveSandbox2')]
+    [ValidateSet('Menu', 'ApiGpt', 'ApiOther', 'Login', 'CheckApiKey', 'CheckAccounts', 'SyncHistory', 'RemoveSandbox2', 'SetCliMode')]
     [string]$Action = 'Menu',
+    [ValidateSet('', 'Ask', 'Config', 'FullAccess')]
+    [string]$CliMode = '',
+    [switch]$ConfirmFullAccess,
     [string]$Lane1Home = $(if (-not [string]::IsNullOrWhiteSpace($env:CODEX_LANE1_HOME)) { $env:CODEX_LANE1_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$Lane2Home = $(if (-not [string]::IsNullOrWhiteSpace($env:CODEX_LANE2_HOME)) { $env:CODEX_LANE2_HOME } else { Join-Path $env:USERPROFILE '.codex-official' }),
     [string]$LocalBin  = $(if (-not [string]::IsNullOrWhiteSpace($env:CODEX_LOCAL_BIN))  { $env:CODEX_LOCAL_BIN }  else { Join-Path $env:USERPROFILE '.local\bin' }),
@@ -1018,6 +1043,12 @@ function Get-TomlConfigSummary([string]$ConfigPath) {
         if ($noComment -match '^\[(.+)\]$') {
             $inSection = $true
             $hdrInner = $Matches[1].Trim()
+            $hdrLower = $hdrInner.ToLowerInvariant()
+            if ($hdrLower -eq 'approval_policy' -or $hdrLower -like 'approval_policy.*') {
+                if ([string]::IsNullOrEmpty($summary.ApprovalPolicy)) {
+                    $summary.ApprovalPolicy = 'granular'
+                }
+            }
             # Direct [model_providers.<name>] section (ignore deeper subtables for base_url/env_key)
             $directProvMatch = [regex]::Match($hdrInner, '^model_providers\s*\.\s*(?:"((?:[^"\\]|\\.)+)"|''([^'']+)''|([A-Za-z0-9_-]+))\s*$')
             if ($directProvMatch.Success) {
@@ -1048,6 +1079,9 @@ function Get-TomlConfigSummary([string]$ConfigPath) {
             $multilineQuote = ''
             Update-TomlMultilineState -Text $rhs -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
             if ($bracketDepth -gt 0 -or $multilineQuote -ne '') {
+                if (-not $inSection -and $k -ceq 'approval_policy' -and (Remove-TomlInlineComment $rhs).Trim().StartsWith('{')) {
+                    $summary.ApprovalPolicy = 'granular'
+                }
                 $inMultiline = $true
                 continue
             }
@@ -1057,7 +1091,13 @@ function Get-TomlConfigSummary([string]$ConfigPath) {
                     'model_provider'  { $summary.ModelProvider  = $valStr }
                     'model'           { $summary.Model          = $valStr }
                     'sandbox_mode'    { $summary.SandboxMode    = $valStr }
-                    'approval_policy' { $summary.ApprovalPolicy = $valStr }
+                    'approval_policy' {
+                        if (-not [string]::IsNullOrEmpty($valStr)) {
+                            $summary.ApprovalPolicy = $valStr
+                        } elseif ((Remove-TomlInlineComment $rhs).Trim().StartsWith('{')) {
+                            $summary.ApprovalPolicy = 'granular'
+                        }
+                    }
                 }
             } elseif ($null -ne $currentProviderKey) {
                 $pObj = $providers[$currentProviderKey]
@@ -1258,6 +1298,282 @@ except Exception as exc:
     }
     $safeErr = Redact-SecretsFromText -Text $out
     return [PSCustomObject]@{ Checked = $true; Valid = $false; Message = $safeErr }
+}
+
+function Get-CliPermissionModeInfo([string]$ConfigPath) {
+    <#
+    .SYNOPSIS
+        Classifies Sandbox 2's active Codex CLI permission mode from config.toml without mutating disk:
+          - Full Access : sandbox_mode="danger-full-access" && approval_policy="never"
+          - Ask         : sandbox_mode="workspace-write" && approval_policy="on-request"
+          - Config      : any other explicit/custom/unset config.toml combination
+    #>
+    $sum = Get-TomlConfigSummary -ConfigPath $ConfigPath
+    $ap = $sum.ApprovalPolicy
+    $sb = $sum.SandboxMode
+    $apLbl = if (-not [string]::IsNullOrWhiteSpace($ap)) { $ap } else { 'unset' }
+    $sbLbl = if (-not [string]::IsNullOrWhiteSpace($sb)) { $sb } else { 'unset' }
+
+    if (-not $sum.Exists) {
+        return [PSCustomObject]@{
+            ModeKey        = 'Config'
+            ApprovalPolicy = ''
+            SandboxMode    = ''
+            DisplayLabel   = 'Not configured yet (config.toml missing)'
+            ShortLabel     = 'Not configured'
+            Color          = 'DarkYellow'
+            IsDanger       = $false
+        }
+    }
+    if ($sum.IsSymlink) {
+        return [PSCustomObject]@{
+            ModeKey        = 'Config'
+            ApprovalPolicy = ''
+            SandboxMode    = ''
+            DisplayLabel   = 'SYMLINK_REJECTED (config.toml is a reparse point)'
+            ShortLabel     = 'SYMLINK_REJECTED'
+            Color          = 'Red'
+            IsDanger       = $true
+        }
+    }
+    if (($sb -ceq 'danger-full-access') -and ($ap -ceq 'never')) {
+        return [PSCustomObject]@{
+            ModeKey        = 'FullAccess'
+            ApprovalPolicy = $ap
+            SandboxMode    = $sb
+            DisplayLabel   = 'Full Access (Toan quyen -- DANGER: approval_policy=never, sandbox_mode=danger-full-access)'
+            ShortLabel     = 'Full Access (Toan quyen -- DANGER)'
+            Color          = 'Red'
+            IsDanger       = $true
+        }
+    }
+    if (($sb -ceq 'workspace-write') -and ($ap -ceq 'on-request')) {
+        return [PSCustomObject]@{
+            ModeKey        = 'Ask'
+            ApprovalPolicy = $ap
+            SandboxMode    = $sb
+            DisplayLabel   = 'Ask (Xin yeu cau: approval_policy=on-request, sandbox_mode=workspace-write)'
+            ShortLabel     = 'Ask (Xin yeu cau)'
+            Color          = 'Green'
+            IsDanger       = $false
+        }
+    }
+    $isDangerCustom = ($sb -ceq 'danger-full-access')
+    $warnTag = if ($isDangerCustom) { ' [WARN danger-full-access]' } else { '' }
+    return [PSCustomObject]@{
+        ModeKey        = 'Config'
+        ApprovalPolicy = $ap
+        SandboxMode    = $sb
+        DisplayLabel   = "Config (config.toml${warnTag}: approval=$apLbl, sandbox=$sbLbl)"
+        ShortLabel     = "Config (config.toml: approval=$apLbl, sandbox=$sbLbl)"
+        Color          = if ($isDangerCustom) { 'Yellow' } else { 'Cyan' }
+        IsDanger       = $isDangerCustom
+    }
+}
+
+function Show-FullAccessDangerWarning {
+    <#
+    .SYNOPSIS
+        Displays a high-visibility RED/YELLOW danger warning modeled on Codex CLI's
+        `--dangerously-bypass-approvals-and-sandbox` ("EXTREMELY DANGEROUS") banner.
+    #>
+    Write-Host ""
+    Write-Host "========================================================================" -ForegroundColor Red
+    Write-Host "  [!] CANH BAO NGUY HIEM -- EXTREMELY DANGEROUS (FULL ACCESS / TOAN QUYEN)" -ForegroundColor Red
+    Write-Host "========================================================================" -ForegroundColor Red
+    Write-Host "  Che do nay se ghi vao Sandbox 2 (~/.codex-official/config.toml):" -ForegroundColor Yellow
+    Write-Host '    approval_policy = "never"               (TAT HOAN TOAN hoi duyet lenh)' -ForegroundColor Red
+    Write-Host '    sandbox_mode    = "danger-full-access"  (TAT HOAN TOAN OS sandbox)' -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  RUI RO TREN TOAN MAY (HOST-WIDE RISKS):" -ForegroundColor Yellow
+    Write-Host "    - Bo qua ranh gioi workspace-write: Codex CLI co toan quyen DOC / GHI / XOA" -ForegroundColor Yellow
+    Write-Host "      file, CHAY LENH shell va truy cap MANG tren TOAN MAY theo quyen user OS." -ForegroundColor Yellow
+    Write-Host "    - Khong hoi duyet truoc khi thuc thi lenh hay sua file ngoai thu muc du an." -ForegroundColor Yellow
+    Write-Host "    - rules\default.rules chi chan prefix lenh truc tiep (argv), KHONG the" -ForegroundColor Yellow
+    Write-Host "      chan het payload long trong powershell -Command / cmd /c / bash -c." -ForegroundColor Yellow
+    Write-Host "    - Prompt injection tu repo/file la hoac loi AI co the gay mat du lieu ngoai" -ForegroundColor Yellow
+    Write-Host "      thu muc du an hoac ro ri thong tin nhay cam." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  KHUYEN NGHI AN TOAN:" -ForegroundColor Yellow
+    Write-Host "    - Tao Git commit checkpoint (hoac dung Git worktree / VM co lap) truoc!" -ForegroundColor Yellow
+    Write-Host "    - Chuyen lai ve [1] Xin yeu cau (Ask) ngay sau khi hoan thanh tac vu." -ForegroundColor Yellow
+    Write-Host "========================================================================" -ForegroundColor Red
+    Write-Host ""
+}
+
+function Set-CodexConfigPermissionMode {
+    <#
+    .SYNOPSIS
+        Surgically updates ONLY top-level `sandbox_mode` and `approval_policy` in Lane2\config.toml,
+        preserving 100% of [projects.*] trust levels, [features], [mcp_servers.*], [plugins.*],
+        [tui], [model_providers.*], [[array_tables]], comments, and custom top-level keys.
+        Also removes any conflicting [approval_policy] / [approval_policy.*] granular table when
+        setting a string approval_policy so the resulting TOML is guaranteed valid and duplicate-free.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$SandboxMode,
+        [Parameter(Mandatory = $true)][string]$ApprovalPolicy
+    )
+    Assert-NotReparsePoint -PathValue $ConfigPath -Label 'Lane 2 config.toml'
+
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        $freshText = @(
+            '# Sandbox 2 (Codex CLI) Configuration',
+            "sandbox_mode = `"$SandboxMode`"",
+            "approval_policy = `"$ApprovalPolicy`""
+        ) -join "`r`n"
+        Write-Utf8NoBom -FilePath $ConfigPath -Text ($freshText + "`r`n")
+        return
+    }
+
+    $raw = [string](Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop)
+    $topLines = New-Object 'System.Collections.Generic.List[string]'
+    $sectionLines = New-Object 'System.Collections.Generic.List[string]'
+
+    $inSection = $false
+    $skipSection = $false
+    $inMultiline = $false
+    $skipMultiline = $false
+    $bracketDepth = 0
+    $multilineQuote = ''
+
+    $replacedSandbox = $false
+    $replacedApproval = $false
+
+    foreach ($line in ($raw -split "\r?\n")) {
+        if ($inMultiline) {
+            if (-not $skipMultiline) {
+                if ($inSection) { $sectionLines.Add($line) } else { $topLines.Add($line) }
+            }
+            Update-TomlMultilineState -Text $line -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
+            if ($bracketDepth -eq 0 -and $multilineQuote -eq '') {
+                $inMultiline = $false
+                $skipMultiline = $false
+            }
+            continue
+        }
+
+        $noComment = (Remove-TomlInlineComment $line).Trim()
+        if ($noComment -match '^\[\[(.+)\]\]$') {
+            $inSection = $true
+            $skipSection = $false
+            $sectionLines.Add($line)
+            continue
+        }
+        if ($noComment -match '^\[(.+)\]$') {
+            $inSection = $true
+            $hdrLower = $Matches[1].Trim().ToLowerInvariant()
+            if ($hdrLower -eq 'approval_policy' -or $hdrLower -like 'approval_policy.*') {
+                $skipSection = $true
+            } else {
+                $skipSection = $false
+                $sectionLines.Add($line)
+            }
+            continue
+        }
+
+        if (-not $inSection) {
+            $kv = [regex]::Match($line, '^\s*([A-Za-z0-9_-]+)\s*=(.*)$')
+            if ($kv.Success) {
+                $k = $kv.Groups[1].Value
+                $rhs = $kv.Groups[2].Value
+                $bracketDepth = 0
+                $multilineQuote = ''
+                Update-TomlMultilineState -Text $rhs -BracketDepth ([ref]$bracketDepth) -MultilineQuote ([ref]$multilineQuote)
+                $startsMultiline = ($bracketDepth -gt 0 -or $multilineQuote -ne '')
+
+                if ($k -ceq 'sandbox_mode') {
+                    if (-not $replacedSandbox) {
+                        $topLines.Add("sandbox_mode = `"$SandboxMode`"")
+                        $replacedSandbox = $true
+                    }
+                    if ($startsMultiline) { $inMultiline = $true; $skipMultiline = $true }
+                    continue
+                }
+                if ($k -ceq 'approval_policy') {
+                    if (-not $replacedApproval) {
+                        $topLines.Add("approval_policy = `"$ApprovalPolicy`"")
+                        $replacedApproval = $true
+                    }
+                    if ($startsMultiline) { $inMultiline = $true; $skipMultiline = $true }
+                    continue
+                }
+                if ($startsMultiline) { $inMultiline = $true; $skipMultiline = $false }
+            }
+            $topLines.Add($line)
+        } else {
+            if (-not $skipSection) {
+                $sectionLines.Add($line)
+            }
+        }
+    }
+
+    # Trim trailing empty lines from $topLines before appending any newly inserted top-level keys.
+    while ($topLines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($topLines[$topLines.Count - 1])) {
+        $topLines.RemoveAt($topLines.Count - 1)
+    }
+    if (-not $replacedSandbox) {
+        $topLines.Add("sandbox_mode = `"$SandboxMode`"")
+    }
+    if (-not $replacedApproval) {
+        $topLines.Add("approval_policy = `"$ApprovalPolicy`"")
+    }
+
+    $combined = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($tl in $topLines) { $combined.Add($tl) }
+    if ($sectionLines.Count -gt 0) {
+        if ($combined.Count -gt 0) { $combined.Add('') }
+        $leadingBlank = $true
+        foreach ($sl in $sectionLines) {
+            if ($leadingBlank -and [string]::IsNullOrWhiteSpace($sl)) { continue }
+            $leadingBlank = $false
+            $combined.Add($sl)
+        }
+    }
+
+    $finalText = (($combined -join "`r`n").TrimEnd()) + "`r`n"
+    Write-Utf8NoBom -FilePath $ConfigPath -Text $finalText
+}
+
+function Invoke-OpenConfigInEditor {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$EditorCommand
+    )
+    Write-Info "Opening '$ConfigPath' with '$EditorCommand' (save & close editor to continue)..."
+    $edExt = [System.IO.Path]::GetExtension($EditorCommand).ToLowerInvariant()
+    $prevPref = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        if ($edExt -eq '.ps1' -and (Test-Path -LiteralPath $EditorCommand -PathType Leaf)) {
+            & $script:CurrentPsExe -NoProfile -ExecutionPolicy Bypass -File $EditorCommand $ConfigPath 2>&1 | ForEach-Object {
+                Write-Host ("    " + (Redact-SecretsFromText -Text ([string]$_)))
+            }
+            if ($LASTEXITCODE -ne 0) {
+                Write-FailLine "Editor script exited with code $LASTEXITCODE."
+                return $false
+            }
+        } elseif (($edExt -eq '.cmd' -or $edExt -eq '.bat') -and (Test-Path -LiteralPath $EditorCommand -PathType Leaf)) {
+            & $EditorCommand $ConfigPath 2>&1 | ForEach-Object {
+                Write-Host ("    " + (Redact-SecretsFromText -Text ([string]$_)))
+            }
+            if ($LASTEXITCODE -ne 0) {
+                Write-FailLine "Editor command exited with code $LASTEXITCODE."
+                return $false
+            }
+        } elseif (Test-Path -LiteralPath $EditorCommand -PathType Leaf) {
+            Start-Process -FilePath $EditorCommand -ArgumentList @("`"$ConfigPath`"") -Wait -ErrorAction Stop
+        } elseif ($EditorCommand -match '^(\S+)\s+(.+)$') {
+            Start-Process -FilePath $Matches[1] -ArgumentList @($Matches[2], "`"$ConfigPath`"") -Wait -ErrorAction Stop
+        } else {
+            Start-Process -FilePath $EditorCommand -ArgumentList @("`"$ConfigPath`"") -Wait -ErrorAction Stop
+        }
+        return $true
+    } finally {
+        $ErrorActionPreference = $prevPref
+        $global:LASTEXITCODE = 0
+    }
 }
 
 function Get-SafeAuthMetadata([string]$AuthJsonPath) {
@@ -2090,10 +2406,15 @@ function Invoke-ActionCheckAccounts {
             Write-Host ("    auth.json metadata : " + ($metaParts -join ' | '))
 
             # Safe config.toml summary
-            $mpLbl = if ($cfgSum.ModelProvider) { $cfgSum.ModelProvider } else { 'openai(default)' }
-            $ekLbl = if ($cfgSum.ActiveEnvKey)  { $cfgSum.ActiveEnvKey }  else { 'none' }
-            $sbLbl = if ($cfgSum.SandboxMode)   { $cfgSum.SandboxMode }   else { 'unset(native)' }
-            Write-Host "    config.toml        : model_provider=$mpLbl | env_key=$ekLbl | sandbox_mode=$sbLbl"
+            $mpLbl = if ($cfgSum.ModelProvider)  { $cfgSum.ModelProvider }  else { 'openai(default)' }
+            $ekLbl = if ($cfgSum.ActiveEnvKey)   { $cfgSum.ActiveEnvKey }   else { 'none' }
+            $sbLbl = if ($cfgSum.SandboxMode)    { $cfgSum.SandboxMode }    else { 'unset(native)' }
+            $apLbl = if ($cfgSum.ApprovalPolicy) { $cfgSum.ApprovalPolicy } else { 'unset(native)' }
+            Write-Host "    config.toml        : model_provider=$mpLbl | env_key=$ekLbl | sandbox_mode=$sbLbl | approval_policy=$apLbl"
+            if ($lane.Home -eq $Lane2Home) {
+                $lane2Mode = Get-CliPermissionModeInfo -ConfigPath $cfgPath
+                Write-Host "    CLI Permission Mode: $($lane2Mode.DisplayLabel)" -ForegroundColor $lane2Mode.Color
+            }
             if ($cfgSum.PlaintextSecretKeys.Count -gt 0) {
                 Write-WarnLine ("Plaintext key(s) in config.toml: " + ($cfgSum.PlaintextSecretKeys -join ', ') + ' (values redacted)')
             }
@@ -2278,21 +2599,310 @@ function Invoke-ActionRemoveSandbox2 {
 }
 
 # ============================================================================
+# Action 7: SetCliMode -- 3-Mode Sandbox 2 (Codex CLI) Permission Selector
+# ============================================================================
+
+function Invoke-ActionSetCliMode {
+    Write-Section '[7] Chon Che Do Quyen Sandbox 2 (Codex CLI): Xin yeu cau / Config / Toan quyen'
+    Write-Info "Sandbox 2 (CLI): $Lane2Home"
+
+    $lane2Cfg = Join-Path $Lane2Home 'config.toml'
+    $curMode = Get-CliPermissionModeInfo -ConfigPath $lane2Cfg
+    Write-Host "    Che do hien tai    : $($curMode.DisplayLabel)" -ForegroundColor $curMode.Color
+
+    $targetMode = $CliMode
+    if ([string]::IsNullOrWhiteSpace($targetMode)) {
+        if ($NonInteractive) {
+            Write-FailLine 'NonInteractive SetCliMode requires -CliMode Ask|Config|FullAccess.'
+            return 1
+        }
+        $isNonTty = $false
+        try {
+            if ([Console]::IsInputRedirected -or (-not [System.Environment]::UserInteractive)) { $isNonTty = $true }
+        } catch { $isNonTty = $true }
+        if ($isNonTty) {
+            Write-FailLine 'Non-TTY SetCliMode requires -CliMode Ask|Config|FullAccess.'
+            return 1
+        }
+
+        Write-Host ""
+        Write-Host "  Chon che do quyen cho Sandbox 2 (Codex CLI):" -ForegroundColor Cyan
+        Write-Host "    [1] Xin yeu cau (Ask)" -ForegroundColor Green
+        Write-Host '        -> approval_policy = "on-request", sandbox_mode = "workspace-write"' -ForegroundColor Gray
+        Write-Host "        -> Gon trong thu muc du an, chi tham khao thuat toan ben ngoai o che do chi-doc, hoi truoc lenh nhay cam." -ForegroundColor Gray
+        Write-Host "    [2] Thuoc cau hinh config.toml (Config)" -ForegroundColor Cyan
+        Write-Host "        -> Giu nguyen approval_policy / sandbox_mode theo ~/.codex-official/config.toml cua ban" -ForegroundColor Gray
+        Write-Host "        -> Tuy chon mo thang config.toml chinh sua + validate TOML + khoa ACL." -ForegroundColor Gray
+        Write-Host "    [3] Toan quyen (Full Access -- DANGER)" -ForegroundColor Red
+        Write-Host '        -> approval_policy = "never", sandbox_mode = "danger-full-access"' -ForegroundColor Yellow
+        Write-Host "        -> TAT sandbox & TAT hoi duyet toan may! Bat buoc xac nhan canh bao nguy hiem." -ForegroundColor Yellow
+        Write-Host "    [0] Huy / Quay lai (Cancel)" -ForegroundColor DarkGray
+        Write-Host ""
+
+        $pick = Read-Host 'Chon che do [1/2/3, hoac 0 de huy]'
+        if ($null -eq $pick) {
+            Write-Info '[CANCELLED] Khong co thay doi nao duoc thuc hien.'
+            return 0
+        }
+        switch ($pick.Trim().ToUpperInvariant()) {
+            '1'          { $targetMode = 'Ask' }
+            'ASK'        { $targetMode = 'Ask' }
+            '2'          { $targetMode = 'Config' }
+            'CONFIG'     { $targetMode = 'Config' }
+            '3'          { $targetMode = 'FullAccess' }
+            'FULL'       { $targetMode = 'FullAccess' }
+            'FULLACCESS' { $targetMode = 'FullAccess' }
+            '0'          { Write-Info '[CANCELLED] Khong co thay doi nao duoc thuc hien.'; return 0 }
+            ''           { Write-Info '[CANCELLED] Khong co thay doi nao duoc thuc hien.'; return 0 }
+            default      { Write-WarnLine "Lua chon khong hop le: $pick"; return 1 }
+        }
+    }
+
+    switch ($targetMode) {
+        'Ask' {
+            Write-Section '[1] Ap dung che do: Xin yeu cau (Ask -- on-request + workspace-write)'
+            if (-not (Test-Path -LiteralPath $Lane2Home)) {
+                if ($script:IsDryRun) {
+                    Write-Info "[DRY-RUN] Would create directory: $Lane2Home"
+                } else {
+                    [void][System.IO.Directory]::CreateDirectory($Lane2Home)
+                }
+            }
+            Assert-NotReparsePoint -PathValue $lane2Cfg -Label 'Lane 2 config.toml'
+
+            if ($script:IsDryRun) {
+                if (Test-Path -LiteralPath $lane2Cfg -PathType Leaf) {
+                    Write-Info "[DRY-RUN] Would backup '$lane2Cfg'"
+                }
+                Write-Info '[DRY-RUN] Would set approval_policy = "on-request" and sandbox_mode = "workspace-write" (preserving [projects.*], [features], [mcp_servers.*], [plugins.*], [tui]).'
+                Write-Info "[DRY-RUN] Would lock 2-step NTFS DACL on: $lane2Cfg"
+                [void](Invoke-HistorySync -SourceHome $Lane1Home -TargetHome $Lane2Home -Bidirectional)
+                return 0
+            }
+
+            if (Test-Path -LiteralPath $lane2Cfg -PathType Leaf) {
+                $bkp = New-TimestampedBackup -FilePath $lane2Cfg
+                Write-Ok "Backup created & ACL-locked: $bkp"
+            }
+            Set-CodexConfigPermissionMode -ConfigPath $lane2Cfg -SandboxMode 'workspace-write' -ApprovalPolicy 'on-request'
+
+            $tomlRes = Test-TomlSyntax -ConfigPath $lane2Cfg
+            if (-not $tomlRes.Valid) {
+                Write-FailLine "TOML validation failed after updating '$lane2Cfg': $($tomlRes.Message)"
+                return 1
+            } elseif ($tomlRes.Checked) {
+                Write-Ok $tomlRes.Message
+            }
+
+            Protect-SensitiveFileAcl $lane2Cfg
+            Write-Ok "Locked 2-step NTFS DACL: $lane2Cfg"
+            Write-Ok 'Sandbox 2 switched to [1] Xin yeu cau (Ask): approval_policy="on-request", sandbox_mode="workspace-write" (project-contained; external reference read-only).'
+
+            Write-Section 'Dong bo lich su chat 2 chieu (GPT 1 <-> Sandbox 2)...'
+            [void](Invoke-HistorySync -SourceHome $Lane1Home -TargetHome $Lane2Home -Bidirectional)
+            return 0
+        }
+
+        'Config' {
+            Write-Section '[2] Che do: Thuoc cau hinh config.toml (Config -- giu nguyen config.toml cua ban)'
+            if (-not (Test-Path -LiteralPath $Lane2Home)) {
+                if ($script:IsDryRun) {
+                    Write-Info "[DRY-RUN] Would create directory: $Lane2Home"
+                } else {
+                    [void][System.IO.Directory]::CreateDirectory($Lane2Home)
+                }
+            }
+            Assert-NotReparsePoint -PathValue $lane2Cfg -Label 'Lane 2 config.toml'
+
+            if (-not (Test-Path -LiteralPath $lane2Cfg -PathType Leaf)) {
+                $starterCfg = @(
+                    '# Sandbox 2 (Codex CLI) Configuration (user-managed config.toml)',
+                    'sandbox_mode = "workspace-write"',
+                    'approval_policy = "on-request"'
+                ) -join "`r`n"
+                if ($script:IsDryRun) {
+                    Write-Info "[DRY-RUN] Would create starter config.toml at: $lane2Cfg"
+                } else {
+                    Write-Utf8NoBom -FilePath $lane2Cfg -Text ($starterCfg + "`r`n")
+                    Protect-SensitiveFileAcl $lane2Cfg
+                    Write-Info "Created starter config.toml: $lane2Cfg"
+                }
+            }
+
+            $cfgBefore = Get-TomlConfigSummary -ConfigPath $lane2Cfg
+            $apDisp = if ($cfgBefore.ApprovalPolicy) { $cfgBefore.ApprovalPolicy } else { 'unset(native)' }
+            $sbDisp = if ($cfgBefore.SandboxMode)    { $cfgBefore.SandboxMode }    else { 'unset(native)' }
+            Write-Host "    File config.toml Sandbox 2 : $lane2Cfg" -ForegroundColor White
+            Write-Host "    approval_policy (preserved): $apDisp" -ForegroundColor Cyan
+            Write-Host "    sandbox_mode    (preserved): $sbDisp" -ForegroundColor Cyan
+
+            $effectiveEditor = ''
+            if (-not [string]::IsNullOrWhiteSpace($Editor)) {
+                $effectiveEditor = $Editor.Trim()
+            } elseif (-not $NonInteractive) {
+                $openAns = Read-Host 'Mo truc tiep config.toml de chinh sua ngay bay gio? [y/N]'
+                if ($openAns -and $openAns.Trim() -match '^(y|yes)$') {
+                    $effectiveEditor = if (-not [string]::IsNullOrWhiteSpace($env:EDITOR)) { $env:EDITOR.Trim() } else { 'notepad.exe' }
+                }
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($effectiveEditor)) {
+                if (Test-Path -LiteralPath $lane2Cfg -PathType Leaf) {
+                    $bkp = New-TimestampedBackup -FilePath $lane2Cfg
+                    if ($script:IsDryRun) {
+                        Write-Info "[DRY-RUN] Would create backup: $bkp"
+                    } else {
+                        Write-Ok "Backup created & ACL-locked: $bkp"
+                    }
+                }
+                if ($script:IsDryRun) {
+                    Write-Info "[DRY-RUN] Would open '$lane2Cfg' with editor '$effectiveEditor' (wait until closed)."
+                } else {
+                    $edOk = Invoke-OpenConfigInEditor -ConfigPath $lane2Cfg -EditorCommand $effectiveEditor
+                    if (-not $edOk) { return 1 }
+                }
+            } else {
+                Write-Info 'Preserving existing approval_policy & sandbox_mode in Lane2\config.toml untouched.'
+            }
+
+            $exitCode = 0
+            if (Test-Path -LiteralPath $lane2Cfg -PathType Leaf) {
+                $tomlRes = Test-TomlSyntax -ConfigPath $lane2Cfg
+                if (-not $tomlRes.Valid) {
+                    Write-FailLine "Invalid TOML syntax in '$lane2Cfg': $($tomlRes.Message)"
+                    $exitCode = 1
+                } elseif ($tomlRes.Checked) {
+                    Write-Ok $tomlRes.Message
+                } else {
+                    Write-Info $tomlRes.Message
+                }
+
+                $cfgRaw = [string](Get-Content -LiteralPath $lane2Cfg -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+                $badKeys = @(Find-PlaintextSecretsInToml -ConfigText $cfgRaw)
+                if ($badKeys.Count -gt 0) {
+                    Write-WarnLine ("SECURITY WARNING: Plaintext secret key(s) detected in Lane2\config.toml: " + ($badKeys -join ', ') + ' (values redacted!). Replace with env_key.')
+                } else {
+                    Write-Ok 'Secret hygiene check passed: zero plaintext api_key / experimental_bearer_token in config.toml.'
+                }
+
+                if ($script:IsDryRun) {
+                    Write-Info "[DRY-RUN] Would re-lock 2-step NTFS DACL on: $lane2Cfg"
+                } else {
+                    Protect-SensitiveFileAcl $lane2Cfg
+                    Write-Ok "Re-locked 2-step NTFS DACL: $lane2Cfg"
+                }
+
+                $postMode = Get-CliPermissionModeInfo -ConfigPath $lane2Cfg
+                Write-Host "    Active Sandbox 2 Mode      : $($postMode.DisplayLabel)" -ForegroundColor $postMode.Color
+            }
+
+            Write-Section 'Dong bo lich su chat 2 chieu (GPT 1 <-> Sandbox 2)...'
+            [void](Invoke-HistorySync -SourceHome $Lane1Home -TargetHome $Lane2Home -Bidirectional)
+            return $exitCode
+        }
+
+        'FullAccess' {
+            Write-Section '[3] Yeu cau bat che do: Toan quyen (Full Access -- DANGER)'
+            Show-FullAccessDangerWarning
+
+            # MANDATORY FAIL-CLOSED CONFIRMATION GATE BEFORE ANY DISK OR BACKUP MUTATION.
+            # NOTE: -Force alone MUST NOT bypass this danger gate; explicit -ConfirmFullAccess
+            # (or exact interactive typed phrase 'TOAN QUYEN' / 'I UNDERSTAND') is mandatory!
+            $confirmed = $false
+            if ($ConfirmFullAccess.IsPresent) {
+                Write-WarnLine '-ConfirmFullAccess acknowledged: enabling Full Access (danger-full-access / never).'
+                $confirmed = $true
+            } else {
+                $isNonInteractiveSession = $NonInteractive.IsPresent
+                if (-not $isNonInteractiveSession) {
+                    try {
+                        if ([Console]::IsInputRedirected -or (-not [System.Environment]::UserInteractive)) {
+                            $isNonInteractiveSession = $true
+                        }
+                    } catch {
+                        $isNonInteractiveSession = $true
+                    }
+                }
+                if ($isNonInteractiveSession) {
+                    Write-FailLine 'REFUSED (fail-closed): Full Access (Toan quyen) requires explicit -ConfirmFullAccess in non-interactive/non-TTY mode (-Force alone does NOT bypass this gate). Lane2\config.toml was NOT modified.'
+                    return 1
+                }
+                $phrase = Read-Host "Nhap chinh xac 'TOAN QUYEN' hoac 'I UNDERSTAND' de xac nhan bat Toan quyen (de trong de huy)"
+                $trimmedPhrase = if ($null -ne $phrase) { $phrase.Trim() } else { '' }
+                if (($trimmedPhrase -ceq 'TOAN QUYEN') -or ($trimmedPhrase -ceq 'I UNDERSTAND')) {
+                    Write-WarnLine 'Interactive Full Access confirmation accepted.'
+                    $confirmed = $true
+                } else {
+                    Write-FailLine "REFUSED / CANCELLED (fail-closed): Cum tu xac nhan khong khop (yeu cau chinh xac 'TOAN QUYEN' hoac 'I UNDERSTAND'). Lane2\config.toml KHONG bi thay doi."
+                    return 1
+                }
+            }
+
+            if (-not $confirmed) { return 1 }
+
+            if (-not (Test-Path -LiteralPath $Lane2Home)) {
+                if ($script:IsDryRun) {
+                    Write-Info "[DRY-RUN] Would create directory: $Lane2Home"
+                } else {
+                    [void][System.IO.Directory]::CreateDirectory($Lane2Home)
+                }
+            }
+            Assert-NotReparsePoint -PathValue $lane2Cfg -Label 'Lane 2 config.toml'
+
+            if ($script:IsDryRun) {
+                if (Test-Path -LiteralPath $lane2Cfg -PathType Leaf) {
+                    Write-Info "[DRY-RUN] Would backup '$lane2Cfg'"
+                }
+                Write-Info '[DRY-RUN] Would set approval_policy = "never" and sandbox_mode = "danger-full-access" (preserving [projects.*], [features], [mcp_servers.*], [plugins.*], [tui]).'
+                Write-Info "[DRY-RUN] Would lock 2-step NTFS DACL on: $lane2Cfg"
+                [void](Invoke-HistorySync -SourceHome $Lane1Home -TargetHome $Lane2Home -Bidirectional)
+                return 0
+            }
+
+            if (Test-Path -LiteralPath $lane2Cfg -PathType Leaf) {
+                $bkp = New-TimestampedBackup -FilePath $lane2Cfg
+                Write-Ok "Backup created & ACL-locked: $bkp"
+            }
+            Set-CodexConfigPermissionMode -ConfigPath $lane2Cfg -SandboxMode 'danger-full-access' -ApprovalPolicy 'never'
+
+            $tomlRes = Test-TomlSyntax -ConfigPath $lane2Cfg
+            if (-not $tomlRes.Valid) {
+                Write-FailLine "TOML validation failed after updating '$lane2Cfg': $($tomlRes.Message)"
+                return 1
+            } elseif ($tomlRes.Checked) {
+                Write-Ok $tomlRes.Message
+            }
+
+            Protect-SensitiveFileAcl $lane2Cfg
+            Write-Ok "Locked 2-step NTFS DACL: $lane2Cfg"
+            Write-WarnLine 'Sandbox 2 is now in [3] FULL ACCESS (Toan quyen -- DANGER): approval_policy="never", sandbox_mode="danger-full-access". Switch back to [1] Ask via codex-manage [7] when done!'
+
+            Write-Section 'Dong bo lich su chat 2 chieu (GPT 1 <-> Sandbox 2)...'
+            [void](Invoke-HistorySync -SourceHome $Lane1Home -TargetHome $Lane2Home -Bidirectional)
+            return 0
+        }
+    }
+    return 1
+}
+
+# ============================================================================
 # Interactive Menu Loop (-Action Menu)
 # ============================================================================
 
 function Invoke-InteractiveMenu {
     if ($NonInteractive) {
-        Write-FailLine 'Cannot run interactive Menu with -NonInteractive. Specify -Action ApiGpt|ApiOther|Login|CheckApiKey|CheckAccounts|SyncHistory|RemoveSandbox2.'
+        Write-FailLine 'Cannot run interactive Menu with -NonInteractive. Specify -Action ApiGpt|ApiOther|Login|CheckApiKey|CheckAccounts|SyncHistory|RemoveSandbox2|SetCliMode.'
         return 1
     }
     while ($true) {
+        $activeCliMode = Get-CliPermissionModeInfo -ConfigPath (Join-Path $Lane2Home 'config.toml')
         Write-Host ""
         Write-Host "========================================================================" -ForegroundColor Cyan
-        Write-Host "  CODEX DUAL-LANE CONTROL CENTER -- Quan ly Sandbox 2 (Codex CLI) v1.4.0" -ForegroundColor Cyan
+        Write-Host "  CODEX DUAL-LANE CONTROL CENTER -- Quan ly Sandbox 2 (Codex CLI) v1.4" -ForegroundColor Cyan
         Write-Host "========================================================================" -ForegroundColor Cyan
         Write-Host "  GPT 1 (Codex Desktop) : $Lane1Home" -ForegroundColor Green
         Write-Host "  Sandbox 2 (Codex CLI) : $Lane2Home" -ForegroundColor Yellow
+        Write-Host "  Sandbox 2 Mode        : $($activeCliMode.DisplayLabel)" -ForegroundColor $activeCliMode.Color
         if ($script:IsDryRun) {
             Write-Host "  [DRY-RUN MODE ACTIVE -- preview only, zero mutations]" -ForegroundColor Yellow
         }
@@ -2305,10 +2915,11 @@ function Invoke-InteractiveMenu {
         Write-Host "  [4]  Check Tai khoan Hien co (chi-doc: GPT 1 Desktop + Sandbox 2 CLI)"
         Write-Host "  [5]  Dong bo Lich su Chat 2 chieu (GPT 1 <-> Sandbox 2)"
         Write-Host "  [6]  Xoa Sandbox 2 (Codex CLI) An toan -- KHONG xoa lich su chat GPT 1"
+        Write-Host "  [7]  Chon che do quyen Sandbox 2 (Codex CLI): Xin yeu cau / Config / Toan quyen"
         Write-Host "  [0]  Thoat (Exit)"
         Write-Host "------------------------------------------------------------------------" -ForegroundColor DarkGray
 
-        $choice = Read-Host 'Chon chuc nang (1, 1A, 1B, 2, 3, 4, 5, 6, 0)'
+        $choice = Read-Host 'Chon chuc nang (1, 1A, 1B, 2, 3, 4, 5, 6, 7, 0)'
         if ($null -eq $choice) { break }
         $c = $choice.Trim().ToUpperInvariant()
 
@@ -2349,6 +2960,15 @@ function Invoke-InteractiveMenu {
             '4' { [void](Invoke-ActionCheckAccounts) }
             '5' { [void](Invoke-ActionSyncHistory) }
             '6' { [void](Invoke-ActionRemoveSandbox2) }
+            '7' {
+                $savedCliMode = $CliMode
+                try {
+                    $CliMode = ''
+                    [void](Invoke-ActionSetCliMode)
+                } finally {
+                    $CliMode = $savedCliMode
+                }
+            }
             '0' { Write-Info 'Da thoat Codex Dual-Lane Control Center.'; break }
             'Q' { Write-Info 'Da thoat Codex Dual-Lane Control Center.'; break }
             'EXIT' { Write-Info 'Da thoat Codex Dual-Lane Control Center.'; break }
@@ -2387,6 +3007,7 @@ $rc = switch ($Action) {
     'CheckAccounts'  { Invoke-ActionCheckAccounts }
     'SyncHistory'    { Invoke-ActionSyncHistory }
     'RemoveSandbox2' { Invoke-ActionRemoveSandbox2 }
+    'SetCliMode'     { Invoke-ActionSetCliMode }
 }
 
 exit ([int]$rc)

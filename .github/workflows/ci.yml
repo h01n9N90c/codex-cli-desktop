@@ -904,6 +904,8 @@ jobs:
           #       10f) sync-history (--dry-run zero mutation + bidirectional convergence across GPT 1 & Sandbox 2)
           #       10g) remove-sandbox2 (fail-closed without --force, --dry-run safe, rescues Sandbox 2 chats + local
           #            non-symlink rollout file into GPT 1 BEFORE unlinking symlinks & removing Sandbox 2!)
+          #       10h) set-cli-mode & setup-dual-lane --cli-mode (native [features] preservation, Ask / Config /
+          #            Full-Access fail-closed danger gate, doctor.sh CLI mode reporting, 0600 & TOML validity)
           PY_CMD=""
           for _py_cand in python3 python; do
             if command -v "${_py_cand}" >/dev/null 2>&1 && "${_py_cand}" --version 2>&1 | grep -Eq '^Python 3\.'; then
@@ -1431,4 +1433,297 @@ jobs:
           assert "s2-final-rescue" in rows and rows["s2-final-rescue"] == 1, rows
           PY
 
-          echo "[PASS] Unix smoke, fail-closed worktree, traversal/SUID defense, interrupted rollback, 3x loop, pre-existing link/exact backup/missing-backup preflight, v1.3.3 trust-boundary parity, and v1.4.0 Section 10 codex-manager.sh (all 6 actions + history-preserving rescue) passed!"
+          # 10h) v1.4 Native-Rich [features] & 3 Codex CLI Permission Modes (Ask / Config / Full-Access):
+          #      Tests setup-dual-lane.sh (--cli-mode ask|config|full-access + --confirm-full-access +
+          #      non-destructive [features] merge), codex-manager.sh --action set-cli-mode (all 3 modes +
+          #      fail-closed danger warning gate without confirmation), and doctor.sh CLI mode reporting.
+          P10H_DIR="${WORK_DIR}/p10h cli modes"
+          P10H_L1="${P10H_DIR}/gpt 1"
+          P10H_L2="${P10H_DIR}/sandbox 2"
+          P10H_BIN="${P10H_DIR}/local bin"
+          P10H_REPO="${P10H_DIR}/my repo"
+          P10H_FAKE_BIN="${P10H_DIR}/fake bin"
+          mkdir -p "${P10H_L1}/sessions" "${P10H_L2}" "${P10H_BIN}" "${P10H_REPO}" "${P10H_FAKE_BIN}"
+
+          cat > "${P10H_FAKE_BIN}/codex" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [ "${1:-}" = "--version" ]; then echo "codex-cli 0.171.0-ci"; exit 0; fi
+          if [ "${1:-}" = "features" ]; then
+            cat <<'FEATS'
+          daemon_auto_start       stable   true
+          memories                stable   false
+          goals                   stable   true
+          image_generation        stable   true
+          api_key_model_discovery stable   true
+          js_repl                 removed  false
+          FEATS
+            exit 0
+          fi
+          if [ "${1:-}" = "execpolicy" ]; then echo '{"decision":"forbidden"}'; exit 0; fi
+          if [ "${1:-}" = "login" ]; then echo "Not logged in"; exit 0; fi
+          exit 0
+          EOF
+          chmod +x "${P10H_FAKE_BIN}/codex"
+
+          cat > "${P10H_L2}/config.toml" <<'EOF'
+          model = "gpt-5"
+          web_search = "cached"
+
+          [features]
+          multi_agent_v2 = true
+          hooks = true
+
+          [mcp_servers.user_mcp]
+          command = "node"
+
+          [projects."/tmp/p10h-trusted"]
+          trust_level = "trusted"
+
+          [projects."/tmp/p10h-untrusted"]
+          trust_level = "untrusted"
+          EOF
+          chmod 600 "${P10H_L2}/config.toml"
+
+          # 10h-1) Default setup-dual-lane.sh (Ask): enables active native features, skips removed js_repl,
+          #        preserves user [features], web_search, [mcp_servers.*], and [projects.*] trust levels!
+          PATH="${P10H_FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P10H_L1}" CODEX_LANE2_HOME="${P10H_L2}" CODEX_LOCAL_BIN="${P10H_BIN}" \
+            ./scripts/setup-dual-lane.sh --repo "${P10H_REPO}"
+          assert_mode_0600 "${P10H_L2}/config.toml"
+          "${PY_CMD}" -B - "${P10H_L2}/config.toml" <<'PY'
+          import pathlib, sys, tomllib
+          cfg = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert cfg.get("sandbox_mode") == "workspace-write", cfg
+          assert cfg.get("approval_policy") == "on-request", cfg
+          assert cfg.get("web_search") == "cached", cfg
+          feats = cfg.get("features", {})
+          assert feats.get("memories") is True, feats
+          assert feats.get("daemon_auto_start") is False, feats
+          assert feats.get("goals") is True, feats
+          assert feats.get("image_generation") is True, feats
+          assert feats.get("api_key_model_discovery") is True, feats
+          assert feats.get("multi_agent_v2") is True, feats
+          assert feats.get("hooks") is True, feats
+          assert "js_repl" not in feats, feats
+          assert cfg.get("mcp_servers", {}).get("user_mcp", {}).get("command") == "node", cfg
+          projs = cfg.get("projects", {})
+          assert projs.get("/tmp/p10h-trusted", {}).get("trust_level") == "trusted", projs
+          assert projs.get("/tmp/p10h-untrusted", {}).get("trust_level") == "untrusted", projs
+          PY
+
+          P10H_DOC_ASK="$(
+            PATH="${P10H_BIN}:${P10H_FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P10H_L1}" CODEX_LANE2_HOME="${P10H_L2}" CODEX_LOCAL_BIN="${P10H_BIN}" \
+              ./scripts/doctor.sh
+          )"
+          printf '%s\n' "${P10H_DOC_ASK}" | grep -Eq '^\[PASS\][[:space:]]+Sandbox 2 CLI Mode[[:space:]]+: Ask '
+
+          # 10h-2) setup-dual-lane.sh --cli-mode config preserves custom approval_policy, sandbox_mode & [sandbox_workspace_write]
+          #        and cleanly supports --sync-sessions even when approval_policy is custom ("on-failure").
+          cat > "${P10H_L2}/config.toml" <<'EOF'
+          model = "gpt-5"
+          sandbox_mode = "read-only"
+          approval_policy = "on-failure"
+
+          [sandbox_workspace_write]
+          network_access = true
+
+          [features]
+          multi_agent_v2 = true
+
+          [mcp_servers.user_mcp]
+          command = "node"
+
+          [projects."/tmp/p10h-trusted"]
+          trust_level = "trusted"
+
+          [projects."/tmp/p10h-untrusted"]
+          trust_level = "untrusted"
+          EOF
+          chmod 600 "${P10H_L2}/config.toml"
+          PATH="${P10H_FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P10H_L1}" CODEX_LANE2_HOME="${P10H_L2}" CODEX_LOCAL_BIN="${P10H_BIN}" \
+            ./scripts/setup-dual-lane.sh --repo "${P10H_REPO}" --cli-mode config --sync-sessions
+          assert_mode_0600 "${P10H_L2}/config.toml"
+          "${PY_CMD}" -B - "${P10H_L2}/config.toml" <<'PY'
+          import pathlib, sys, tomllib
+          cfg = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert cfg.get("sandbox_mode") == "read-only", cfg
+          assert cfg.get("approval_policy") == "on-failure", cfg
+          assert cfg.get("sandbox_workspace_write", {}).get("network_access") is True, cfg
+          assert cfg.get("features", {}).get("multi_agent_v2") is True, cfg
+          assert cfg.get("projects", {}).get("/tmp/p10h-trusted", {}).get("trust_level") == "trusted", cfg
+          assert cfg.get("projects", {}).get("/tmp/p10h-untrusted", {}).get("trust_level") == "untrusted", cfg
+          PY
+
+          # 10h-3) setup-dual-lane.sh --cli-mode full-access MUST fail closed without --confirm-full-access (0 mutations)!
+          P10H_BEFORE_SETUP_FA="$(sha256_of "${P10H_L2}/config.toml")"
+          set +e
+          P10H_SETUP_FA_REFUSE="$(
+            PATH="${P10H_FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P10H_L1}" CODEX_LANE2_HOME="${P10H_L2}" CODEX_LOCAL_BIN="${P10H_BIN}" \
+              ./scripts/setup-dual-lane.sh --repo "${P10H_REPO}" --cli-mode full-access </dev/null 2>&1
+          )"
+          P10H_SETUP_FA_RC=$?
+          set -e
+          [ "${P10H_SETUP_FA_RC}" -ne 0 ] || { echo "[FAIL] Section 10h: setup-dual-lane --cli-mode full-access did not fail closed without --confirm-full-access!" >&2; exit 1; }
+          printf '%s\n' "${P10H_SETUP_FA_REFUSE}" | grep -Fq 'EXTREMELY DANGEROUS'
+          printf '%s\n' "${P10H_SETUP_FA_REFUSE}" | grep -Fq 'danger-full-access'
+          [ "$(sha256_of "${P10H_L2}/config.toml")" = "${P10H_BEFORE_SETUP_FA}" ]
+
+          # Confirmed setup-dual-lane.sh --cli-mode full-access --confirm-full-access succeeds & sets danger-full-access/never
+          P10H_SETUP_FA_OK="$(
+            PATH="${P10H_FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P10H_L1}" CODEX_LANE2_HOME="${P10H_L2}" CODEX_LOCAL_BIN="${P10H_BIN}" \
+              ./scripts/setup-dual-lane.sh --repo "${P10H_REPO}" --cli-mode full-access --confirm-full-access 2>&1
+          )"
+          printf '%s\n' "${P10H_SETUP_FA_OK}" | grep -Fq 'EXTREMELY DANGEROUS'
+          assert_mode_0600 "${P10H_L2}/config.toml"
+          "${PY_CMD}" -B - "${P10H_L2}/config.toml" <<'PY'
+          import pathlib, sys, tomllib
+          cfg = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert cfg.get("sandbox_mode") == "danger-full-access", cfg
+          assert cfg.get("approval_policy") == "never", cfg
+          assert cfg.get("features", {}).get("multi_agent_v2") is True, cfg
+          assert cfg.get("projects", {}).get("/tmp/p10h-trusted", {}).get("trust_level") == "trusted", cfg
+          assert cfg.get("projects", {}).get("/tmp/p10h-untrusted", {}).get("trust_level") == "untrusted", cfg
+          PY
+
+          # 10h-4) codex-manager.sh --action set-cli-mode: ask -> full-access fail-closed (no flag, --force, wrong phrase)
+          #        -> full-access --confirm-full-access -> config mode preservation -> interactive TOAN QUYEN -> ask (from granular)
+          ./scripts/codex-manager.sh --action set-cli-mode --cli-mode ask --non-interactive \
+            --lane1-home "${P10H_L1}" --lane2-home "${P10H_L2}" --local-bin "${P10H_BIN}" \
+            --codex-path "${P10H_FAKE_BIN}/codex"
+          assert_mode_0600 "${P10H_L2}/config.toml"
+          P10H_ASK_HASH="$(sha256_of "${P10H_L2}/config.toml")"
+          P10H_BKP_BEFORE="$(find "${P10H_L2}" -maxdepth 1 -name 'config.toml.backup-*' 2>/dev/null | awk 'END{print NR+0}')"
+
+          # 10h-4a) full-access refused without --confirm-full-access (0 mutations, 0 new backups)
+          set +e
+          P10H_MGR_REFUSE1="$(
+            ./scripts/codex-manager.sh --action set-cli-mode --cli-mode full-access --non-interactive \
+              --lane1-home "${P10H_L1}" --lane2-home "${P10H_L2}" --local-bin "${P10H_BIN}" 2>&1
+          )"
+          P10H_MGR_REFUSE1_RC=$?
+          set -e
+          [ "${P10H_MGR_REFUSE1_RC}" -ne 0 ] || { echo "[FAIL] Section 10h: set-cli-mode full-access succeeded without --confirm-full-access!" >&2; exit 1; }
+          printf '%s\n' "${P10H_MGR_REFUSE1}" | grep -Fq 'EXTREMELY DANGEROUS'
+          [ "$(sha256_of "${P10H_L2}/config.toml")" = "${P10H_ASK_HASH}" ]
+          [ "$(find "${P10H_L2}" -maxdepth 1 -name 'config.toml.backup-*' 2>/dev/null | awk 'END{print NR+0}')" = "${P10H_BKP_BEFORE}" ]
+
+          # 10h-4b) --force alone MUST NOT bypass --confirm-full-access (0 mutations)!
+          if ./scripts/codex-manager.sh --action set-cli-mode --cli-mode full-access --force --non-interactive \
+              --lane1-home "${P10H_L1}" --lane2-home "${P10H_L2}" --local-bin "${P10H_BIN}" >/dev/null 2>&1; then
+            echo "[FAIL] Section 10h: --force bypassed --confirm-full-access gate!" >&2; exit 1
+          fi
+          [ "$(sha256_of "${P10H_L2}/config.toml")" = "${P10H_ASK_HASH}" ]
+
+          # 10h-4c) Interactive wrong phrase ('yes') MUST fail closed (0 mutations)!
+          if printf 'yes\n' | ./scripts/codex-manager.sh --action set-cli-mode --cli-mode full-access \
+              --lane1-home "${P10H_L1}" --lane2-home "${P10H_L2}" --local-bin "${P10H_BIN}" >/dev/null 2>&1; then
+            echo "[FAIL] Section 10h: interactive 'yes' bypassed TOAN QUYEN confirmation!" >&2; exit 1
+          fi
+          [ "$(sha256_of "${P10H_L2}/config.toml")" = "${P10H_ASK_HASH}" ]
+
+          # 10h-4d) full-access WITH --confirm-full-access prints danger warning, sets danger-full-access/never, locks 0600,
+          #         preserves [projects.*] & [features], and doctor.sh emits [WARN] while exiting 0!
+          P10H_MGR_FA_OUT="$(
+            ./scripts/codex-manager.sh --action set-cli-mode --cli-mode full-access --confirm-full-access --non-interactive \
+              --lane1-home "${P10H_L1}" --lane2-home "${P10H_L2}" --local-bin "${P10H_BIN}" 2>&1
+          )"
+          printf '%s\n' "${P10H_MGR_FA_OUT}" | grep -Fq 'EXTREMELY DANGEROUS'
+          printf '%s\n' "${P10H_MGR_FA_OUT}" | grep -Fq 'danger-full-access'
+          assert_mode_0600 "${P10H_L2}/config.toml"
+          "${PY_CMD}" -B - "${P10H_L2}/config.toml" <<'PY'
+          import pathlib, sys, tomllib
+          cfg = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert cfg.get("sandbox_mode") == "danger-full-access", cfg
+          assert cfg.get("approval_policy") == "never", cfg
+          assert cfg.get("features", {}).get("multi_agent_v2") is True, cfg
+          assert cfg.get("mcp_servers", {}).get("user_mcp", {}).get("command") == "node", cfg
+          assert cfg.get("projects", {}).get("/tmp/p10h-trusted", {}).get("trust_level") == "trusted", cfg
+          assert cfg.get("projects", {}).get("/tmp/p10h-untrusted", {}).get("trust_level") == "untrusted", cfg
+          PY
+          P10H_DOC_FA="$(
+            PATH="${P10H_BIN}:${P10H_FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P10H_L1}" CODEX_LANE2_HOME="${P10H_L2}" CODEX_LOCAL_BIN="${P10H_BIN}" \
+              ./scripts/doctor.sh
+          )"
+          printf '%s\n' "${P10H_DOC_FA}" | grep -Eq '^\[WARN\][[:space:]]+Sandbox 2 CLI Mode[[:space:]]+: Full Access '
+
+          # 10h-4e) config mode preserves custom config.toml untouched (exact SHA-256 unchanged), doctor.sh [PASS] Config!
+          cat > "${P10H_L2}/config.toml" <<'EOF'
+          model = "gpt-5"
+          sandbox_mode = "read-only"
+          approval_policy = "on-failure"
+
+          [features]
+          multi_agent_v2 = true
+
+          [mcp_servers.user_mcp]
+          command = "node"
+
+          [projects."/tmp/p10h-trusted"]
+          trust_level = "trusted"
+
+          [projects."/tmp/p10h-untrusted"]
+          trust_level = "untrusted"
+          EOF
+          chmod 600 "${P10H_L2}/config.toml"
+          P10H_CUSTOM_CFG_HASH="$(sha256_of "${P10H_L2}/config.toml")"
+          ./scripts/codex-manager.sh --action set-cli-mode --cli-mode config --non-interactive \
+            --lane1-home "${P10H_L1}" --lane2-home "${P10H_L2}" --local-bin "${P10H_BIN}"
+          [ "$(sha256_of "${P10H_L2}/config.toml")" = "${P10H_CUSTOM_CFG_HASH}" ]
+          assert_mode_0600 "${P10H_L2}/config.toml"
+          P10H_DOC_CFG="$(
+            PATH="${P10H_BIN}:${P10H_FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P10H_L1}" CODEX_LANE2_HOME="${P10H_L2}" CODEX_LOCAL_BIN="${P10H_BIN}" \
+              ./scripts/doctor.sh
+          )"
+          printf '%s\n' "${P10H_DOC_CFG}" | grep -Eq '^\[PASS\][[:space:]]+Sandbox 2 CLI Mode[[:space:]]+: Config '
+
+          # 10h-4f) Interactive exact 'TOAN QUYEN' confirmation succeeds cleanly!
+          printf 'TOAN QUYEN\n' | ./scripts/codex-manager.sh --action set-cli-mode --cli-mode full-access \
+            --lane1-home "${P10H_L1}" --lane2-home "${P10H_L2}" --local-bin "${P10H_BIN}"
+          "${PY_CMD}" -B - "${P10H_L2}/config.toml" <<'PY'
+          import pathlib, sys, tomllib
+          cfg = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert cfg.get("sandbox_mode") == "danger-full-access", cfg
+          assert cfg.get("approval_policy") == "never", cfg
+          PY
+
+          # 10h-4g) ask mode restores on-request + workspace-write cleanly (even replacing a granular [approval_policy] table)
+          cat > "${P10H_L2}/config.toml" <<'EOF'
+          model = "gpt-5"
+          sandbox_mode = "danger-full-access"
+
+          [approval_policy.granular]
+          sandbox_approval = true
+
+          [features]
+          multi_agent_v2 = true
+
+          [mcp_servers.user_mcp]
+          command = "node"
+
+          [projects."/tmp/p10h-trusted"]
+          trust_level = "trusted"
+
+          [projects."/tmp/p10h-untrusted"]
+          trust_level = "untrusted"
+          EOF
+          chmod 600 "${P10H_L2}/config.toml"
+          ./scripts/codex-manager.sh --action set-cli-mode --cli-mode ask --non-interactive \
+            --lane1-home "${P10H_L1}" --lane2-home "${P10H_L2}" --local-bin "${P10H_BIN}"
+          assert_mode_0600 "${P10H_L2}/config.toml"
+          "${PY_CMD}" -B - "${P10H_L2}/config.toml" <<'PY'
+          import pathlib, sys, tomllib
+          cfg = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert cfg.get("sandbox_mode") == "workspace-write", cfg
+          assert cfg.get("approval_policy") == "on-request", cfg
+          assert cfg.get("features", {}).get("multi_agent_v2") is True, cfg
+          assert cfg.get("mcp_servers", {}).get("user_mcp", {}).get("command") == "node", cfg
+          assert cfg.get("projects", {}).get("/tmp/p10h-trusted", {}).get("trust_level") == "trusted", cfg
+          assert cfg.get("projects", {}).get("/tmp/p10h-untrusted", {}).get("trust_level") == "untrusted", cfg
+          PY
+          P10H_DOC_RESTORED="$(
+            PATH="${P10H_BIN}:${P10H_FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P10H_L1}" CODEX_LANE2_HOME="${P10H_L2}" CODEX_LOCAL_BIN="${P10H_BIN}" \
+              ./scripts/doctor.sh
+          )"
+          printf '%s\n' "${P10H_DOC_RESTORED}" | grep -Eq '^\[PASS\][[:space:]]+Sandbox 2 CLI Mode[[:space:]]+: Ask '
+
+          echo "[PASS] Unix smoke, fail-closed worktree, traversal/SUID defense, interrupted rollback, 3x loop, pre-existing link/exact backup/missing-backup preflight, v1.3.3 trust-boundary parity, and v1.4 Section 10 codex-manager.sh (all 7 actions, 3 CLI modes + danger gate + history-preserving rescue) passed!"

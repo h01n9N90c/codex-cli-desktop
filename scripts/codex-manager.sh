@@ -74,10 +74,13 @@ Options:
                            check-accounts  Read-only inspection of GPT 1 & Sandbox 2 accounts/health
                            sync-history    Bidirectional chat history sync (GPT 1 <-> Sandbox 2)
                            remove-sandbox2 Safe uninstall Sandbox 2 WITHOUT deleting chat history
+                           set-cli-mode    Configure Sandbox 2 CLI permission mode (ask | config | full-access)
   --lane1-home PATH      GPT 1 / Desktop CODEX_HOME (default: $CODEX_LANE1_HOME or ~/.codex)
   --lane2-home PATH      Sandbox 2 / CLI CODEX_HOME (default: $CODEX_LANE2_HOME or ~/.codex-official)
   --local-bin PATH       CLI wrapper directory (default: $CODEX_LOCAL_BIN or ~/.local/bin)
   --codex-path PATH      Explicit path to real `codex` binary (auto-detected if omitted)
+  --cli-mode MODE        With set-cli-mode: 'ask', 'config', or 'full-access'
+  --confirm-full-access  Explicitly confirm --cli-mode full-access (required when --non-interactive)
   --online-check         With check-api-key, perform live GET <base_url>/models probe
   --device-auth          With login, pass --device-auth to `codex login`
   --editor CMD           Editor command for api-other (default: $VISUAL, $EDITOR, or vi)
@@ -633,7 +636,11 @@ def clean_val(v, pat, max_len=128):
 
 mp = clean_val(data.get("model_provider", ""), r"[A-Za-z0-9_.-]+", 64)
 sb = clean_val(data.get("sandbox_mode", ""), r"[A-Za-z0-9_.-]+", 64)
-ap = clean_val(data.get("approval_policy", ""), r"[A-Za-z0-9_.-]+", 64)
+ap_raw = data.get("approval_policy", "")
+if isinstance(ap_raw, dict):
+    ap = "granular"
+else:
+    ap = clean_val(ap_raw, r"[A-Za-z0-9_.-]+", 64)
 
 env_key = ""
 base_url = ""
@@ -723,16 +730,22 @@ PY
       sub(/^[[:space:]]*\[/, "", sec)
       sub(/\][[:space:]]*$/, "", sec)
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
+      if (ap == "" && (tolower(sec) == "approval_policy" || index(tolower(sec), "approval_policy.") == 1)) {
+        ap = "granular"
+      }
       next
     }
-    sec == "" && clean ~ /^[[:space:]]*model_provider[[:space:]]*=/ {
+    sec == "" && clean ~ /^[[:space:]]*["\047]?model_provider["\047]?[[:space:]]*=/ {
       v = clean; sub(/^[^=]*=/, "", v); mp = unquote(v)
     }
-    sec == "" && clean ~ /^[[:space:]]*sandbox_mode[[:space:]]*=/ {
+    sec == "" && clean ~ /^[[:space:]]*["\047]?sandbox_mode["\047]?[[:space:]]*=/ {
       v = clean; sub(/^[^=]*=/, "", v); sb = unquote(v)
     }
-    sec == "" && clean ~ /^[[:space:]]*approval_policy[[:space:]]*=/ {
-      v = clean; sub(/^[^=]*=/, "", v); ap = unquote(v)
+    sec == "" && clean ~ /^[[:space:]]*["\047]?approval_policy["\047]?[[:space:]]*=/ {
+      v = clean; sub(/^[^=]*=/, "", v)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      if (substr(v, 1, 1) == "{") ap = "granular"
+      else ap = unquote(v)
     }
     tolower(sec) ~ /^model_providers\./ {
       pname = tolower(sec)
@@ -772,6 +785,153 @@ PY
         AP=*) CFG_APPROVAL_POLICY="${line#AP=}" ;;
       esac
     done <<< "${parsed}"
+  fi
+}
+
+# Classify active Sandbox 2 CLI permission mode from (sandbox_mode, approval_policy).
+classify_cli_mode() {
+  local sb="${1:-}"
+  local ap="${2:-}"
+  if [ "${sb}" = "danger-full-access" ] && [ "${ap}" = "never" ]; then
+    printf 'Full Access (Toan quyen — DANGER)'
+  elif [ "${sb}" = "workspace-write" ] && [ "${ap}" = "on-request" ]; then
+    printf 'Ask (Xin yeu cau)'
+  else
+    printf 'Config (config.toml: approval=%s, sandbox=%s)' "${ap:-unset}" "${sb:-unset}"
+  fi
+}
+
+# Print high-visibility ANSI RED/YELLOW danger warning banner modeled on Codex CLI's
+# --dangerously-bypass-approvals-and-sandbox warning whenever Full Access is requested.
+print_full_access_danger_warning() {
+  local c_red="" c_yel="" c_rst=""
+  if [ -z "${NO_COLOR:-}" ]; then
+    c_red=$'\033[1;31m'
+    c_yel=$'\033[1;33m'
+    c_rst=$'\033[0m'
+  fi
+  printf '%s\n' "${c_red}========================================================================${c_rst}"
+  printf '%s\n' "${c_red}[!!!] CANH BAO NGUY HIEM — EXTREMELY DANGEROUS (FULL ACCESS MODE) [!!!]${c_rst}"
+  printf '%s\n' "${c_red}========================================================================${c_rst}"
+  printf '%s\n' "${c_yel}Che do duoc yeu cau: Toan quyen (Full Access) cho Sandbox 2 (Codex CLI)${c_rst}"
+  printf '%s\n' "${c_yel}  - sandbox_mode    = \"danger-full-access\"  (TAT HOAN TOAN OS SANDBOX)${c_rst}"
+  printf '%s\n' "${c_yel}  - approval_policy = \"never\"               (TAT HOAN TOAN HOI DUYET)${c_rst}"
+  printf '\n'
+  printf '%s\n' "${c_yel}Rui ro truc tiep tren toan bo may tinh (Host-Wide Risk):${c_rst}"
+  printf '%s\n' "${c_yel}  * Codex CLI co the DOC / GHI / XOA bat ky tep nao ben ngoai thu muc${c_rst}"
+  printf '%s\n' "${c_yel}    du an va CHAY LENH + TRUY CAP MANG voi toan bo quyen OS user hien tai.${c_rst}"
+  printf '%s\n' "${c_yel}  * default.rules chi kiem tra prefix argv truc tiep (KHONG chan duoc${c_rst}"
+  printf '%s\n' "${c_yel}    lenh long ben trong bash -c / sh -c / python -c / script).${c_rst}"
+  printf '%s\n' "${c_yel}  * KHUYEN NGHI BAT BUOC: Tao Git commit checkpoint (git commit) hoac${c_rst}"
+  printf '%s\n' "${c_yel}    chay trong --use-git-worktree / container truoc khi bat che do nay!${c_rst}"
+  printf '%s\n' "${c_red}========================================================================${c_rst}"
+}
+
+# Atomically upsert ONLY top-level `sandbox_mode` and `approval_policy` in config.toml,
+# stripping any conflicting `[approval_policy]` granular table while preserving 100% of
+# `[projects.*]` trust levels, `[features]`, `[mcp_servers.*]`, `[plugins.*]`, `[tui]`,
+# `[model_providers.*]`, comments, and all other user keys.
+upsert_cli_mode_in_toml() {
+  local cfg="$1"
+  local target_sb="$2"
+  local target_ap="$3"
+  if [ -L "${cfg}" ]; then
+    echo "[FAIL] Security refusal: '${cfg}' is a symlink; refusing to modify." >&2
+    exit 1
+  fi
+  if [ -d "${cfg}" ]; then
+    echo "[FAIL] Refusing to modify directory '${cfg}' as config.toml." >&2
+    exit 1
+  fi
+  [ -f "${cfg}" ] || return 1
+
+  local updated
+  updated="$(awk -v sb="${target_sb}" -v ap="${target_ap}" '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    function emit_missing() {
+      if (!wrote_sb) {
+        printf "sandbox_mode = \"%s\"\n", sb
+        wrote_sb = 1
+      }
+      if (!wrote_ap) {
+        printf "approval_policy = \"%s\"\n", ap
+        wrote_ap = 1
+      }
+    }
+    BEGIN { in_sec = 0; skip_sec = 0; wrote_sb = 0; wrote_ap = 0 }
+    {
+      raw = $0
+      sub(/\r$/, "", raw)
+      clean = strip_comment(raw)
+      if (clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/) {
+        if (!in_sec) {
+          emit_missing()
+          in_sec = 1
+        }
+        sec = clean
+        sub(/^[[:space:]]*\[/, "", sec)
+        sub(/\][[:space:]]*$/, "", sec)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
+        lsec = tolower(sec)
+        if (lsec == "approval_policy" || index(lsec, "approval_policy.") == 1) {
+          skip_sec = 1
+          next
+        }
+        skip_sec = 0
+        print raw
+        next
+      }
+      if (!in_sec) {
+        if (clean ~ /^[[:space:]]*(sandbox_mode|"sandbox_mode"|\047sandbox_mode\047)[[:space:]]*=/) {
+          if (!wrote_sb) {
+            printf "sandbox_mode = \"%s\"\n", sb
+            wrote_sb = 1
+          }
+          next
+        }
+        if (clean ~ /^[[:space:]]*(approval_policy|"approval_policy"|\047approval_policy\047)[[:space:]]*=/) {
+          if (!wrote_ap) {
+            printf "approval_policy = \"%s\"\n", ap
+            wrote_ap = 1
+          }
+          next
+        }
+        print raw
+        next
+      }
+      if (!skip_sec) {
+        print raw
+      }
+    }
+    END {
+      if (!in_sec) {
+        emit_missing()
+      }
+    }
+  ' "${cfg}")"
+
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    atomic_write_from_stdin "${cfg}" 600 < <(printf '%s\n' "${updated}")
   fi
 }
 
@@ -1560,6 +1720,11 @@ inspect_lane_readonly() {
   echo "  codex status    : ${login_status}"
   echo "  auth.json       : status=${AUTH_STATUS} | auth_mode=${AUTH_MODE} | api_key=${AUTH_API_KEY_MASKED} | oauth=$([ "${AUTH_HAS_OAUTH}" -eq 1 ] && echo yes || echo no)"
   echo "  config.toml     : model_provider=${CFG_MODEL_PROVIDER:-openai(default)} | env_key=${env_state} | sandbox=${CFG_SANDBOX_MODE:-default} | approval=${CFG_APPROVAL_POLICY:-default}"
+  case "${title}" in
+    "Sandbox 2"*)
+      echo "  CLI Mode        : $(classify_cli_mode "${CFG_SANDBOX_MODE}" "${CFG_APPROVAL_POLICY}")"
+      ;;
+  esac
   if [ "${CFG_HAS_PLAINTEXT}" -eq 1 ]; then
     echo "  Secret Hygiene  : [WARN] Plaintext api_key/bearer_token present in config.toml!"
   else
@@ -1682,21 +1847,247 @@ EOF
   fi
 }
 
+# [7] Configure Sandbox 2 Permission Mode (Ask / Config / Full Access)
+action_set_cli_mode() {
+  echo "=== [7] Chon Che do Quyen Sandbox 2 (Codex CLI: ${LANE2_HOME}/config.toml) ==="
+  [ "${DRY_RUN}" -eq 1 ] && echo "[DRY-RUN MODE] No files on disk will be modified."
+
+  if [ -L "${LANE2_HOME}" ]; then
+    echo "[FAIL] Security refusal: LANE2_HOME '${LANE2_HOME}' is a symlink." >&2
+    return 1
+  fi
+  local cfg2="${LANE2_HOME}/config.toml"
+  if [ -L "${cfg2}" ]; then
+    echo "[FAIL] Security refusal: '${cfg2}' is a symlink; refusing to modify." >&2
+    return 1
+  fi
+  if [ -d "${cfg2}" ]; then
+    echo "[FAIL] Refusing to treat directory '${cfg2}' as config.toml." >&2
+    return 1
+  fi
+
+  read_config_meta "${cfg2}"
+  echo "  Current CLI Mode : $(classify_cli_mode "${CFG_SANDBOX_MODE}" "${CFG_APPROVAL_POLICY}")"
+
+  local chosen_mode="${CLI_MODE}"
+  if [ -z "${chosen_mode}" ]; then
+    if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+      echo "[FAIL] --action set-cli-mode in --non-interactive mode requires --cli-mode <ask|config|full-access>." >&2
+      return 1
+    fi
+    cat <<EOF
+
+Chon che do quyen cho Sandbox 2 (Codex CLI):
+  [1] Xin yeu cau (Ask)
+      approval_policy = "on-request", sandbox_mode = "workspace-write"
+      (nam gon trong thu muc du an, chi tham khao thuat toan ben ngoai o che do chi-doc)
+  [2] Thuoc cau hinh config.toml (Config)
+      Giu nguyen approval_policy / sandbox_mode trong ${cfg2}
+      (tuy chon mo chinh truc tiep + kiem tra TOML + khoa 0600)
+  [3] Toan quyen (Full Access — DANGER)
+      approval_policy = "never", sandbox_mode = "danger-full-access"
+      (CANH BAO NGUY HIEM — tat sandbox & tat hoi duyet; yeu cau xac nhan 'TOAN QUYEN')
+  [0] Huy (Cancel)
+
+EOF
+    local sel=""
+    printf 'Chon che do [1/2/3/0]: ' >&2
+    IFS= read -r sel || true
+    sel="$(to_lower "$(printf '%s' "${sel%$'\r'}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')")"
+    case "${sel}" in
+      1|ask) chosen_mode="ask" ;;
+      2|config) chosen_mode="config" ;;
+      3|full-access|fullaccess) chosen_mode="full-access" ;;
+      0|q|quit|cancel|"")
+        echo "[INFO] Cancelled by user; no changes made."
+        return 0
+        ;;
+      *)
+        echo "[FAIL] Lua chon khong hop le: '${sel}' (chon 1, 2, 3, hoac 0)." >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  case "${chosen_mode}" in
+    ask)
+      if [ "${DRY_RUN}" -eq 0 ]; then
+        mkdir -p -- "${LANE2_HOME}"
+        chmod 700 "${LANE2_HOME}" 2>/dev/null || true
+      fi
+      if [ -f "${cfg2}" ]; then
+        backup_file_0600 "${cfg2}"
+        if [ "${DRY_RUN}" -eq 0 ]; then
+          upsert_cli_mode_in_toml "${cfg2}" "workspace-write" "on-request"
+          echo "    Updated ${cfg2}: approval_policy=\"on-request\", sandbox_mode=\"workspace-write\" (preserved [projects.*] & user sections)."
+        else
+          echo "    [DRY-RUN] Would set approval_policy=\"on-request\" and sandbox_mode=\"workspace-write\" in ${cfg2}."
+        fi
+      elif [ "${DRY_RUN}" -eq 0 ]; then
+        atomic_write_from_stdin "${cfg2}" 600 <<'EOF'
+# Sandbox 2 (Codex CLI) configuration — Ask mode (Xin yeu cau)
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+EOF
+        echo "    Initialized ${cfg2} in Ask mode."
+      else
+        echo "    [DRY-RUN] Would initialize ${cfg2} in Ask mode."
+      fi
+      if [ "${DRY_RUN}" -eq 0 ] && [ -f "${cfg2}" ]; then
+        validate_toml_file "${cfg2}"
+        lock_file_0600 "${cfg2}"
+      fi
+      run_bidirectional_sync 0
+      echo "[OK] Sandbox 2 CLI mode set to Ask (Xin yeu cau: approval_policy=on-request, sandbox_mode=workspace-write)."
+      ;;
+
+    config)
+      if [ ! -f "${cfg2}" ]; then
+        if [ "${DRY_RUN}" -eq 0 ]; then
+          mkdir -p -- "${LANE2_HOME}"
+          chmod 700 "${LANE2_HOME}" 2>/dev/null || true
+          atomic_write_from_stdin "${cfg2}" 600 <<'EOF'
+# Sandbox 2 (Codex CLI) configuration — Config mode (config.toml is source of truth)
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+EOF
+          echo "    Initialized starter config: ${cfg2}"
+        else
+          echo "    [DRY-RUN] Would initialize starter config: ${cfg2}"
+        fi
+      else
+        echo "    Preserving existing approval_policy & sandbox_mode in ${cfg2} untouched."
+      fi
+
+      local chosen_editor=""
+      if [ -n "${EDITOR_CMD}" ]; then
+        chosen_editor="${EDITOR_CMD}"
+      elif [ "${NON_INTERACTIVE}" -eq 0 ]; then
+        local edit_ans=""
+        printf 'Ban co muon mo %s de chinh sua truc tiep? [y/N]: ' "${cfg2}" >&2
+        IFS= read -r edit_ans || true
+        case "$(to_lower "${edit_ans%$'\r'}")" in
+          y|yes)
+            chosen_editor="${VISUAL:-${EDITOR:-vi}}"
+            if ! command -v "${chosen_editor%% *}" >/dev/null 2>&1 && command -v nano >/dev/null 2>&1; then
+              chosen_editor="nano"
+            fi
+            ;;
+        esac
+      fi
+
+      if [ -n "${chosen_editor}" ]; then
+        if [ -f "${cfg2}" ]; then
+          backup_file_0600 "${cfg2}"
+        fi
+        if [ "${DRY_RUN}" -eq 1 ]; then
+          echo "    [DRY-RUN] Would open ${cfg2} with editor: ${chosen_editor}"
+        else
+          echo "[+] Opening ${cfg2} with editor: ${chosen_editor}"
+          if [ -f "${chosen_editor}" ] && [ -x "${chosen_editor}" ]; then
+            "${chosen_editor}" "${cfg2}"
+          else
+            local editor_parts=()
+            read -r -a editor_parts <<< "${chosen_editor}"
+            if [ "${#editor_parts[@]}" -eq 0 ]; then
+              echo "[FAIL] Invalid --editor command." >&2
+              return 1
+            fi
+            "${editor_parts[@]}" "${cfg2}"
+          fi
+        fi
+      fi
+
+      if [ -f "${cfg2}" ]; then
+        validate_toml_file "${cfg2}"
+        if has_plaintext_secret_in_toml "${cfg2}"; then
+          echo "[WARN] SECURITY WARNING: Plaintext 'api_key' or 'experimental_bearer_token' detected in ${cfg2}! Switch to env_key." >&2
+        fi
+        lock_file_0600 "${cfg2}"
+        read_config_meta "${cfg2}"
+        echo "    Active config.toml mode: $(classify_cli_mode "${CFG_SANDBOX_MODE}" "${CFG_APPROVAL_POLICY}")"
+      fi
+      run_bidirectional_sync 0
+      echo "[OK] Sandbox 2 CLI mode: Config (Thuoc cau hinh config.toml) verified & preserved."
+      ;;
+
+    full-access)
+      # Print realistic Codex-style ANSI RED/YELLOW danger warning BEFORE any mutation!
+      print_full_access_danger_warning
+
+      # Mandatory fail-closed confirmation gate (--force alone MUST NOT bypass this!).
+      if [ "${CONFIRM_FULL_ACCESS}" -eq 1 ]; then
+        echo "[WARN] Explicit --confirm-full-access received. Enabling Full Access (danger-full-access / approval_policy=never)..." >&2
+      elif [ "${NON_INTERACTIVE}" -eq 1 ]; then
+        echo "[FAIL] Refused Full Access (danger-full-access / approval_policy=never) in --non-interactive mode without explicit --confirm-full-access (--force alone is NOT accepted). Zero changes made to ${cfg2}." >&2
+        return 1
+      else
+        local confirm_phrase=""
+        printf "De xac nhan bat TOAN QUYEN (Full Access), go chinh xac 'TOAN QUYEN' (hoac 'I UNDERSTAND'): " >&2
+        IFS= read -r confirm_phrase || true
+        confirm_phrase="${confirm_phrase%$'\r'}"
+        if [ "${confirm_phrase}" != "TOAN QUYEN" ] && [ "${confirm_phrase}" != "I UNDERSTAND" ]; then
+          echo "[FAIL] Refused Full Access (danger-full-access / approval_policy=never): confirmation phrase did not match exact 'TOAN QUYEN' or 'I UNDERSTAND'. Zero changes made to ${cfg2}." >&2
+          return 1
+        fi
+      fi
+
+      if [ "${DRY_RUN}" -eq 0 ]; then
+        mkdir -p -- "${LANE2_HOME}"
+        chmod 700 "${LANE2_HOME}" 2>/dev/null || true
+      fi
+      if [ -f "${cfg2}" ]; then
+        backup_file_0600 "${cfg2}"
+        if [ "${DRY_RUN}" -eq 0 ]; then
+          upsert_cli_mode_in_toml "${cfg2}" "danger-full-access" "never"
+          echo "    Updated ${cfg2}: approval_policy=\"never\", sandbox_mode=\"danger-full-access\" (preserved [projects.*] & user sections)."
+        else
+          echo "    [DRY-RUN] Would set approval_policy=\"never\" and sandbox_mode=\"danger-full-access\" in ${cfg2}."
+        fi
+      elif [ "${DRY_RUN}" -eq 0 ]; then
+        atomic_write_from_stdin "${cfg2}" 600 <<'EOF'
+# Sandbox 2 (Codex CLI) configuration — FULL ACCESS (DANGER)
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+EOF
+        echo "    Initialized ${cfg2} in Full Access mode (DANGER)."
+      else
+        echo "    [DRY-RUN] Would initialize ${cfg2} in Full Access mode (DANGER)."
+      fi
+      if [ "${DRY_RUN}" -eq 0 ] && [ -f "${cfg2}" ]; then
+        validate_toml_file "${cfg2}"
+        lock_file_0600 "${cfg2}"
+      fi
+      run_bidirectional_sync 0
+      echo "[OK] Sandbox 2 CLI mode set to Full Access (Toan quyen: approval_policy=never, sandbox_mode=danger-full-access)."
+      ;;
+
+    *)
+      echo "[FAIL] Invalid --cli-mode '${chosen_mode}'. Allowed values: 'ask', 'config', 'full-access'." >&2
+      return 1
+      ;;
+  esac
+}
+
 # Interactive Menu
 action_menu() {
   if [ "${NON_INTERACTIVE}" -eq 1 ]; then
-    echo "[FAIL] --action menu cannot run with --non-interactive. Pass an explicit --action <api-gpt|api-other|login|check-api-key|check-accounts|sync-history|remove-sandbox2>." >&2
+    echo "[FAIL] --action menu cannot run with --non-interactive. Pass an explicit --action <api-gpt|api-other|login|check-api-key|check-accounts|sync-history|remove-sandbox2|set-cli-mode>." >&2
     return 1
   fi
 
   while true; do
+    read_config_meta "${LANE2_HOME}/config.toml"
+    local active_cli_mode=""
+    active_cli_mode="$(classify_cli_mode "${CFG_SANDBOX_MODE}" "${CFG_APPROVAL_POLICY}")"
     cat <<EOF
 
 ========================================================================
-  Codex Dual-Lane Control Center — Sandbox 2 Manager (v1.4.0)
+  Codex Dual-Lane Control Center — Sandbox 2 Manager (v1.4)
 ========================================================================
   GPT 1 (Desktop)  : ${LANE1_HOME}
   Sandbox 2 (CLI)  : ${LANE2_HOME}
+  Che do quyen CLI : ${active_cli_mode}
 ------------------------------------------------------------------------
   [1]  Xac thuc API Key cho Sandbox 2 (Codex CLI)
        [1a] OpenAI / GPT API Key (masked -> codex login --with-api-key)
@@ -1706,11 +2097,12 @@ action_menu() {
   [4]  Check Tai khoan Hien co (GPT 1 & Sandbox 2 — chi doc)
   [5]  Dong bo Lich su Chat 2 chieu (GPT 1 <-> Sandbox 2)
   [6]  Xoa Sandbox 2 An toan (GIU NGUYEN 100% lich su chat ve GPT 1)
+  [7]  Chon che do quyen Sandbox 2 (Codex CLI)
   [0]  Thoat (Exit)
 ------------------------------------------------------------------------
 EOF
     local choice=""
-    printf 'Chon chuc nang [1/1a/1b/2/3/4/5/6/0]: ' >&2
+    printf 'Chon chuc nang [1/1a/1b/2/3/4/5/6/7/0]: ' >&2
     if ! IFS= read -r choice; then
       printf '\n' >&2
       break
@@ -1750,6 +2142,14 @@ EOF
       4) action_check_accounts || true ;;
       5) action_sync_history || true ;;
       6) action_remove_sandbox2 || true ;;
+      7)
+        local prev_cm="${CLI_MODE}" prev_cfa="${CONFIRM_FULL_ACCESS}"
+        CLI_MODE=""
+        CONFIRM_FULL_ACCESS=0
+        action_set_cli_mode || true
+        CLI_MODE="${prev_cm}"
+        CONFIRM_FULL_ACCESS="${prev_cfa}"
+        ;;
       0|q|quit|exit)
         echo "Tam biet!"
         break
@@ -1772,6 +2172,8 @@ LANE1_HOME="${CODEX_LANE1_HOME:-${HOME}/.codex}"
 LANE2_HOME="${CODEX_LANE2_HOME:-${HOME}/.codex-official}"
 LOCAL_BIN="${CODEX_LOCAL_BIN:-${HOME}/.local/bin}"
 CODEX_PATH="${CODEX_REAL_BIN:-}"
+CLI_MODE=""
+CONFIRM_FULL_ACCESS=0
 ONLINE_CHECK=0
 DEVICE_AUTH=0
 EDITOR_CMD=""
@@ -1806,6 +2208,15 @@ while [ "$#" -gt 0 ]; do
       require_arg "$1" "$#"
       CODEX_PATH="$2"
       shift 2
+      ;;
+    --cli-mode)
+      require_arg "$1" "$#"
+      CLI_MODE="$2"
+      shift 2
+      ;;
+    --confirm-full-access)
+      CONFIRM_FULL_ACCESS=1
+      shift
       ;;
     --online-check)
       ONLINE_CHECK=1
@@ -1878,6 +2289,18 @@ if [ "${LANE1_HOME}" = "${LANE2_HOME}" ]; then
   exit 1
 fi
 
+if [ -n "${CLI_MODE}" ]; then
+  CLI_MODE="$(to_lower "${CLI_MODE}")"
+  case "${CLI_MODE}" in
+    ask|config|full-access) ;;
+    fullaccess) CLI_MODE="full-access" ;;
+    *)
+      echo "[FAIL] Invalid --cli-mode '${CLI_MODE}'. Allowed values: 'ask', 'config', 'full-access'." >&2
+      exit 1
+      ;;
+  esac
+fi
+
 PY_BIN="$(resolve_python3)"
 
 ACTION_LOWER="$(to_lower "${ACTION}")"
@@ -1906,8 +2329,11 @@ case "${ACTION_LOWER}" in
   remove-sandbox2|removesandbox2)
     action_remove_sandbox2
     ;;
+  set-cli-mode|setclimode)
+    action_set_cli_mode
+    ;;
   *)
-    echo "[FAIL] Unknown --action '${ACTION}'. Allowed: menu, api-gpt, api-other, login, check-api-key, check-accounts, sync-history, remove-sandbox2." >&2
+    echo "[FAIL] Unknown --action '${ACTION}'. Allowed: menu, api-gpt, api-other, login, check-api-key, check-accounts, sync-history, remove-sandbox2, set-cli-mode." >&2
     exit 1
     ;;
 esac

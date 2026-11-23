@@ -35,8 +35,10 @@
          (direct Lane2\config.toml edit, TOML validation, plaintext warning, ACL re-lock), Login
          (standard & --device-auth), CheckApiKey (offline + live loopback HttpListener 200/401,
          zero secret echo), CheckAccounts (100% read-only on both lanes, zero token echo),
-         SyncHistory (bidirectional), and RemoveSandbox2 (fail-closed pre-uninstall chat & local
-         rollout rescue into GPT 1 before safe Junction detach and Lane 2 removal).
+         SyncHistory (bidirectional), RemoveSandbox2 (fail-closed pre-uninstall chat & local
+         rollout rescue into GPT 1 before safe Junction detach and Lane 2 removal), and
+         SetCliMode / setup-dual-lane -CliMode (3-mode Ask / Config / FullAccess with fail-closed
+         danger confirmation gate, native [features] preservation, and doctor.ps1 CLI mode audit).
 
 .NOTES
     Author    : Lê Hoàng Ngọc Tươi
@@ -2570,6 +2572,213 @@ env_key = "CODEX_P13_PROBE_KEY"
         Assert-True ($syncBkps.Count -ge 1) 'Expected SQLite .sync-backup-* safety copy in GPT 1 before sync write!'
 
         Write-Host "    [OK] codex-manager.ps1 verified end-to-end (ApiGpt, ApiOther, Login/--device-auth, CheckApiKey offline+200+401, CheckAccounts read-only, SyncHistory, and history-preserving RemoveSandbox2)" -ForegroundColor Green
+
+        # 13g) 3-Mode Sandbox 2 Permission Selector (Ask / Config / FullAccess) + Native [features] Preservation + doctor.ps1 Mode Audit
+        $p13gL1   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p13g lane 1 desktop')
+        $p13gL2   = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p13g lane 2 cli')
+        $p13gBin  = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p13g local bin')
+        $p13gRepo = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p13g repo')
+        $p13gMockCmd = Join-Path $tmpRoot 'p13g-mock-codex.cmd'
+        New-Item -ItemType Directory -Path (Join-Path $p13gL1 'sessions'), $p13gL2, $p13gBin, $p13gRepo -Force | Out-Null
+        try {
+            $p13gMockBat = @(
+                '@echo off',
+                'if "%~1"=="--version" (echo codex-cli 0.171.0-alpha.13-test & exit /b 0)',
+                'if "%~1"=="features" (',
+                '  echo daemon_auto_start    stable  true',
+                '  echo memories             stable  false',
+                '  echo goals                stable  true',
+                '  echo image_generation     stable  true',
+                '  echo api_key_model_discovery stable true',
+                '  echo js_repl              removed false',
+                '  exit /b 0',
+                ')',
+                'if "%~1"=="execpolicy" (echo {"decision":"forbidden"} & exit /b 0)',
+                'if "%~1"=="login" (echo Logged in using chatgpt & exit /b 0)',
+                'exit /b 0'
+            ) -join "`r`n"
+            [System.IO.File]::WriteAllText($p13gMockCmd, $p13gMockBat + "`r`n", [System.Text.Encoding]::ASCII)
+
+            [System.IO.File]::WriteAllText((Join-Path $p13gL1 'auth.json'), '{"auth_mode":"chatgpt"}', (New-Object System.Text.UTF8Encoding($false)))
+            [System.IO.File]::WriteAllText((Join-Path $p13gL2 'auth.json'), '{"auth_mode":"chatgpt"}', (New-Object System.Text.UTF8Encoding($false)))
+
+            $p13gCfg2Path = Join-Path $p13gL2 'config.toml'
+            $p13gSeedCfg2 = @"
+approval_policy = "on-failure"
+sandbox_mode = "read-only"
+web_search = "cached"
+
+[features]
+multi_agent_v2 = true
+fast_mode = true
+
+[sandbox_workspace_write]
+network_access = true
+
+[projects."c:\\p13g\\trusted"]
+trust_level = "trusted"
+
+[projects."c:\\p13g\\untrusted"]
+trust_level = "untrusted"
+
+[projects."c:\\p13g\\missing"]
+custom_note = "preserve-missing-trust-13g"
+
+[mcp_servers.p13g_mcp]
+command = "node"
+args = ["p13g.js"]
+
+[tui]
+theme = "dark"
+"@
+            [System.IO.File]::WriteAllText($p13gCfg2Path, $p13gSeedCfg2, (New-Object System.Text.UTF8Encoding($false)))
+
+            # (i) setup-dual-lane.ps1 -CliMode Config: preserves custom approval_policy/sandbox_mode/network_access/web_search
+            #     AND merges user [features] non-destructively while enabling supported native features (and NOT emitting js_repl)!
+            $res13gSetupCfg = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
+                '-RepoPath', $p13gRepo, '-CodexPath', $p13gMockCmd,
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin,
+                '-CliMode', 'Config', '-SkipPathUpdate'
+            )
+            Assert-True ($res13gSetupCfg.ExitCode -eq 0) "Test 13g setup -CliMode Config failed (exit=$($res13gSetupCfg.ExitCode)):`n$($res13gSetupCfg.Output)"
+            $cfg13gAfterSetup = Get-Content -LiteralPath $p13gCfg2Path -Raw -Encoding UTF8
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*approval_policy\s*=\s*"on-failure"\s*$') 'setup -CliMode Config did not preserve custom approval_policy = "on-failure"!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*sandbox_mode\s*=\s*"read-only"\s*$') 'setup -CliMode Config did not preserve custom sandbox_mode = "read-only"!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*web_search\s*=\s*"cached"\s*$') 'setup -CliMode Config did not preserve custom web_search = "cached"!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*network_access\s*=\s*true\s*$') 'setup -CliMode Config did not preserve existing [sandbox_workspace_write] network_access = true!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*multi_agent_v2\s*=\s*true\s*$') 'setup did not preserve user [features] multi_agent_v2 = true!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*fast_mode\s*=\s*true\s*$') 'setup did not preserve user [features] fast_mode = true!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*memories\s*=\s*true\s*$') 'setup did not enable native feature memories = true!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*goals\s*=\s*true\s*$') 'setup did not enable native feature goals = true!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*image_generation\s*=\s*true\s*$') 'setup did not enable native feature image_generation = true!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*api_key_model_discovery\s*=\s*true\s*$') 'setup did not enable native feature api_key_model_discovery = true!'
+            Assert-True ($cfg13gAfterSetup -match '(?m)^\s*daemon_auto_start\s*=\s*false\s*$') 'setup did not write daemon_auto_start = false!'
+            Assert-True ($cfg13gAfterSetup -notmatch '(?m)^\s*js_repl\s*=') 'setup must NOT emit removed js_repl flag!'
+            $tomlCheckPy | & $py -B - $p13gCfg2Path
+            Assert-True ($LASTEXITCODE -eq 0) 'Lane2\config.toml invalid TOML after setup -CliMode Config!'
+            Assert-True ([bool](Get-Acl -LiteralPath $p13gCfg2Path).AreAccessRulesProtected) 'setup -CliMode Config did not lock NTFS DACL!'
+
+            $res13gDocCfg = Invoke-PsScript -ScriptPath $DoctorScript -Arguments @(
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin, '-CodexPath', $p13gMockCmd
+            )
+            Assert-True ($res13gDocCfg.ExitCode -eq 0) "doctor.ps1 failed on Config mode (exit=$($res13gDocCfg.ExitCode)):`n$($res13gDocCfg.Output)"
+            Assert-True ($res13gDocCfg.Output -match '\[PASS\]\s+Sandbox 2 CLI Mode\s*:\s*Config.*on-failure.*read-only') "doctor.ps1 did not report [PASS] Sandbox 2 CLI Mode Config:`n$($res13gDocCfg.Output)"
+
+            # (ii) setup-dual-lane.ps1 -CliMode FullAccess WITHOUT -ConfirmFullAccess MUST refuse fail-closed (exit 1, 0 mutations)!
+            $hashBeforeSetupRefuse = (Get-FileHash -LiteralPath $p13gCfg2Path -Algorithm SHA256).Hash
+            $bkpCountBeforeSetupRefuse = @(Get-ChildItem -LiteralPath $p13gL2 -Filter 'config.toml.backup-*' -File).Count
+            $res13gSetupRefuse = & $invokePsWithStdin $SetupScript @(
+                '-RepoPath', $p13gRepo, '-CodexPath', $p13gMockCmd,
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin,
+                '-CliMode', 'FullAccess', '-SkipPathUpdate'
+            ) 'yes'
+            Assert-True ($res13gSetupRefuse.ExitCode -eq 1) "setup -CliMode FullAccess without -ConfirmFullAccess MUST exit 1 (got $($res13gSetupRefuse.ExitCode)):`n$($res13gSetupRefuse.Output)"
+            Assert-True ($res13gSetupRefuse.Output -match 'EXTREMELY DANGEROUS' -and $res13gSetupRefuse.Output -match 'danger-full-access') "setup -CliMode FullAccess did not print realistic danger warning:`n$($res13gSetupRefuse.Output)"
+            Assert-True ((Get-FileHash -LiteralPath $p13gCfg2Path -Algorithm SHA256).Hash -eq $hashBeforeSetupRefuse) 'CRITICAL: setup -CliMode FullAccess modified config.toml despite refusal!'
+            Assert-True (@(Get-ChildItem -LiteralPath $p13gL2 -Filter 'config.toml.backup-*' -File).Count -eq $bkpCountBeforeSetupRefuse) 'setup -CliMode FullAccess created backup despite refusal!'
+
+            # (iii) codex-manager.ps1 SetCliMode FullAccess WITHOUT -ConfirmFullAccess (even with -Force!) MUST fail closed (exit 1, 0 mutations)!
+            $hashBeforeMgrRefuse = (Get-FileHash -LiteralPath $p13gCfg2Path -Algorithm SHA256).Hash
+            $bkpCountBeforeMgrRefuse = @(Get-ChildItem -LiteralPath $p13gL2 -Filter 'config.toml.backup-*' -File).Count
+            $res13gMgrRefuse = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'SetCliMode', '-CliMode', 'FullAccess', '-Force', '-NonInteractive',
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin
+            )
+            Assert-True ($res13gMgrRefuse.ExitCode -eq 1) "SetCliMode FullAccess without -ConfirmFullAccess MUST exit 1 even with -Force (got $($res13gMgrRefuse.ExitCode)):`n$($res13gMgrRefuse.Output)"
+            Assert-True ($res13gMgrRefuse.Output -match 'EXTREMELY DANGEROUS' -and $res13gMgrRefuse.Output -match 'danger-full-access' -and $res13gMgrRefuse.Output -match 'approval_policy = "never"') "SetCliMode FullAccess did not print realistic danger warning:`n$($res13gMgrRefuse.Output)"
+            Assert-True ((Get-FileHash -LiteralPath $p13gCfg2Path -Algorithm SHA256).Hash -eq $hashBeforeMgrRefuse) 'CRITICAL: SetCliMode FullAccess altered config.toml SHA-256 despite refusal!'
+            Assert-True (@(Get-ChildItem -LiteralPath $p13gL2 -Filter 'config.toml.backup-*' -File).Count -eq $bkpCountBeforeMgrRefuse) 'SetCliMode FullAccess created backup despite refusal!'
+
+            # (iv) codex-manager.ps1 SetCliMode FullAccess WITH -ConfirmFullAccess: backs up, sets never/danger-full-access, preserves projects/features/mcp/tui, locks ACL!
+            $res13gMgrFull = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'SetCliMode', '-CliMode', 'FullAccess', '-ConfirmFullAccess', '-NonInteractive',
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin
+            )
+            Assert-True ($res13gMgrFull.ExitCode -eq 0) "SetCliMode FullAccess -ConfirmFullAccess failed (exit=$($res13gMgrFull.ExitCode)):`n$($res13gMgrFull.Output)"
+            Assert-True ($res13gMgrFull.Output -match 'EXTREMELY DANGEROUS') "SetCliMode FullAccess -ConfirmFullAccess did not display danger banner:`n$($res13gMgrFull.Output)"
+            Assert-True (@(Get-ChildItem -LiteralPath $p13gL2 -Filter 'config.toml.backup-*' -File).Count -gt $bkpCountBeforeMgrRefuse) 'SetCliMode FullAccess did not create config.toml backup!'
+            $cfg13gFull = Get-Content -LiteralPath $p13gCfg2Path -Raw -Encoding UTF8
+            Assert-True ($cfg13gFull -match '(?m)^\s*approval_policy\s*=\s*"never"\s*$') 'SetCliMode FullAccess did not set approval_policy = "never"!'
+            Assert-True ($cfg13gFull -match '(?m)^\s*sandbox_mode\s*=\s*"danger-full-access"\s*$') 'SetCliMode FullAccess did not set sandbox_mode = "danger-full-access"!'
+            Assert-True ($cfg13gFull -match '(?m)^\s*multi_agent_v2\s*=\s*true\s*$') 'SetCliMode FullAccess lost user [features]!'
+            Assert-True ($cfg13gFull -match '\[mcp_servers\.p13g_mcp\]' -and $cfg13gFull -match '\[tui\]') 'SetCliMode FullAccess lost [mcp_servers] or [tui]!'
+            $p13gFullMap = & $parseProjectSections $cfg13gFull
+            Assert-True ($p13gFullMap.ContainsKey('c:\p13g\trusted') -and $p13gFullMap['c:\p13g\trusted'].Body -match 'trust_level\s*=\s*"trusted"') 'SetCliMode FullAccess lost trusted project!'
+            Assert-True ($p13gFullMap.ContainsKey('c:\p13g\untrusted') -and $p13gFullMap['c:\p13g\untrusted'].Body -match 'trust_level\s*=\s*"untrusted"') 'SECURITY: SetCliMode FullAccess altered untrusted project!'
+            Assert-True ($p13gFullMap.ContainsKey('c:\p13g\missing') -and $p13gFullMap['c:\p13g\missing'].Body -notmatch 'trust_level\s*=') 'SECURITY: SetCliMode FullAccess promoted missing-trust project!'
+            $tomlCheckPy | & $py -B - $p13gCfg2Path
+            Assert-True ($LASTEXITCODE -eq 0) 'Lane2\config.toml invalid TOML after SetCliMode FullAccess!'
+            Assert-True ([bool](Get-Acl -LiteralPath $p13gCfg2Path).AreAccessRulesProtected) 'SetCliMode FullAccess did not lock NTFS DACL!'
+
+            # Verify doctor.ps1 reports [WARN] Full Access (danger-full-access) with exit 0 (no false FAIL) while auditing ACLs/secrets/Junctions!
+            $res13gDocFull = Invoke-PsScript -ScriptPath $DoctorScript -Arguments @(
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin, '-CodexPath', $p13gMockCmd
+            )
+            Assert-True ($res13gDocFull.ExitCode -eq 0) "doctor.ps1 must exit 0 on intentional Full Access (got $($res13gDocFull.ExitCode)):`n$($res13gDocFull.Output)"
+            Assert-True ($res13gDocFull.Output -match '\[WARN\]\s+Sandbox 2 CLI Mode\s*:\s*Full Access \(danger-full-access') "doctor.ps1 did not report [WARN] Full Access (danger-full-access):`n$($res13gDocFull.Output)"
+            Assert-True ($res13gDocFull.Output -match 'kernel_acl=locked' -and $res13gDocFull.Output -match '6/6 NTFS Junctions healthy' -and $res13gDocFull.Output -match '\[PASS\]\s+Secret Hygiene') "doctor.ps1 failed to audit ACLs/secrets/Junctions in Full Access mode:`n$($res13gDocFull.Output)"
+
+            # Verify CheckAccounts displays approval_policy and Full Access mode clearly!
+            $res13gAcctFull = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'CheckAccounts', '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2,
+                '-LocalBin', $p13gBin, '-CodexPath', $p13gMockCmd, '-NonInteractive'
+            )
+            Assert-True ($res13gAcctFull.ExitCode -eq 0 -and $res13gAcctFull.Output -match 'approval_policy=never' -and $res13gAcctFull.Output -match 'Full Access') "CheckAccounts did not display Full Access & approval_policy=never:`n$($res13gAcctFull.Output)"
+
+            # (v) codex-manager.ps1 SetCliMode Config: preserves custom approval_policy & sandbox_mode, validates TOML, re-locks ACL!
+            $cfg13gCustom = ($cfg13gFull -replace '(?m)^\s*approval_policy\s*=.*$', 'approval_policy = "on-failure"') -replace '(?m)^\s*sandbox_mode\s*=.*$', 'sandbox_mode = "read-only"'
+            [System.IO.File]::WriteAllText($p13gCfg2Path, $cfg13gCustom, (New-Object System.Text.UTF8Encoding($false)))
+            $null = & icacls.exe $p13gCfg2Path /inheritance:e 2>&1
+            $global:LASTEXITCODE = 0
+            Assert-True (-not [bool](Get-Acl -LiteralPath $p13gCfg2Path).AreAccessRulesProtected) 'Pre-test inheritance reset failed'
+            $res13gMgrCfg = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'SetCliMode', '-CliMode', 'Config', '-NonInteractive',
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin
+            )
+            Assert-True ($res13gMgrCfg.ExitCode -eq 0) "SetCliMode Config failed (exit=$($res13gMgrCfg.ExitCode)):`n$($res13gMgrCfg.Output)"
+            Assert-True ($res13gMgrCfg.Output -match 'Valid TOML syntax') "SetCliMode Config did not validate TOML syntax:`n$($res13gMgrCfg.Output)"
+            $cfg13gAfterMgrCfg = Get-Content -LiteralPath $p13gCfg2Path -Raw -Encoding UTF8
+            Assert-True ($cfg13gAfterMgrCfg -match '(?m)^\s*approval_policy\s*=\s*"on-failure"\s*$' -and $cfg13gAfterMgrCfg -match '(?m)^\s*sandbox_mode\s*=\s*"read-only"\s*$') 'SetCliMode Config altered custom approval_policy or sandbox_mode!'
+            Assert-True ([bool](Get-Acl -LiteralPath $p13gCfg2Path).AreAccessRulesProtected) 'SetCliMode Config did not re-lock NTFS DACL!'
+
+            # (vi) codex-manager.ps1 SetCliMode Ask: switches cleanly back to on-request + workspace-write, preserves projects/features, locks ACL!
+            $res13gMgrAsk = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'SetCliMode', '-CliMode', 'Ask', '-NonInteractive',
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin
+            )
+            Assert-True ($res13gMgrAsk.ExitCode -eq 0) "SetCliMode Ask failed (exit=$($res13gMgrAsk.ExitCode)):`n$($res13gMgrAsk.Output)"
+            $cfg13gAsk = Get-Content -LiteralPath $p13gCfg2Path -Raw -Encoding UTF8
+            Assert-True ($cfg13gAsk -match '(?m)^\s*approval_policy\s*=\s*"on-request"\s*$' -and $cfg13gAsk -match '(?m)^\s*sandbox_mode\s*=\s*"workspace-write"\s*$') 'SetCliMode Ask did not restore on-request + workspace-write!'
+            Assert-True ($cfg13gAsk -match '(?m)^\s*multi_agent_v2\s*=\s*true\s*$') 'SetCliMode Ask lost user [features]!'
+            $p13gAskMap = & $parseProjectSections $cfg13gAsk
+            Assert-True ($p13gAskMap.ContainsKey('c:\p13g\untrusted') -and $p13gAskMap['c:\p13g\untrusted'].Body -match 'trust_level\s*=\s*"untrusted"') 'SetCliMode Ask altered untrusted project!'
+            $tomlCheckPy | & $py -B - $p13gCfg2Path
+            Assert-True ($LASTEXITCODE -eq 0) 'Lane2\config.toml invalid TOML after SetCliMode Ask!'
+            Assert-True ([bool](Get-Acl -LiteralPath $p13gCfg2Path).AreAccessRulesProtected) 'SetCliMode Ask did not lock NTFS DACL!'
+
+            $res13gDocAsk = Invoke-PsScript -ScriptPath $DoctorScript -Arguments @(
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin, '-CodexPath', $p13gMockCmd
+            )
+            Assert-True ($res13gDocAsk.ExitCode -eq 0) "doctor.ps1 failed on Ask mode (exit=$($res13gDocAsk.ExitCode)):`n$($res13gDocAsk.Output)"
+            Assert-True ($res13gDocAsk.Output -match '\[PASS\]\s+Sandbox 2 CLI Mode\s*:\s*Ask') "doctor.ps1 did not report [PASS] Sandbox 2 CLI Mode Ask:`n$($res13gDocAsk.Output)"
+
+            # (vii) setup-dual-lane.ps1 -CliMode FullAccess -ConfirmFullAccess: succeeds cleanly with danger banner, never/danger-full-access, and locked ACL!
+            $res13gSetupFull = Invoke-PsScript -ScriptPath $SetupScript -Arguments @(
+                '-RepoPath', $p13gRepo, '-CodexPath', $p13gMockCmd,
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gL2, '-LocalBin', $p13gBin,
+                '-CliMode', 'FullAccess', '-ConfirmFullAccess', '-SkipPathUpdate'
+            )
+            Assert-True ($res13gSetupFull.ExitCode -eq 0) "setup -CliMode FullAccess -ConfirmFullAccess failed (exit=$($res13gSetupFull.ExitCode)):`n$($res13gSetupFull.Output)"
+            Assert-True ($res13gSetupFull.Output -match 'EXTREMELY DANGEROUS') "setup -CliMode FullAccess -ConfirmFullAccess did not print danger banner:`n$($res13gSetupFull.Output)"
+            $cfg13gSetupFull = Get-Content -LiteralPath $p13gCfg2Path -Raw -Encoding UTF8
+            Assert-True ($cfg13gSetupFull -match '(?m)^\s*approval_policy\s*=\s*"never"\s*$' -and $cfg13gSetupFull -match '(?m)^\s*sandbox_mode\s*=\s*"danger-full-access"\s*$') 'setup -CliMode FullAccess -ConfirmFullAccess did not write never + danger-full-access!'
+            Assert-True ($cfg13gSetupFull -match '(?m)^\s*multi_agent_v2\s*=\s*true\s*$') 'setup -CliMode FullAccess lost user [features]!'
+            Assert-True ([bool](Get-Acl -LiteralPath $p13gCfg2Path).AreAccessRulesProtected) 'setup -CliMode FullAccess did not lock NTFS DACL!'
+
+            Write-Host "    [OK] Stage 13g verified (SetCliMode Ask/Config/FullAccess fail-closed gate, setup -CliMode Config/FullAccess, native [features] preservation, and doctor.ps1 CLI mode audit)" -ForegroundColor Green
+        } finally {
+            Remove-TempTreeSafely -RootDir $null -Lane2Dir $p13gL2
+        }
     } finally {
         Remove-TempTreeSafely -RootDir $null -Lane2Dir $p13L2
     }

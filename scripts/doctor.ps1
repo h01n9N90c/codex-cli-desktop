@@ -12,8 +12,9 @@
          their expected Lane 1 targets).
       5. Security Guardrails on both lanes: config.toml, rules\default.rules, AGENTS.md
          (Static-Analysis-Only check), sandbox network isolation (`network_access = false`),
-         shell environment secret scrubbing (`[shell_environment_policy]`), and live behavioral
-         probes through the real Codex Rust `execpolicy check` engine.
+         shell environment secret scrubbing (`[shell_environment_policy]`), active Sandbox 2 CLI
+         permission mode (`Ask`, `Config`, or advisory `[WARN] Full Access (danger-full-access)`),
+         and live behavioral probes through the real Codex Rust `execpolicy check` engine.
       6. Plaintext Secret Hygiene check: scans config.toml in memory for prohibited plaintext keys
          (`experimental_bearer_token`, inline `api_key`) without ever printing secret values.
       7. Auth & NTFS Kernel ACL Isolation: safely reads only the `auth_mode` metadata field from
@@ -333,16 +334,18 @@ function Remove-TomlInlineComment([string]$Line) {
 function Inspect-CodexConfigGuardrails([string]$ConfigText) {
     <#
     .SYNOPSIS
-        Line-by-line TOML section inspector for `[sandbox_workspace_write]` and
-        `[shell_environment_policy]` security guardrails.
+        Line-by-line TOML inspector for top-level `sandbox_mode`/`approval_policy` plus
+        `[sandbox_workspace_write]` and `[shell_environment_policy]` security guardrails.
         WHY: Avoids both regex false positives (matching commented `# network_access = false`)
         and regex false negatives (arrays like `writable_roots = [...]` before `network_access`
         stopping `[^\[]*` prematurely).
     #>
     $netAccessValue = $null
     $envFilterOk = $false
+    $sandboxMode = ''
+    $approvalPolicy = ''
     if ([string]::IsNullOrEmpty($ConfigText)) {
-        return [PSCustomObject]@{ NetOffline = $false; EnvFilterOk = $false }
+        return [PSCustomObject]@{ NetOffline = $false; EnvFilterOk = $false; SandboxMode = ''; ApprovalPolicy = '' }
     }
 
     $currentSection = ''
@@ -372,10 +375,24 @@ function Inspect-CodexConfigGuardrails([string]$ConfigText) {
         }
         if ($line -match '^\[(.+)\]$') {
             $currentSection = $Matches[1].Trim().ToLowerInvariant()
+            if (($currentSection -eq 'approval_policy' -or $currentSection -like 'approval_policy.*') -and [string]::IsNullOrEmpty($approvalPolicy)) {
+                $approvalPolicy = 'granular'
+            }
             continue
         }
 
-        if ($currentSection -eq 'sandbox_workspace_write') {
+        if ($currentSection -eq '') {
+            if ($line -match '^sandbox_mode\s*=\s*(?:"([^"]+)"|''([^'']+)'')\s*$') {
+                $sandboxMode = if ($Matches[1]) { $Matches[1].Trim() } else { $Matches[2].Trim() }
+            } elseif ($line -match '^approval_policy\s*=\s*(.*)$') {
+                $apRhs = $Matches[1].Trim()
+                if ($apRhs -match '^(?:"([^"]+)"|''([^'']+)'')\s*$') {
+                    $approvalPolicy = if ($Matches[1]) { $Matches[1].Trim() } else { $Matches[2].Trim() }
+                } elseif ($apRhs.StartsWith('{')) {
+                    $approvalPolicy = 'granular'
+                }
+            }
+        } elseif ($currentSection -eq 'sandbox_workspace_write') {
             if ($line -match '^network_access\s*=\s*(true|false)\s*$') {
                 $netAccessValue = $Matches[1].ToLowerInvariant()
             }
@@ -394,8 +411,10 @@ function Inspect-CodexConfigGuardrails([string]$ConfigText) {
     }
 
     return [PSCustomObject]@{
-        NetOffline  = ($netAccessValue -eq 'false')
-        EnvFilterOk = $envFilterOk
+        NetOffline     = ($netAccessValue -eq 'false')
+        EnvFilterOk    = $envFilterOk
+        SandboxMode    = $sandboxMode
+        ApprovalPolicy = $approvalPolicy
     }
 }
 
@@ -719,6 +738,30 @@ foreach ($pair in @(@('Lane 1', $Lane1Home), @('Lane 2', $Lane2Home))) {
         }
     } else {
         Report 'WARN' "$label Guardrails" "config=$hasConfig, rules=$hasRules, AGENTS.md=$hasAgents"
+    }
+
+    # Report active Sandbox 2 (Codex CLI) permission mode cleanly without false FAIL on intentional Full Access.
+    if ($label -eq 'Lane 2') {
+        if (-not $hasConfig) {
+            Report 'WARN' 'Sandbox 2 CLI Mode' 'Lane 2 config.toml not found (run setup-dual-lane.ps1)'
+        } else {
+            $l2ModeInfo = Inspect-CodexConfigGuardrails -ConfigText $cfgText
+            $sbVal = $l2ModeInfo.SandboxMode
+            $apVal = $l2ModeInfo.ApprovalPolicy
+            $sbDisp = if (-not [string]::IsNullOrWhiteSpace($sbVal)) { $sbVal } else { 'unset' }
+            $apDisp = if (-not [string]::IsNullOrWhiteSpace($apVal)) { $apVal } else { 'unset' }
+            if ($sbVal -ceq 'danger-full-access') {
+                if ($apVal -ceq 'never') {
+                    Report 'WARN' 'Sandbox 2 CLI Mode' 'Full Access (danger-full-access | approval_policy=never) -- OS sandbox & approvals bypassed; switch back to Ask via codex-manage [7] when done'
+                } else {
+                    Report 'WARN' 'Sandbox 2 CLI Mode' "Config [danger-full-access] (approval_policy=$apDisp, sandbox_mode=danger-full-access) -- OS sandbox bypassed"
+                }
+            } elseif (($sbVal -ceq 'workspace-write') -and ($apVal -ceq 'on-request')) {
+                Report 'PASS' 'Sandbox 2 CLI Mode' 'Ask (approval_policy=on-request, sandbox_mode=workspace-write | project-contained)'
+            } else {
+                Report 'PASS' 'Sandbox 2 CLI Mode' "Config (config.toml: approval_policy=$apDisp, sandbox_mode=$sbDisp)"
+            }
+        }
     }
 }
 

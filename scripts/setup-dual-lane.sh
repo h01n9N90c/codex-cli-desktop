@@ -76,7 +76,11 @@ Usage: ./scripts/setup-dual-lane.sh [REPO_PATH] [OPTIONS]
 
 Options:
   --repo, --repo-path PATH    Target repository directory (default: current directory; accepts relative paths like .)
-  --approval-policy MODE      'on-request' (default, secure) or 'never' (unattended)
+  --cli-mode MODE             Lane 2 CLI permission mode: 'ask' (default: on-request + workspace-write),
+                              'config' (preserve existing config.toml approval_policy & sandbox_mode),
+                              or 'full-access' (DANGER: never + danger-full-access; requires confirmation)
+  --confirm-full-access       Explicitly confirm --cli-mode full-access (required when non-interactive)
+  --approval-policy MODE      'on-request' (default, secure) or 'never' (unattended; used with --cli-mode ask)
   --allow-sandbox-network     Enable network_access=true inside [sandbox_workspace_write]
   --use-git-worktree          Create an isolated Git worktree (<repo>-lane2) for OS-level file isolation
   --worktree-path PATH        Custom worktree path when using --use-git-worktree
@@ -101,6 +105,7 @@ Environment overrides:
   CODEX_LANE2_HOME            Secondary CODEX_HOME (CLI: Login + API Key, default: ~/.codex-official)
   CODEX_LOCAL_BIN             Launcher install directory (default: ~/.local/bin)
   CODEX_CARGO_TARGET_DIR      Isolated Rust Cargo target dir for Lane 2
+  CODEX_CLI_MODE              Default Lane 2 CLI mode ('ask', 'config', or 'full-access')
   CODEX_APPROVAL_POLICY       Default approval policy ('on-request' or 'never')
   CODEX_SANDBOX_NETWORK       Default sandbox network flag ('false' or 'true')
   CODEX_LANE2_BRANCH          Git branch name when --use-git-worktree is enabled (default: dual-lane-2)
@@ -448,6 +453,32 @@ backup_and_copy() {
   fi
 }
 
+# Print high-visibility ANSI RED/YELLOW danger warning banner modeled on Codex CLI's
+# --dangerously-bypass-approvals-and-sandbox warning whenever Full Access is requested.
+print_full_access_danger_warning() {
+  local c_red="" c_yel="" c_rst=""
+  if [ -z "${NO_COLOR:-}" ]; then
+    c_red=$'\033[1;31m'
+    c_yel=$'\033[1;33m'
+    c_rst=$'\033[0m'
+  fi
+  printf '%s\n' "${c_red}========================================================================${c_rst}"
+  printf '%s\n' "${c_red}[!!!] CANH BAO NGUY HIEM — EXTREMELY DANGEROUS (FULL ACCESS MODE) [!!!]${c_rst}"
+  printf '%s\n' "${c_red}========================================================================${c_rst}"
+  printf '%s\n' "${c_yel}Che do duoc yeu cau: Toan quyen (Full Access) cho Sandbox 2 (Codex CLI)${c_rst}"
+  printf '%s\n' "${c_yel}  - sandbox_mode    = \"danger-full-access\"  (TAT HOAN TOAN OS SANDBOX)${c_rst}"
+  printf '%s\n' "${c_yel}  - approval_policy = \"never\"               (TAT HOAN TOAN HOI DUYET)${c_rst}"
+  printf '\n'
+  printf '%s\n' "${c_yel}Rui ro truc tiep tren toan bo may tinh (Host-Wide Risk):${c_rst}"
+  printf '%s\n' "${c_yel}  * Codex CLI co the DOC / GHI / XOA bat ky tep nao ben ngoai thu muc${c_rst}"
+  printf '%s\n' "${c_yel}    du an va CHAY LENH + TRUY CAP MANG voi toan bo quyen OS user hien tai.${c_rst}"
+  printf '%s\n' "${c_yel}  * default.rules chi kiem tra prefix argv truc tiep (KHONG chan duoc${c_rst}"
+  printf '%s\n' "${c_yel}    lenh long ben trong bash -c / sh -c / python -c / script).${c_rst}"
+  printf '%s\n' "${c_yel}  * KHUYEN NGHI BAT BUOC: Tao Git commit checkpoint (git commit) hoac${c_rst}"
+  printf '%s\n' "${c_yel}    chay trong --use-git-worktree / container truoc khi bat che do nay!${c_rst}"
+  printf '%s\n' "${c_red}========================================================================${c_rst}"
+}
+
 # ------------------------------------------------------------------------------
 # Defaults & CLI Argument Parsing
 # ------------------------------------------------------------------------------
@@ -463,8 +494,11 @@ LANE1_HOME="${CODEX_LANE1_HOME:-${HOME}/.codex}"
 LANE2_HOME="${CODEX_LANE2_HOME:-${HOME}/.codex-official}"
 LOCAL_BIN="${CODEX_LOCAL_BIN:-${HOME}/.local/bin}"
 CARGO_TARGET_LANE2="${CODEX_CARGO_TARGET_DIR:-${SAFE_TMPDIR}/codex-lane2-target}"
+CLI_MODE="${CODEX_CLI_MODE:-ask}"
+CONFIRM_FULL_ACCESS=0
 APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-on-request}"
 SANDBOX_NETWORK="${CODEX_SANDBOX_NETWORK:-false}"
+ALLOW_SANDBOX_NETWORK_EXPLICIT=0
 USE_GIT_WORKTREE=0
 LANE2_WORKTREE_PATH=""
 LANE2_BRANCH="${CODEX_LANE2_BRANCH:-dual-lane-2}"
@@ -489,6 +523,15 @@ while [ "$#" -gt 0 ]; do
       REPO_PATH="$2"
       shift 2
       ;;
+    --cli-mode)
+      require_arg "$1" "$#"
+      CLI_MODE="$2"
+      shift 2
+      ;;
+    --confirm-full-access)
+      CONFIRM_FULL_ACCESS=1
+      shift
+      ;;
     --approval-policy)
       require_arg "$1" "$#"
       APPROVAL_POLICY="$2"
@@ -496,6 +539,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --allow-sandbox-network)
       SANDBOX_NETWORK="true"
+      ALLOW_SANDBOX_NETWORK_EXPLICIT=1
       shift
       ;;
     --use-git-worktree)
@@ -593,6 +637,15 @@ done
 # Strict Input & Precondition Validation (Fail Closed Before Any Disk Writes)
 # ------------------------------------------------------------------------------
 # Allowlist TOML enum/boolean values to prevent config.toml structure injection.
+CLI_MODE="$(printf '%s' "${CLI_MODE}" | awk '{print tolower($0)}')"
+case "${CLI_MODE}" in
+  ask|config|full-access) ;;
+  *)
+    echo "[FAIL] Invalid --cli-mode '${CLI_MODE}'. Allowed values: 'ask', 'config', 'full-access'." >&2
+    exit 1
+    ;;
+esac
+
 case "${APPROVAL_POLICY}" in
   on-request|never) ;;
   *)
@@ -608,6 +661,26 @@ case "${SANDBOX_NETWORK}" in
     exit 1
     ;;
 esac
+
+# Fail-closed Full Access confirmation gate (runs BEFORE any worktree, backup, or disk writes).
+if [ "${CLI_MODE}" = "full-access" ]; then
+  print_full_access_danger_warning
+  if [ "${CONFIRM_FULL_ACCESS}" -eq 1 ]; then
+    echo "[WARN] Explicit --confirm-full-access received. Proceeding with Full Access (danger-full-access / approval_policy=never)..." >&2
+  elif [ -t 0 ]; then
+    full_access_confirm=""
+    printf "De xac nhan bat TOAN QUYEN (Full Access), go chinh xac 'TOAN QUYEN' (hoac 'I UNDERSTAND'): " >&2
+    IFS= read -r full_access_confirm || true
+    full_access_confirm="${full_access_confirm%$'\r'}"
+    if [ "${full_access_confirm}" != "TOAN QUYEN" ] && [ "${full_access_confirm}" != "I UNDERSTAND" ]; then
+      echo "[FAIL] Refused Full Access (danger-full-access / approval_policy=never): exact confirmation phrase 'TOAN QUYEN' or 'I UNDERSTAND' not provided. Zero files modified." >&2
+      exit 1
+    fi
+  else
+    echo "[FAIL] Refused Full Access (danger-full-access / approval_policy=never): explicit confirmation required (pass --confirm-full-access, or run interactively and type 'TOAN QUYEN' / 'I UNDERSTAND'). Zero files modified." >&2
+    exit 1
+  fi
+fi
 
 # Validate gateway target lane and gateway parameters when gateway mode is active.
 if [ "${CONFIGURE_CLI_GATEWAY}" -eq 1 ]; then
@@ -769,10 +842,11 @@ HAS_DAEMON_FLAG=0
 HAS_GOALS_FLAG=0
 HAS_API_DISCOVERY_FLAG=0
 HAS_IMAGE_GEN_FLAG=0
-if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^daemon_auto_start[[:space:]]+'; then HAS_DAEMON_FLAG=1; fi
-if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^goals[[:space:]]+'; then HAS_GOALS_FLAG=1; fi
-if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^api_key_model_discovery[[:space:]]+'; then HAS_API_DISCOVERY_FLAG=1; fi
-if printf '%s\n' "${FEATURES_OUT}" | grep -Eq '^image_generation[[:space:]]+'; then HAS_IMAGE_GEN_FLAG=1; fi
+ACTIVE_FEATURE_STAGE_RE='(stable|experimental|under[[:space:]]+development|deprecated)'
+if printf '%s\n' "${FEATURES_OUT}" | grep -Eqi "^daemon_auto_start[[:space:]]+${ACTIVE_FEATURE_STAGE_RE}([[:space:]]|$)"; then HAS_DAEMON_FLAG=1; fi
+if printf '%s\n' "${FEATURES_OUT}" | grep -Eqi "^goals[[:space:]]+${ACTIVE_FEATURE_STAGE_RE}([[:space:]]|$)"; then HAS_GOALS_FLAG=1; fi
+if printf '%s\n' "${FEATURES_OUT}" | grep -Eqi "^api_key_model_discovery[[:space:]]+${ACTIVE_FEATURE_STAGE_RE}([[:space:]]|$)"; then HAS_API_DISCOVERY_FLAG=1; fi
+if printf '%s\n' "${FEATURES_OUT}" | grep -Eqi "^image_generation[[:space:]]+${ACTIVE_FEATURE_STAGE_RE}([[:space:]]|$)"; then HAS_IMAGE_GEN_FLAG=1; fi
 
 # ------------------------------------------------------------------------------
 # 3. Optional: Create Isolated Git Worktree for Lane 2 (Hard OS Write Boundary)
@@ -1021,10 +1095,11 @@ extract_preserved_top_keys() {
     }
     clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ { exit }
     clean ~ /^[[:space:]]*$/ { next }
-    clean ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/ {
+    clean ~ /^[[:space:]]*["\047]?[A-Za-z0-9_-]+["\047]?[[:space:]]*=/ {
       key = clean
       sub(/^[[:space:]]*/, "", key)
       sub(/[[:space:]]*=.*$/, "", key)
+      gsub(/^["\047]|["\047]$/, "", key)
       if (key == "experimental_bearer_token" || key == "api_key") {
         next
       }
@@ -1044,14 +1119,217 @@ extract_preserved_top_keys() {
   ' "${cfg_file}" || true
 }
 
+# Preserve custom user key assignments inside a specific managed TOML table
+# (e.g. [features] or [memories]) while skipping kit-upserted keys and secrets.
+extract_preserved_table_keys() {
+  local cfg_file="$1"
+  local target_table="$2"
+  local skip_keys_csv="$3"
+  awk -v target_table="${target_table}" -v skip_csv="${skip_keys_csv}" '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    BEGIN { in_target = 0 }
+    {
+      sub(/\r$/, "", $0)
+      clean = strip_comment($0)
+    }
+    clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ {
+      sec = clean
+      sub(/^[[:space:]]*\[/, "", sec)
+      sub(/\][[:space:]]*$/, "", sec)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
+      in_target = (tolower(sec) == target_table)
+      next
+    }
+    !in_target { next }
+    clean ~ /^[[:space:]]*$/ { next }
+    clean ~ /^[[:space:]]*(["\047]?[A-Za-z0-9_-]+["\047]?)[[:space:]]*=/ {
+      key = clean
+      sub(/^[[:space:]]*/, "", key)
+      sub(/[[:space:]]*=.*$/, "", key)
+      gsub(/^["\047]|["\047]$/, "", key)
+      lkey = tolower(key)
+      if (lkey == "experimental_bearer_token" || lkey == "api_key") {
+        next
+      }
+      if (index(skip_csv, "," lkey ",") > 0) {
+        next
+      }
+      print $0
+    }
+  ' "${cfg_file}" || true
+}
+
+# Check if a top-level TOML key (before the first [section]) exists in cfg_file.
+toml_has_top_key() {
+  local cfg_file="$1"
+  local want_key="$2"
+  [ -f "${cfg_file}" ] && [ ! -L "${cfg_file}" ] || return 1
+  awk -v want="${want_key}" '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    {
+      sub(/\r$/, "", $0)
+      clean = strip_comment($0)
+    }
+    clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ { exit(found ? 0 : 1) }
+    clean ~ /^[[:space:]]*(["\047]?[A-Za-z0-9_-]+["\047]?)[[:space:]]*=/ {
+      key = clean
+      sub(/^[[:space:]]*/, "", key)
+      sub(/[[:space:]]*=.*$/, "", key)
+      gsub(/^["\047]|["\047]$/, "", key)
+      if (tolower(key) == tolower(want)) {
+        found = 1
+        exit 0
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "${cfg_file}" 2>/dev/null
+}
+
+# Check if a TOML section `[sec]` (or optionally `[sec.*]` when match_prefix=1) exists.
+toml_has_section() {
+  local cfg_file="$1"
+  local want_sec="$2"
+  local match_prefix="${3:-0}"
+  [ -f "${cfg_file}" ] && [ ! -L "${cfg_file}" ] || return 1
+  awk -v want="${want_sec}" -v mp="${match_prefix}" '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    {
+      sub(/\r$/, "", $0)
+      clean = strip_comment($0)
+    }
+    clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ {
+      sec = clean
+      sub(/^[[:space:]]*\[/, "", sec)
+      sub(/\][[:space:]]*$/, "", sec)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", sec)
+      lsec = tolower(sec)
+      lwant = tolower(want)
+      if (lsec == lwant || (mp == 1 && index(lsec, lwant ".") == 1)) {
+        found = 1
+        exit 0
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "${cfg_file}" 2>/dev/null
+}
+
+# Extract an unquoted top-level scalar string value from rendered TOML text.
+toml_get_top_key_from_text() {
+  local text="$1"
+  local want_key="$2"
+  printf '%s\n' "${text}" | awk -v want="${want_key}" '
+    function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
+      in_dq = 0; in_sq = 0; esc = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        if (in_dq) {
+          out = out c
+          if (c == "\\") esc = 1
+          else if (c == "\"") in_dq = 0
+        } else if (in_sq) {
+          out = out c
+          if (c == "\047") in_sq = 0
+        } else {
+          if (c == "#") break
+          if (c == "\"") in_dq = 1
+          else if (c == "\047") in_sq = 1
+          out = out c
+        }
+      }
+      return out
+    }
+    {
+      sub(/\r$/, "", $0)
+      clean = strip_comment($0)
+    }
+    clean ~ /^[[:space:]]*\[.*\][[:space:]]*$/ { exit }
+    clean ~ /^[[:space:]]*(["\047]?[A-Za-z0-9_-]+["\047]?)[[:space:]]*=/ {
+      key = clean
+      sub(/^[[:space:]]*/, "", key)
+      sub(/[[:space:]]*=.*$/, "", key)
+      gsub(/^["\047]|["\047]$/, "", key)
+      if (tolower(key) == tolower(want)) {
+        val = clean
+        sub(/^[^=]*=/, "", val)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+        gsub(/^["\047]|["\047]$/, "", val)
+        print val
+        exit
+      }
+    }
+  ' 2>/dev/null || true
+}
+
 # Preserve custom user sections (e.g. [mcp_servers.*], [tui], [plugins.*],
 # pre-existing [projects.*]) while refreshing only Dual-Lane managed sections.
 extract_preserved_user_sections() {
   local cfg_file="$1"
   local use_gw="$2"
   local gw_prov_lc="$3"
-  local preserve_sandbox="${4:-0}"
-  awk -v use_gw="${use_gw}" -v gw_prov_lc="${gw_prov_lc}" -v preserve_sandbox="${preserve_sandbox}" '
+  local preserve_sw="${4:-0}"
+  local preserve_ap_table="${5:-0}"
+  awk -v use_gw="${use_gw}" -v gw_prov_lc="${gw_prov_lc}" -v preserve_sw="${preserve_sw}" -v preserve_ap_table="${preserve_ap_table}" '
     function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
       in_dq = 0; in_sq = 0; esc = 0; out = ""
       for (i = 1; i <= length(s); i++) {
@@ -1094,7 +1372,9 @@ extract_preserved_user_sections() {
       nsec = norm_sec(sec)
       if (nsec == "windows" || nsec == "features" || nsec == "memories" || nsec == "shell_environment_policy" || nsec == "shell_environment_policy.set") {
         keep = 0
-      } else if (preserve_sandbox == 0 && nsec == "sandbox_workspace_write") {
+      } else if (preserve_sw == 0 && nsec == "sandbox_workspace_write") {
+        keep = 0
+      } else if (preserve_ap_table == 0 && (nsec == "approval_policy" || index(nsec, "approval_policy.") == 1)) {
         keep = 0
       } else if (use_gw == 1 && nsec == ("model_providers." gw_prov_lc)) {
         keep = 0
@@ -1469,6 +1749,48 @@ extract_harvested_lane1_projects() {
 CFG2="${LANE2_HOME}/config.toml"
 PRESERVED_TOP_KEYS=""
 PRESERVED_USER_SECTIONS=""
+PRESERVED_FEATURES_KEYS=""
+PRESERVED_MEMORIES_KEYS=""
+
+L2_MANAGED_FEAT_KEYS=",memories,"
+[ "${HAS_DAEMON_FLAG}" -eq 1 ] && L2_MANAGED_FEAT_KEYS="${L2_MANAGED_FEAT_KEYS}daemon_auto_start,"
+[ "${HAS_GOALS_FLAG}" -eq 1 ] && L2_MANAGED_FEAT_KEYS="${L2_MANAGED_FEAT_KEYS}goals,"
+[ "${HAS_API_DISCOVERY_FLAG}" -eq 1 ] && L2_MANAGED_FEAT_KEYS="${L2_MANAGED_FEAT_KEYS}api_key_model_discovery,"
+[ "${HAS_IMAGE_GEN_FLAG}" -eq 1 ] && L2_MANAGED_FEAT_KEYS="${L2_MANAGED_FEAT_KEYS}image_generation,"
+
+PRESERVE_TOP_SANDBOX=0
+PRESERVE_SW_SECTION=0
+PRESERVE_AP_TABLE=0
+RENDER_SANDBOX_MODE="workspace-write"
+RENDER_APPROVAL_POLICY="${APPROVAL_POLICY}"
+EMIT_SW_SECTION=1
+
+if [ "${CLI_MODE}" = "full-access" ]; then
+  RENDER_SANDBOX_MODE="danger-full-access"
+  RENDER_APPROVAL_POLICY="never"
+elif [ "${CLI_MODE}" = "config" ]; then
+  PRESERVE_TOP_SANDBOX=1
+  PRESERVE_AP_TABLE=1
+  if [ -f "${CFG2}" ] && [ ! -L "${CFG2}" ]; then
+    if toml_has_top_key "${CFG2}" "sandbox_mode"; then
+      RENDER_SANDBOX_MODE=""
+    else
+      RENDER_SANDBOX_MODE="workspace-write"
+    fi
+    if toml_has_top_key "${CFG2}" "approval_policy" || toml_has_section "${CFG2}" "approval_policy" 1; then
+      RENDER_APPROVAL_POLICY=""
+    else
+      RENDER_APPROVAL_POLICY="on-request"
+    fi
+    if [ "${ALLOW_SANDBOX_NETWORK_EXPLICIT}" -eq 0 ] && toml_has_section "${CFG2}" "sandbox_workspace_write" 0; then
+      PRESERVE_SW_SECTION=1
+      EMIT_SW_SECTION=0
+    fi
+  else
+    RENDER_SANDBOX_MODE="workspace-write"
+    RENDER_APPROVAL_POLICY="on-request"
+  fi
+fi
 
 if [ -L "${CFG2}" ]; then
   echo "[FAIL] Security refusal: '${CFG2}' is a symlink; refusing to overwrite." >&2
@@ -1498,8 +1820,10 @@ if [ -f "${CFG2}" ]; then
   MANIFEST_ROWS+=("$(printf '1\t%s\t%s\t%s\t%s' "${CFG2_ORIG_HASH}" "${CFG2}" "${CFG2_BKP}" "${CFG2_ORIG_MODE}")")
   flush_rollback_manifest
 
-  PRESERVED_TOP_KEYS="$(extract_preserved_top_keys "${CFG2}" "${GATEWAY_ON_LANE2}" "${HAS_GW_MODEL}")"
-  PRESERVED_USER_SECTIONS="$(extract_preserved_user_sections "${CFG2}" "${GATEWAY_ON_LANE2}" "${GW_PROV_LOWER}")"
+  PRESERVED_TOP_KEYS="$(extract_preserved_top_keys "${CFG2}" "${GATEWAY_ON_LANE2}" "${HAS_GW_MODEL}" "${PRESERVE_TOP_SANDBOX}")"
+  PRESERVED_USER_SECTIONS="$(extract_preserved_user_sections "${CFG2}" "${GATEWAY_ON_LANE2}" "${GW_PROV_LOWER}" "${PRESERVE_SW_SECTION}" "${PRESERVE_AP_TABLE}")"
+  PRESERVED_FEATURES_KEYS="$(extract_preserved_table_keys "${CFG2}" "features" "${L2_MANAGED_FEAT_KEYS}")"
+  PRESERVED_MEMORIES_KEYS="$(extract_preserved_table_keys "${CFG2}" "memories" ",generate_memories,use_memories,")"
 else
   MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${CFG2}")")
   flush_rollback_manifest
@@ -1517,8 +1841,12 @@ render_lane2_config() {
     printf 'web_search = "live"\n'
     printf 'disable_response_storage = true\n'
   fi
-  printf 'sandbox_mode = "workspace-write"\n'
-  printf 'approval_policy = "%s"\n' "${APPROVAL_POLICY}"
+  if [ -n "${RENDER_SANDBOX_MODE}" ]; then
+    printf 'sandbox_mode = "%s"\n' "${RENDER_SANDBOX_MODE}"
+  fi
+  if [ -n "${RENDER_APPROVAL_POLICY}" ]; then
+    printf 'approval_policy = "%s"\n' "${RENDER_APPROVAL_POLICY}"
+  fi
   if [ -n "${PRESERVED_TOP_KEYS}" ]; then
     printf '%s\n' "${PRESERVED_TOP_KEYS}"
   fi
@@ -1549,17 +1877,23 @@ render_lane2_config() {
   printf '[features]\n'
   [ "${HAS_DAEMON_FLAG}" -eq 1 ] && printf 'daemon_auto_start = false\n'
   printf 'memories = true\n'
-  printf 'js_repl = false\n'
-  if [ "${GATEWAY_ON_LANE2}" -eq 1 ]; then
-    [ "${HAS_API_DISCOVERY_FLAG}" -eq 1 ] && printf 'api_key_model_discovery = true\n'
-    [ "${HAS_IMAGE_GEN_FLAG}" -eq 1 ] && printf 'image_generation = true\n'
-  fi
+  [ "${HAS_API_DISCOVERY_FLAG}" -eq 1 ] && printf 'api_key_model_discovery = true\n'
+  [ "${HAS_IMAGE_GEN_FLAG}" -eq 1 ] && printf 'image_generation = true\n'
   [ "${HAS_GOALS_FLAG}" -eq 1 ] && printf 'goals = true\n'
+  if [ -n "${PRESERVED_FEATURES_KEYS}" ]; then
+    printf '%s\n' "${PRESERVED_FEATURES_KEYS}"
+  fi
   printf '\n[memories]\n'
   printf 'generate_memories = true\n'
-  printf 'use_memories = true\n\n'
-  printf '[sandbox_workspace_write]\n'
-  printf 'network_access = %s\n\n' "${SANDBOX_NETWORK}"
+  printf 'use_memories = true\n'
+  if [ -n "${PRESERVED_MEMORIES_KEYS}" ]; then
+    printf '%s\n' "${PRESERVED_MEMORIES_KEYS}"
+  fi
+  printf '\n'
+  if [ "${EMIT_SW_SECTION}" -eq 1 ]; then
+    printf '[sandbox_workspace_write]\n'
+    printf 'network_access = %s\n\n' "${SANDBOX_NETWORK}"
+  fi
   printf '[shell_environment_policy]\n'
   printf 'exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]\n\n'
   printf '[shell_environment_policy.set]\n'
@@ -1579,11 +1913,24 @@ if [ "${GATEWAY_ON_LANE2}" -eq 1 ]; then
   fi
 fi
 
+EFFECTIVE_SANDBOX_MODE="$(toml_get_top_key_from_text "${CFG2_RENDERED}" "sandbox_mode")"
+[ -z "${EFFECTIVE_SANDBOX_MODE}" ] && EFFECTIVE_SANDBOX_MODE="custom/unset"
+EFFECTIVE_APPROVAL_POLICY="$(toml_get_top_key_from_text "${CFG2_RENDERED}" "approval_policy")"
+if [ -z "${EFFECTIVE_APPROVAL_POLICY}" ]; then
+  if printf '%s\n' "${CFG2_RENDERED}" | grep -Eqi '^[[:space:]]*\[approval_policy(\]|\.)'; then
+    EFFECTIVE_APPROVAL_POLICY="granular"
+  else
+    EFFECTIVE_APPROVAL_POLICY="custom/unset"
+  fi
+elif [ "${EFFECTIVE_APPROVAL_POLICY#\{}" != "${EFFECTIVE_APPROVAL_POLICY}" ]; then
+  EFFECTIVE_APPROVAL_POLICY="granular"
+fi
+
 if [ "${DRY_RUN}" -eq 0 ]; then
   atomic_write_from_stdin "${CFG2}" 600 < <(printf '%s\n' "${CFG2_RENDERED}")
-  echo "    Wrote: ${CFG2} (approval_policy=${APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK}, gateway=${GATEWAY_ON_LANE2})"
+  echo "    Wrote: ${CFG2} (cli_mode=${CLI_MODE}, sandbox_mode=${EFFECTIVE_SANDBOX_MODE}, approval_policy=${EFFECTIVE_APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK}, gateway=${GATEWAY_ON_LANE2})"
 else
-  echo "    [DRY-RUN] Would write: ${CFG2} (approval_policy=${APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK}, gateway=${GATEWAY_ON_LANE2})"
+  echo "    [DRY-RUN] Would write: ${CFG2} (cli_mode=${CLI_MODE}, sandbox_mode=${EFFECTIVE_SANDBOX_MODE}, approval_policy=${EFFECTIVE_APPROVAL_POLICY}, network_access=${SANDBOX_NETWORK}, gateway=${GATEWAY_ON_LANE2})"
 fi
 
 # Optional: Also configure gateway / API key in Lane 1 when --gateway-target-lane is 'lane1' or 'both'.
@@ -1635,8 +1982,12 @@ if [ "${GATEWAY_ON_LANE1}" -eq 1 ]; then
     flush_rollback_manifest
 
     CFG1_TOP_KEYS="$(extract_preserved_top_keys "${CFG1}" 1 "${HAS_GW_MODEL}" 1)"
-    CFG1_USER_SECTIONS="$(extract_preserved_user_sections "${CFG1}" 1 "${GW_PROV_LOWER}" 1)"
+    CFG1_USER_SECTIONS="$(extract_preserved_user_sections "${CFG1}" 1 "${GW_PROV_LOWER}" 1 1)"
+    CFG1_FEATURES_KEYS="$(extract_preserved_table_keys "${CFG1}" "features" "${L2_MANAGED_FEAT_KEYS}")"
+    CFG1_MEMORIES_KEYS="$(extract_preserved_table_keys "${CFG1}" "memories" ",generate_memories,use_memories,")"
   else
+    CFG1_FEATURES_KEYS=""
+    CFG1_MEMORIES_KEYS=""
     MANIFEST_ROWS+=("$(printf '0\t-\t%s\t-\t-' "${CFG1}")")
     flush_rollback_manifest
   fi
@@ -1670,14 +2021,19 @@ if [ "${GATEWAY_ON_LANE1}" -eq 1 ]; then
     printf '[features]\n'
     [ "${HAS_DAEMON_FLAG}" -eq 1 ] && printf 'daemon_auto_start = false\n'
     printf 'memories = true\n'
-    printf 'js_repl = false\n'
     [ "${HAS_API_DISCOVERY_FLAG}" -eq 1 ] && printf 'api_key_model_discovery = true\n'
     [ "${HAS_IMAGE_GEN_FLAG}" -eq 1 ] && printf 'image_generation = true\n'
     [ "${HAS_GOALS_FLAG}" -eq 1 ] && printf 'goals = true\n'
+    if [ -n "${CFG1_FEATURES_KEYS}" ]; then
+      printf '%s\n' "${CFG1_FEATURES_KEYS}"
+    fi
     printf '\n[memories]\n'
     printf 'generate_memories = true\n'
-    printf 'use_memories = true\n\n'
-    printf '[shell_environment_policy]\n'
+    printf 'use_memories = true\n'
+    if [ -n "${CFG1_MEMORIES_KEYS}" ]; then
+      printf '%s\n' "${CFG1_MEMORIES_KEYS}"
+    fi
+    printf '\n[shell_environment_policy]\n'
     printf 'exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]\n\n'
     printf '[shell_environment_policy.set]\n'
     printf 'CODEX_ACTIVE_LANE = "LANE_1"\n'
@@ -1957,7 +2313,10 @@ if [ "${SYNC_SESSIONS}" -eq 1 ]; then
     fi
   done
   if [ -n "${PY_BIN}" ]; then
-    SYNC_ARGS=("${KIT_ROOT}/scripts/sync-sessions.py" --lane1 "${LANE1_HOME}" --lane2 "${LANE2_HOME}" --repo "${EFFECTIVE_LANE2_REPO}" --approval-mode "${APPROVAL_POLICY}")
+    SYNC_ARGS=("${KIT_ROOT}/scripts/sync-sessions.py" --lane1 "${LANE1_HOME}" --lane2 "${LANE2_HOME}" --repo "${EFFECTIVE_LANE2_REPO}")
+    if [ "${EFFECTIVE_APPROVAL_POLICY}" = "on-request" ] || [ "${EFFECTIVE_APPROVAL_POLICY}" = "never" ]; then
+      SYNC_ARGS+=(--approval-mode "${EFFECTIVE_APPROVAL_POLICY}")
+    fi
     [ "${PINNED_ONLY}" -eq 1 ] && SYNC_ARGS+=(--pinned-only)
     [ "${DRY_RUN}" -eq 1 ] && SYNC_ARGS+=(--dry-run)
     "${PY_BIN}" "${SYNC_ARGS[@]}"
