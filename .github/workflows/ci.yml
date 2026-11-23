@@ -1443,6 +1443,49 @@ jobs:
           [ -d "${P10_L2}" ]
           ! grep -Fq '"s2-final-rescue"' "${P10_L1}/session_index.jsonl"
 
+          # Locked source SQLite DB right before remove-sandbox2 MUST abort fail-closed and keep Sandbox 2 intact!
+          P10_LOCK_READY="${TMP_ROOT}/p10-lock-ready.flag"
+          P10_LOCK_STOP="${TMP_ROOT}/p10-lock-stop.flag"
+          rm -f "${P10_LOCK_READY}" "${P10_LOCK_STOP}"
+          "${PY_CMD}" -B - "${P10_L2}/state_5.sqlite" "${P10_LOCK_READY}" "${P10_LOCK_STOP}" <<'PY' &
+          import os, sqlite3, sys, time
+          conn = sqlite3.connect(sys.argv[1], isolation_level=None)
+          conn.execute("BEGIN EXCLUSIVE")
+          with open(sys.argv[2], "w", encoding="utf-8") as f:
+              f.write("locked")
+          deadline = time.time() + 30.0
+          while time.time() < deadline and not os.path.exists(sys.argv[3]):
+              time.sleep(0.05)
+          try:
+              conn.execute("ROLLBACK")
+          except Exception:
+              pass
+          conn.close()
+          PY
+          P10_LOCK_PID=$!
+          for _ in $(seq 1 100); do [ -f "${P10_LOCK_READY}" ] && break; sleep 0.05; done
+          [ -f "${P10_LOCK_READY}" ]
+          if CODEX_SYNC_BUSY_TIMEOUT_SEC=0.1 ./scripts/codex-manager.sh --action remove-sandbox2 --force --non-interactive \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" >/dev/null 2>&1; then
+            touch "${P10_LOCK_STOP}"
+            wait "${P10_LOCK_PID}" 2>/dev/null || true
+            echo "[FAIL] Section 10g: remove-sandbox2 succeeded despite LOCKED source SQLite DB!" >&2; exit 1
+          fi
+          touch "${P10_LOCK_STOP}"
+          wait "${P10_LOCK_PID}" 2>/dev/null || true
+          [ -d "${P10_L2}" ] || { echo "[FAIL] Section 10g: Sandbox 2 was deleted despite LOCKED source SQLite DB!" >&2; exit 1; }
+
+          # Corrupt source SQLite DB right before remove-sandbox2 MUST abort fail-closed and keep Sandbox 2 intact!
+          cp "${P10_L2}/state_5.sqlite" "${TMP_ROOT}/p10-state5.valid.bak"
+          printf 'CORRUPT_UNIX_SANDBOX2_DB_BYTES%.0s' {1..20} > "${P10_L2}/state_5.sqlite"
+          if ./scripts/codex-manager.sh --action remove-sandbox2 --force --non-interactive \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" >/dev/null 2>&1; then
+            mv "${TMP_ROOT}/p10-state5.valid.bak" "${P10_L2}/state_5.sqlite"
+            echo "[FAIL] Section 10g: remove-sandbox2 succeeded despite CORRUPT source SQLite DB!" >&2; exit 1
+          fi
+          mv "${TMP_ROOT}/p10-state5.valid.bak" "${P10_L2}/state_5.sqlite"
+          [ -d "${P10_L2}" ] || { echo "[FAIL] Section 10g: Sandbox 2 was deleted despite CORRUPT source SQLite DB!" >&2; exit 1; }
+
           # Real history-preserving uninstall
           ./scripts/codex-manager.sh --action remove-sandbox2 --force --non-interactive \
             --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}"

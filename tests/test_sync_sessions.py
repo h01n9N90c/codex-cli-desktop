@@ -1591,5 +1591,266 @@ class TestSyncSessionsSafetyAndUpsert(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("--max-backups", err_buf.getvalue())
 
+    def test_sync_status_classification_success_partial_failed_skipped(self) -> None:
+        """
+        WHAT: Verifies explicit sync outcome statuses (`SUCCESS`, `PARTIAL`, `FAILED`,
+              `SKIPPED`) across CLI `--json` output, plain-text summary, and exit codes:
+              - Both empty homes -> `SKIPPED` (exit 0)
+              - Valid state + index + goals -> `SUCCESS` with `reconcile=OK` (exit 0)
+              - Valid state + corrupt goals -> `PARTIAL` (exit 1)
+              - Corrupt state DB with no other synced DB -> `FAILED` (exit 1)
+        PREVENTS: Silent zero-exit failures where callers cannot distinguish a clean
+                  skip from a partial or failed SQLite sync.
+        """
+        # 1) SKIPPED: two empty directories with no DBs or index.
+        empty_a = os.path.join(self.tmp.name, "empty_status_a")
+        empty_b = os.path.join(self.tmp.name, "empty_status_b")
+        os.makedirs(empty_a, exist_ok=True)
+        os.makedirs(empty_b, exist_ok=True)
+        out_skip = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["sync-sessions.py", "--source", empty_a, "--target", empty_b, "--json"],
+            ),
+            contextlib.redirect_stdout(out_skip),
+        ):
+            rc_skip = sync_mod.main()
+        self.assertEqual(rc_skip, 0)
+        skip_payload = json.loads(out_skip.getvalue())
+        self.assertEqual(skip_payload["status"], sync_mod.SYNC_STATUS_SKIPPED)
+        self.assertEqual(skip_payload["forward"]["state_status"], sync_mod.SYNC_STATUS_SKIPPED)
+
+        # 2) SUCCESS: valid state + index + goals with verified reconciliation.
+        Path(self.lane1, "session_index.jsonl").write_text(
+            json.dumps({"id": "t-pinned-1", "thread_name": "Pinned Core Task"}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        g1 = os.path.join(self.lane1, "goals_1.sqlite")
+        g2 = os.path.join(self.lane2, "goals_1.sqlite")
+        for gpath, rows in (
+            (g1, [("g-1", "t-pinned-1", "Goal 1")]),
+            (g2, []),
+        ):
+            cg = sqlite3.connect(gpath)
+            cg.execute("CREATE TABLE thread_goals (id TEXT PRIMARY KEY, thread_id TEXT, title TEXT)")
+            cg.executemany("INSERT INTO thread_goals VALUES (?, ?, ?)", rows)
+            cg.commit()
+            cg.close()
+
+        out_ok = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["sync-sessions.py", "--source", self.lane1, "--target", self.lane2, "--json"],
+            ),
+            contextlib.redirect_stdout(out_ok),
+        ):
+            rc_ok = sync_mod.main()
+        self.assertEqual(rc_ok, 0)
+        ok_payload = json.loads(out_ok.getvalue())
+        self.assertEqual(ok_payload["status"], sync_mod.SYNC_STATUS_SUCCESS)
+        self.assertEqual(ok_payload["forward"]["state_status"], sync_mod.SYNC_STATUS_SUCCESS)
+        self.assertEqual(ok_payload["forward"]["index_status"], sync_mod.SYNC_STATUS_SUCCESS)
+        self.assertEqual(ok_payload["forward"]["goals_status"], sync_mod.SYNC_STATUS_SUCCESS)
+        self.assertTrue(ok_payload["forward"]["reconciliation"]["verified"])
+
+        # 3) PARTIAL: valid state DB + corrupt goals DB -> status=PARTIAL and exit 1.
+        Path(g1).write_bytes(b"CORRUPT_GOALS_HEADER_PARTIAL" * 12)
+        out_partial = io.StringIO()
+        err_partial = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["sync-sessions.py", "--source", self.lane1, "--target", self.lane2],
+            ),
+            contextlib.redirect_stdout(out_partial),
+            contextlib.redirect_stderr(err_partial),
+        ):
+            rc_partial = sync_mod.main()
+        self.assertEqual(rc_partial, 1)
+        self.assertIn("[PARTIAL]", out_partial.getvalue())
+        self.assertIn("status=PARTIAL", out_partial.getvalue())
+        self.assertIn("goals=0(FAILED)", out_partial.getvalue())
+
+        # 4) FAILED: corrupt state DB with no session_index and no goals -> status=FAILED and exit 1.
+        fail_src = os.path.join(self.tmp.name, "fail_src")
+        fail_dst = os.path.join(self.tmp.name, "fail_dst")
+        os.makedirs(fail_src, exist_ok=True)
+        os.makedirs(fail_dst, exist_ok=True)
+        Path(fail_src, "state_5.sqlite").write_bytes(b"BROKEN_STATE_DB_BYTES" * 16)
+        c_fd = sqlite3.connect(os.path.join(fail_dst, "state_5.sqlite"))
+        c_fd.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT)")
+        c_fd.commit()
+        c_fd.close()
+
+        out_fail = io.StringIO()
+        err_fail = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["sync-sessions.py", "--source", fail_src, "--target", fail_dst],
+            ),
+            contextlib.redirect_stdout(out_fail),
+            contextlib.redirect_stderr(err_fail),
+        ):
+            rc_fail = sync_mod.main()
+        self.assertEqual(rc_fail, 1)
+        self.assertIn("[FAIL]", out_fail.getvalue())
+        self.assertIn("status=FAILED", out_fail.getvalue())
+
+    def test_before_after_reconciliation_verifies_counts_ids_pinned_goals_and_detects_mismatch(self) -> None:
+        """
+        WHAT: Verifies before/after reconciliation accurately checks record counts,
+              thread IDs, Pinned threads, and Goals, AND downgrades status to `PARTIAL`
+              (exit 1) if post-sync verification finds a missing thread ID, lost pin,
+              or missing Goal.
+        PREVENTS: Silent partial commits or dropped Pinned/Goal records going unnoticed
+                  after a sync run.
+        """
+        # Seed target with 1 pre-existing pinned thread + 1 goal.
+        c2 = sqlite3.connect(self.st2)
+        c2.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("t-pre-dst", "Target Pinned", 1, None, None, None, None, "openai", "on-request", "C:\\x", 10, 1),
+        )
+        c2.commit()
+        c2.close()
+
+        g1 = os.path.join(self.lane1, "goals_1.sqlite")
+        g2 = os.path.join(self.lane2, "goals_1.sqlite")
+        for gpath, rows in (
+            (g1, [("g-src-1", "t-pinned-1", "Src Goal 1"), ("g-src-2", "t-unpinned-2", "Src Goal 2")]),
+            (g2, [("g-dst-1", "t-pre-dst", "Dst Goal 1")]),
+        ):
+            cg = sqlite3.connect(gpath)
+            cg.execute("CREATE TABLE thread_goals (id TEXT PRIMARY KEY, thread_id TEXT, title TEXT)")
+            cg.executemany("INSERT INTO thread_goals VALUES (?, ?, ?)", rows)
+            cg.commit()
+            cg.close()
+
+        state_res = sync_mod.sync_state_db_detailed(
+            self.lane1, self.lane2, None, None, False, False
+        )
+        self.assertEqual(state_res["status"], sync_mod.SYNC_STATUS_SUCCESS)
+        self.assertEqual(state_res["before"]["target_threads"], 1)
+        self.assertEqual(state_res["before"]["target_pinned"], 1)
+        self.assertEqual(state_res["after"]["target_threads"], 3)
+        self.assertEqual(state_res["after"]["target_pinned"], 2)
+        self.assertTrue(state_res["reconciliation"]["verified"])
+        self.assertEqual(state_res["reconciliation"]["missing_ids_count"], 0)
+        self.assertEqual(state_res["reconciliation"]["missing_pinned_count"], 0)
+
+        goals_res = sync_mod.sync_goals_db_detailed(self.lane1, self.lane2, dry_run=False)
+        self.assertEqual(goals_res["status"], sync_mod.SYNC_STATUS_SUCCESS)
+        self.assertEqual(goals_res["before"]["target_goals"], 1)
+        self.assertEqual(goals_res["after"]["target_goals"], 3)
+        self.assertTrue(goals_res["reconciliation"]["verified"])
+        self.assertEqual(goals_res["reconciliation"]["missing_goals_count"], 0)
+
+        # Simulate a post-sync verification mismatch (dropped thread ID + dropped pin) -> MUST downgrade to PARTIAL!
+        real_snapshot = sync_mod._snapshot_state_threads
+        call_count = {"n": 0}
+
+        def _tampered_after_snapshot(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
+            call_count["n"] += 1
+            ids, pinned = real_snapshot(conn)
+            if call_count["n"] >= 2:
+                return (ids - {"t-unpinned-2"}, pinned - {"t-pinned-1"})
+            return (ids, pinned)
+
+        err_buf = io.StringIO()
+        with (
+            mock.patch.object(sync_mod, "_snapshot_state_threads", side_effect=_tampered_after_snapshot),
+            contextlib.redirect_stderr(err_buf),
+        ):
+            mismatch_res = sync_mod.sync_state_db_detailed(
+                self.lane1, self.lane2, None, None, False, False
+            )
+        self.assertEqual(mismatch_res["status"], sync_mod.SYNC_STATUS_PARTIAL)
+        self.assertFalse(mismatch_res["reconciliation"]["verified"])
+        self.assertEqual(mismatch_res["reconciliation"]["missing_ids_count"], 1)
+        self.assertEqual(mismatch_res["reconciliation"]["missing_pinned_count"], 1)
+
+    def test_strict_rescue_fails_closed_on_locked_or_corrupt_source_db(self) -> None:
+        """
+        WHAT: Verifies `--rescue-shared-files --strict` (used by RemoveSandbox2) fails
+              closed with exit code 1 and `status=FAILED` when the source SQLite DB
+              exists but is exclusively locked OR corrupt, even when target has no DB yet.
+        PREVENTS: RemoveSandbox2 deleting Sandbox 2 while its SQLite chat history is
+                  locked by another process or unreadable/corrupt.
+        """
+        # 1) Exclusively locked source DB -> MUST fail closed (exit 1, status=FAILED).
+        locker = sqlite3.connect(self.st1, isolation_level=None)
+        try:
+            locker.execute("BEGIN EXCLUSIVE")
+            out_lock = io.StringIO()
+            err_lock = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "sync-sessions.py",
+                        "--source",
+                        self.lane1,
+                        "--target",
+                        self.lane2,
+                        "--rescue-shared-files",
+                        "--strict",
+                        "--busy-timeout",
+                        "0.05",
+                    ],
+                ),
+                contextlib.redirect_stdout(out_lock),
+                contextlib.redirect_stderr(err_lock),
+            ):
+                rc_lock = sync_mod.main()
+            self.assertEqual(rc_lock, 1)
+            self.assertIn("state_db=N/A(FAILED:", out_lock.getvalue())
+            self.assertRegex(out_lock.getvalue(), r"status=(FAILED|PARTIAL)")
+        finally:
+            locker.execute("ROLLBACK")
+            locker.close()
+
+        # 2) Corrupt source DB when target has NO state DB yet -> MUST fail closed (exit 1, status=FAILED/PARTIAL).
+        empty_target = os.path.join(self.tmp.name, "empty_rescue_target")
+        os.makedirs(empty_target, exist_ok=True)
+        Path(self.st1).write_bytes(b"CORRUPT_SOURCE_BEFORE_UNINSTALL" * 16)
+        # Remove source session_index.jsonl so state_db is the only active component -> overall status=FAILED.
+        src_idx = Path(self.lane1, "session_index.jsonl")
+        if src_idx.exists():
+            src_idx.unlink()
+        out_corrupt = io.StringIO()
+        err_corrupt = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "sync-sessions.py",
+                    "--source",
+                    self.lane1,
+                    "--target",
+                    empty_target,
+                    "--rescue-shared-files",
+                    "--strict",
+                ],
+            ),
+            contextlib.redirect_stdout(out_corrupt),
+            contextlib.redirect_stderr(err_corrupt),
+        ):
+            rc_corrupt = sync_mod.main()
+        self.assertEqual(rc_corrupt, 1)
+        self.assertIn("status=FAILED", out_corrupt.getvalue())
+        self.assertIn("state_db=N/A(FAILED:", out_corrupt.getvalue())
+        self.assertEqual(os.listdir(empty_target), [])
+
+
 if __name__ == "__main__":
     unittest.main()

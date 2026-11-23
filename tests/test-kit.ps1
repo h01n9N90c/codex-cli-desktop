@@ -2567,12 +2567,72 @@ env_key = "CODEX_P13_PROBE_KEY"
         )
         Assert-True ($res13fNoForce.ExitCode -ne 0 -and (Test-Path -LiteralPath $p13L2 -PathType Container)) 'RemoveSandbox2 -NonInteractive without -Force MUST fail closed!'
 
+        # RemoveSandbox2 with LOCKED source SQLite DB right before uninstall MUST abort and NOT delete Sandbox 2!
+        $p13L2StateDb = Join-Path $p13L2 'state_5.sqlite'
+        $p13LockReady = Join-Path $tmpRoot 'p13-lock-ready.flag'
+        $p13LockStop  = Join-Path $tmpRoot 'p13-lock-stop.flag'
+        foreach ($lf in @($p13LockReady, $p13LockStop)) { if (Test-Path -LiteralPath $lf) { Remove-Item -LiteralPath $lf -Force } }
+        $p13LockerScript = Join-Path $tmpRoot 'p13-db-locker.py'
+        $p13LockerCode = @(
+            'import os, sqlite3, sys, time',
+            'db_path, ready_flag, stop_flag = sys.argv[1], sys.argv[2], sys.argv[3]',
+            'conn = sqlite3.connect(db_path, isolation_level=None)',
+            'conn.execute("BEGIN EXCLUSIVE")',
+            'with open(ready_flag, "w", encoding="utf-8") as f: f.write("locked")',
+            'deadline = time.time() + 30.0',
+            'while time.time() < deadline and not os.path.exists(stop_flag): time.sleep(0.05)',
+            'try: conn.execute("ROLLBACK")',
+            'except Exception: pass',
+            'conn.close()'
+        ) -join "`n"
+        [System.IO.File]::WriteAllText($p13LockerScript, $p13LockerCode + "`n", (New-Object System.Text.UTF8Encoding($false)))
+        $p13LockerProc = Start-Process -FilePath $py -ArgumentList @('-B', "`"$p13LockerScript`"", "`"$p13L2StateDb`"", "`"$p13LockReady`"", "`"$p13LockStop`"") -PassThru -WindowStyle Hidden
+        $prevSyncTimeout = $env:CODEX_SYNC_BUSY_TIMEOUT_SEC
+        try {
+            $waitDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $p13LockReady) -and [DateTime]::UtcNow -lt $waitDeadline) {
+                Start-Sleep -Milliseconds 50
+            }
+            Assert-True (Test-Path -LiteralPath $p13LockReady) 'Test 13f background SQLite locker failed to acquire EXCLUSIVE lock!'
+            $env:CODEX_SYNC_BUSY_TIMEOUT_SEC = '0.1'
+            $res13fLocked = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'RemoveSandbox2', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+                '-LocalBin', $p13Bin, '-SkipPathUpdate', '-Force', '-NonInteractive'
+            )
+            Assert-True ($res13fLocked.ExitCode -ne 0) "RemoveSandbox2 MUST fail closed when Lane 2 state_5.sqlite is locked (got exit=$($res13fLocked.ExitCode)):`n$($res13fLocked.Output)"
+            Assert-True ($res13fLocked.Output -match 'status=(FAILED|PARTIAL)') "RemoveSandbox2 locked-DB output missing status=FAILED/PARTIAL:`n$($res13fLocked.Output)"
+            Assert-True (Test-Path -LiteralPath $p13L2 -PathType Container) 'CRITICAL: Sandbox 2 was deleted despite locked source SQLite DB!'
+        } finally {
+            if ($null -eq $prevSyncTimeout) { Remove-Item Env:CODEX_SYNC_BUSY_TIMEOUT_SEC -ErrorAction SilentlyContinue } else { $env:CODEX_SYNC_BUSY_TIMEOUT_SEC = $prevSyncTimeout }
+            [System.IO.File]::WriteAllText($p13LockStop, 'stop', (New-Object System.Text.UTF8Encoding($false)))
+            if ($null -ne $p13LockerProc) {
+                try { $null = $p13LockerProc.WaitForExit(5000) } catch {}
+                if (-not $p13LockerProc.HasExited) { try { $p13LockerProc.Kill() } catch {} }
+            }
+        }
+
+        # RemoveSandbox2 with CORRUPT source SQLite DB right before uninstall MUST abort and NOT delete Sandbox 2!
+        $p13ValidStateBytes = [System.IO.File]::ReadAllBytes($p13L2StateDb)
+        try {
+            [System.IO.File]::WriteAllBytes($p13L2StateDb, [System.Text.Encoding]::ASCII.GetBytes(('CORRUPT_SANDBOX2_DB_BEFORE_DELETE_' * 16)))
+            $res13fCorrupt = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'RemoveSandbox2', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+                '-LocalBin', $p13Bin, '-SkipPathUpdate', '-Force', '-NonInteractive'
+            )
+            Assert-True ($res13fCorrupt.ExitCode -ne 0) "RemoveSandbox2 MUST fail closed when Lane 2 state_5.sqlite is corrupt (got exit=$($res13fCorrupt.ExitCode)):`n$($res13fCorrupt.Output)"
+            Assert-True ($res13fCorrupt.Output -match 'status=(FAILED|PARTIAL)') "RemoveSandbox2 corrupt-DB output missing status=FAILED/PARTIAL:`n$($res13fCorrupt.Output)"
+            Assert-True (Test-Path -LiteralPath $p13L2 -PathType Container) 'CRITICAL: Sandbox 2 was deleted despite corrupt source SQLite DB!'
+        } finally {
+            [System.IO.File]::WriteAllBytes($p13L2StateDb, $p13ValidStateBytes)
+        }
+
         # Live RemoveSandbox2 -Force: MUST rescue thread-l2-final + goal-l2-final + rescued-rollout.jsonl into GPT 1 BEFORE removing Sandbox 2!
         $res13fLive = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
             '-Action', 'RemoveSandbox2', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
             '-LocalBin', $p13Bin, '-SkipPathUpdate', '-Force', '-NonInteractive'
         )
         Assert-True ($res13fLive.ExitCode -eq 0) "Test 13f RemoveSandbox2 live failed (exit=$($res13fLive.ExitCode)):`n$($res13fLive.Output)"
+        Assert-True ($res13fLive.Output -match 'status=SUCCESS' -and $res13fLive.Output -match 'reconcile=OK') "RemoveSandbox2 live output missing status=SUCCESS and reconcile=OK:`n$($res13fLive.Output)"
         Assert-True (-not (Test-Path -LiteralPath $p13L2)) 'RemoveSandbox2 did not remove Sandbox 2 directory!'
         foreach ($rmWrap in @('codex.cmd', 'codex-official.cmd', 'codex-t3.cmd', 'codex-manage.cmd', 'codex', 'codex-official', 'codex-t3', 'codex-manage')) {
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $p13Bin $rmWrap))) "RemoveSandbox2 left behind wrapper '$rmWrap'!"

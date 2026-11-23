@@ -1740,6 +1740,7 @@ function Invoke-HistorySync {
         [Parameter(Mandatory = $true)][string]$TargetHome,
         [switch]$Bidirectional,
         [switch]$RescueSharedFiles,
+        [switch]$Strict,
         [switch]$FailClosed
     )
     $syncScript = Join-Path $script:KitRoot 'scripts\sync-sessions.py'
@@ -1765,6 +1766,7 @@ function Invoke-HistorySync {
     $pyArgs = @('-B', $syncScript, '--source', $SourceHome, '--target', $TargetHome, '--backup-target')
     if ($Bidirectional)     { $pyArgs += '--bidirectional' }
     if ($RescueSharedFiles) { $pyArgs += '--rescue-shared-files' }
+    if ($Strict)            { $pyArgs += '--strict' }
     if ($script:IsDryRun)   { $pyArgs += '--dry-run' }
 
     $prevPref = $ErrorActionPreference
@@ -1776,18 +1778,22 @@ function Invoke-HistorySync {
         $ErrorActionPreference = $prevPref
         $global:LASTEXITCODE = 0
     }
+    $hasFailedOrPartial = $false
     foreach ($sl in $syncLines) {
         $safeLine = Redact-SecretsFromText -Text ([string]$sl)
+        if ($safeLine -match 'status=(FAILED|PARTIAL)\b' -or $safeLine -match 'reconcile=MISMATCH\b') {
+            $hasFailedOrPartial = $true
+        }
         if (-not [string]::IsNullOrWhiteSpace($safeLine)) {
             Write-Host "    $safeLine" -ForegroundColor Gray
         }
     }
-    if ($syncExit -ne 0) {
+    if ($syncExit -ne 0 -or $hasFailedOrPartial) {
         if ($FailClosed) {
-            Write-FailLine "sync-sessions.py failed with exit code $syncExit."
+            Write-FailLine "sync-sessions.py did not reach verified SUCCESS/SKIPPED (exit=$syncExit, failed_or_partial=$hasFailedOrPartial)."
             return $false
         }
-        Write-WarnLine "sync-sessions.py exited with code $syncExit; re-run SyncHistory when Codex Desktop/CLI is idle."
+        Write-WarnLine "sync-sessions.py exited with code $syncExit (failed_or_partial=$hasFailedOrPartial); re-run SyncHistory when Codex Desktop/CLI is idle."
         return $false
     }
     Write-Ok 'Chat history synchronization completed cleanly.'
@@ -2553,13 +2559,13 @@ function Invoke-ActionRemoveSandbox2 {
             }
         }
         try {
-            $rescueOk = Invoke-HistorySync -SourceHome $Lane2Home -TargetHome $Lane1Home -RescueSharedFiles -FailClosed
+            $rescueOk = Invoke-HistorySync -SourceHome $Lane2Home -TargetHome $Lane1Home -RescueSharedFiles -Strict -FailClosed
         } catch {
             Write-FailLine "Chat history rescue failed ($($_.Exception.Message)). REFUSING to delete Sandbox 2 ('$Lane2Home') to protect your chat history!"
             return 1
         }
         if (-not $rescueOk) {
-            Write-FailLine "Chat history rescue did not succeed. REFUSING to delete Sandbox 2 ('$Lane2Home') to protect your chat history!"
+            Write-FailLine "Chat history rescue did not succeed cleanly (status=FAILED/PARTIAL or source SQLite DB unreadable/locked/corrupt). REFUSING to delete Sandbox 2 ('$Lane2Home') to protect your chat history!"
             return 1
         }
     } else {

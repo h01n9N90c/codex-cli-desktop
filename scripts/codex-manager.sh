@@ -1813,10 +1813,16 @@ EOF
       mkdir -p -- "${LANE1_HOME}"
       chmod 700 "${LANE1_HOME}" 2>/dev/null || true
     fi
-    local rescue_args=("${sync_script}" --source "${LANE2_HOME}" --target "${LANE1_HOME}" --rescue-shared-files --backup-target)
+    local rescue_args=("${sync_script}" --source "${LANE2_HOME}" --target "${LANE1_HOME}" --rescue-shared-files --backup-target --strict)
     [ "${DRY_RUN}" -eq 1 ] && rescue_args+=(--dry-run)
-    if ! "${PY_BIN}" -B "${rescue_args[@]}"; then
-      echo "[FAIL] Chat history rescue failed! Aborting Sandbox 2 removal to protect your chat history." >&2
+    local rescue_out=""
+    local rescue_rc=0
+    rescue_out="$("${PY_BIN}" -B "${rescue_args[@]}" 2>&1)" || rescue_rc=$?
+    if [ -n "${rescue_out}" ]; then
+      printf '%s\n' "${rescue_out}"
+    fi
+    if [ "${rescue_rc}" -ne 0 ] || printf '%s\n' "${rescue_out}" | grep -Eq 'status=(FAILED|PARTIAL)|reconcile=MISMATCH'; then
+      echo "[FAIL] Chat history rescue failed or returned PARTIAL/FAILED (source SQLite DB unreadable/locked/corrupt or reconciliation mismatch). Aborting Sandbox 2 removal to protect your chat history!" >&2
       return 1
     fi
   else

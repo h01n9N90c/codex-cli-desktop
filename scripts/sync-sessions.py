@@ -69,6 +69,20 @@ __license__ = "Apache-2.0"
 DEFAULT_BUSY_TIMEOUT_SEC: float = 15.0
 DEFAULT_BUSY_TIMEOUT_MS: int = int(DEFAULT_BUSY_TIMEOUT_SEC * 1000)
 
+# Explicit sync outcome statuses (replaces raw integer-only reporting).
+SYNC_STATUS_SUCCESS: str = "SUCCESS"
+SYNC_STATUS_PARTIAL: str = "PARTIAL"
+SYNC_STATUS_FAILED: str = "FAILED"
+SYNC_STATUS_SKIPPED: str = "SKIPPED"
+VALID_SYNC_STATUSES: frozenset[str] = frozenset(
+    {
+        SYNC_STATUS_SUCCESS,
+        SYNC_STATUS_PARTIAL,
+        SYNC_STATUS_FAILED,
+        SYNC_STATUS_SKIPPED,
+    }
+)
+
 # Strict allowlist for SQLite identifiers interpolated as table/column names.
 # Prevents second-order SQL injection if a source DB contains crafted column names.
 SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -306,6 +320,21 @@ def _build_sqlite_uri(db_path: str, mode: str) -> str:
     return Path(db_path).resolve(strict=True).as_uri() + f"?mode={mode}"
 
 
+def _effective_busy_timeout(timeout: float | None = None) -> float:
+    """Resolve effective SQLite busy timeout (explicit arg > env override > default)."""
+    if timeout is not None:
+        return max(0.0, float(timeout))
+    env_raw = os.environ.get("CODEX_SYNC_BUSY_TIMEOUT_SEC", "").strip()
+    if env_raw:
+        try:
+            val = float(env_raw)
+            if val >= 0.0:
+                return val
+        except ValueError:
+            pass
+    return DEFAULT_BUSY_TIMEOUT_SEC
+
+
 def connect_readonly(
     db_path: str, timeout: float | None = None
 ) -> sqlite3.Connection:
@@ -320,7 +349,7 @@ def connect_readonly(
     """
     if _is_reparse_or_symlink(db_path):
         raise ValueError(f"Security violation: refusing to open symlink SQLite DB: {db_path!r}")
-    effective_timeout = DEFAULT_BUSY_TIMEOUT_SEC if timeout is None else timeout
+    effective_timeout = _effective_busy_timeout(timeout)
     uri = _build_sqlite_uri(db_path, "ro")
     conn = sqlite3.connect(uri, uri=True, timeout=effective_timeout)
     try:
@@ -345,7 +374,7 @@ def connect_readwrite(
     """
     if _is_reparse_or_symlink(db_path):
         raise ValueError(f"Security violation: refusing to open symlink SQLite DB: {db_path!r}")
-    effective_timeout = DEFAULT_BUSY_TIMEOUT_SEC if timeout is None else timeout
+    effective_timeout = _effective_busy_timeout(timeout)
     uri = _build_sqlite_uri(db_path, "rw")
     conn = sqlite3.connect(uri, uri=True, timeout=effective_timeout, isolation_level=None)
     try:
@@ -490,7 +519,9 @@ def backup_sqlite_db(
                 pass
 
 
-def find_latest_versioned_db(directory: str, prefix: str) -> str | None:
+def find_latest_versioned_db(
+    directory: str, prefix: str, *, strict: bool = False
+) -> str | None:
     """
     Locate the highest-numbered `<prefix>_<N>.sqlite` file directly inside
     `directory` using `os.scandir` (immune to glob brackets in path names).
@@ -498,6 +529,7 @@ def find_latest_versioned_db(directory: str, prefix: str) -> str | None:
     Security invariant:
       Rejects any symlink matching `<prefix>_<N>.sqlite` by raising ValueError
       rather than silently following an attacker-planted link outside `directory`.
+      When `strict=True`, re-raises directory scan `OSError` fail-closed.
     """
     if not DB_PREFIX_RE.fullmatch(prefix):
         raise ValueError(f"Security violation: invalid DB prefix: {prefix!r}")
@@ -518,6 +550,8 @@ def find_latest_versioned_db(directory: str, prefix: str) -> str | None:
                     continue
                 candidates.append((int(match.group(1)), entry.name, entry.path))
     except OSError as exc:
+        if strict:
+            raise
         print(
             f"[WARN] Unable to scan directory for {prefix}_*.sqlite ({type(exc).__name__}).",
             file=sys.stderr,
@@ -920,23 +954,172 @@ def rescue_shared_files(
     return (len(copy_plan), skipped_existing, skipped_links)
 
 
-def sync_session_index(
+def _aggregate_sync_status(statuses: list[str]) -> str:
+    """
+    Aggregate component sync statuses into one overall status:
+      - All SKIPPED -> SKIPPED
+      - All non-SKIPPED are SUCCESS -> SUCCESS
+      - Any PARTIAL, or mix of SUCCESS and FAILED -> PARTIAL
+      - At least one FAILED and zero SUCCESS/PARTIAL -> FAILED
+    """
+    if not statuses:
+        return SYNC_STATUS_SKIPPED
+    non_skipped = [s for s in statuses if s != SYNC_STATUS_SKIPPED]
+    if not non_skipped:
+        return SYNC_STATUS_SKIPPED
+    if all(s == SYNC_STATUS_SUCCESS for s in non_skipped):
+        return SYNC_STATUS_SUCCESS
+    if any(s == SYNC_STATUS_PARTIAL for s in non_skipped):
+        return SYNC_STATUS_PARTIAL
+    if any(s == SYNC_STATUS_SUCCESS for s in non_skipped) and any(
+        s == SYNC_STATUS_FAILED for s in non_skipped
+    ):
+        return SYNC_STATUS_PARTIAL
+    return SYNC_STATUS_FAILED
+
+
+def _snapshot_state_threads(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
+    """
+    Return `(all_thread_ids, pinned_thread_ids)` from an open SQLite connection
+    to `state_*.sqlite` without leaking titles or session contents.
+    """
+    if "threads" not in get_tables(conn):
+        return (set(), set())
+    cols = get_columns(conn, "threads")
+    if "id" not in cols:
+        return (set(), set())
+    inspect_cols = ["id"] + [
+        c for c in ("is_pinned", "pinned", "thread_section_id") if c in cols
+    ]
+    select_sql = ", ".join(quote_identifier(c) for c in inspect_cols)
+    all_ids: set[str] = set()
+    pinned_ids: set[str] = set()
+    for row in conn.execute(f'SELECT {select_sql} FROM "threads"').fetchall():
+        row_map = dict(zip(inspect_cols, row))
+        tid = str(row_map["id"])
+        all_ids.add(tid)
+        is_pinned = (
+            bool(row_map.get("is_pinned"))
+            or bool(row_map.get("pinned"))
+            or (row_map.get("thread_section_id") is not None)
+        )
+        if is_pinned:
+            pinned_ids.add(tid)
+    return (all_ids, pinned_ids)
+
+
+def _snapshot_goals_keys(
+    conn: sqlite3.Connection,
+) -> tuple[int, set[tuple[object, ...]]]:
+    """
+    Return `(row_count, key_set)` for `thread_goals` from an open SQLite
+    connection to `goals_*.sqlite`.
+    """
+    if "thread_goals" not in get_tables(conn):
+        return (0, set())
+    cols_info = get_column_info(conn, "thread_goals")
+    if not cols_info:
+        return (0, set())
+    pk_cols = [
+        col
+        for _, col in sorted(
+            (int(meta["pk_index"]), col)
+            for col, meta in cols_info.items()
+            if int(meta["pk_index"]) > 0
+        )
+    ]
+    key_cols = pk_cols if pk_cols else list(cols_info.keys())
+    select_sql = ", ".join(quote_identifier(c) for c in key_cols)
+    rows = conn.execute(f'SELECT {select_sql} FROM "thread_goals"').fetchall()
+    return (len(rows), {tuple(r) for r in rows})
+
+
+def _snapshot_session_index_ids(
+    path: Path, *, allowed_ids: set[str] | None = None
+) -> set[str]:
+    """Read valid thread IDs from a `session_index.jsonl` file."""
+    ids: set[str] = set()
+    if not path.exists():
+        return ids
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            raw_id = obj.get("id")
+            if not isinstance(raw_id, (str, int)) or isinstance(raw_id, bool):
+                continue
+            tid = str(raw_id).strip()
+            if not tid:
+                continue
+            if allowed_ids is not None and tid not in allowed_ids:
+                continue
+            ids.add(tid)
+    return ids
+
+
+def _bootstrap_target_sqlite_from_source(
+    target_dir: str,
+    src_db_path: str,
+    src_conn: sqlite3.Connection,
+) -> Path:
+    """
+    Atomically clone a verified, readable source SQLite DB into
+    `<target_dir>/<basename(src_db_path)>` via SQLite's online `.backup()` API
+    (staged temp file + 0600 on POSIX + os.replace) when target does not yet
+    have a matching SQLite DB during rescue/strict sync.
+    """
+    os.makedirs(target_dir, mode=0o700, exist_ok=True)
+    dest_path = Path(target_dir) / os.path.basename(src_db_path)
+    validated_dest = ensure_contained_path(target_dir, dest_path, reject_symlinks=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(validated_dest.parent),
+        prefix=f".{validated_dest.name}.bootstrap.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    if os.name == "posix":
+        os.chmod(tmp_path, 0o600)
+    dst_conn: sqlite3.Connection | None = None
+    try:
+        dst_conn = sqlite3.connect(tmp_path)
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            dst_conn = None
+        if os.name == "posix":
+            os.chmod(tmp_path, 0o600)
+        ensure_contained_path(target_dir, validated_dest, reject_symlinks=True)
+        os.replace(tmp_path, validated_dest)
+        tmp_path = None
+        return validated_dest
+    finally:
+        if dst_conn is not None:
+            dst_conn.close()
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def sync_session_index_detailed(
     lane1: str,
     lane2: str,
     dry_run: bool,
     allowed_ids: set[str] | None = None,
-) -> int:
+) -> dict[str, object]:
     """
-    Merge `session_index.jsonl` entries by thread `id` from `lane1` into `lane2`,
-    preserving all existing target entries, preferring newer timestamped entries
-    on conflict, and atomically writing the merged JSONL file (skipped in
-    `--dry-run`).
-
-    Security invariants:
-      - Rejects identical `lane1`/`lane2` directories and rejects symlinks or
-        path traversal on either `session_index.jsonl` (including dangling links).
-      - Skips malformed JSON lines and non-object JSON values safely.
-      - Never prints session titles or JSONL contents to stdout/stderr.
+    Merge `session_index.jsonl` entries by thread `id` from `lane1` into `lane2`
+    and return a structured result with explicit status (`SUCCESS`, `PARTIAL`,
+    `FAILED`, `SKIPPED`) and before/after ID reconciliation.
     """
     lane1, lane2 = _normalize_distinct_lanes(lane1, lane2)
 
@@ -949,13 +1132,24 @@ def sync_session_index(
     idx2 = ensure_contained_path(lane2, idx2_raw, reject_symlinks=True)
 
     if not idx1.exists():
-        return 0
+        return {
+            "status": SYNC_STATUS_SKIPPED,
+            "reason": "missing_source_index",
+            "count": 0,
+            "source_exists": False,
+            "target_exists": idx2.exists(),
+            "before": {"source_count": 0, "target_count": 0},
+            "after": {"target_count": 0},
+            "reconciliation": {"verified": True, "missing_ids_count": 0},
+        }
     if not idx1.is_file():
         raise ValueError("Security violation: source session_index.jsonl is not a regular file.")
     if idx2.exists() and not idx2.is_file():
         raise ValueError("Security violation: target session_index.jsonl is not a regular file.")
 
     by_id: dict[str, tuple[dict[str, object], str]] = {}
+    target_before_ids: set[str] = set()
+    source_eligible_ids: set[str] = set()
     # Preserve existing destination entries first, then conflict-merge source entries.
     for path, is_source in ((idx2, False), (idx1, True)):
         if not path.exists():
@@ -980,6 +1174,10 @@ def sync_session_index(
                         continue
                     if is_source and allowed_ids is not None and tid not in allowed_ids:
                         continue
+                    if is_source:
+                        source_eligible_ids.add(tid)
+                    else:
+                        target_before_ids.add(tid)
                     if tid not in by_id:
                         by_id[tid] = (obj, line)
                     else:
@@ -990,13 +1188,100 @@ def sync_session_index(
                 f"[WARN] Could not read {path.name} cleanly ({type(exc).__name__}); aborting session_index sync to preserve target.",
                 file=sys.stderr,
             )
-            return 0
+            return {
+                "status": SYNC_STATUS_FAILED,
+                "reason": f"read_error:{type(exc).__name__}",
+                "count": 0,
+                "source_exists": True,
+                "target_exists": idx2.exists(),
+                "before": {
+                    "source_count": len(source_eligible_ids),
+                    "target_count": len(target_before_ids),
+                },
+                "after": {"target_count": len(target_before_ids)},
+                "reconciliation": {"verified": False, "missing_ids_count": len(source_eligible_ids)},
+            }
 
+    expected_ids = target_before_ids | source_eligible_ids
     if not dry_run:
         os.makedirs(idx2.parent, mode=0o700, exist_ok=True)
         payload = "".join(f"{entry_line}\n" for _, entry_line in by_id.values())
         atomic_write_text(idx2, payload)
-    return len(by_id)
+        try:
+            after_ids = _snapshot_session_index_ids(idx2)
+        except (OSError, UnicodeDecodeError) as exc:
+            return {
+                "status": SYNC_STATUS_FAILED,
+                "reason": f"post_verify_read_error:{type(exc).__name__}",
+                "count": len(by_id),
+                "source_exists": True,
+                "target_exists": idx2.exists(),
+                "before": {
+                    "source_count": len(source_eligible_ids),
+                    "target_count": len(target_before_ids),
+                },
+                "after": {"target_count": 0},
+                "reconciliation": {"verified": False, "missing_ids_count": len(expected_ids)},
+            }
+        missing_ids = expected_ids - after_ids
+        verified = len(missing_ids) == 0 and len(after_ids) >= len(expected_ids)
+        return {
+            "status": SYNC_STATUS_SUCCESS if verified else SYNC_STATUS_PARTIAL,
+            "reason": "ok" if verified else "reconciliation_mismatch",
+            "count": len(by_id),
+            "source_exists": True,
+            "target_exists": True,
+            "before": {
+                "source_count": len(source_eligible_ids),
+                "target_count": len(target_before_ids),
+            },
+            "after": {"target_count": len(after_ids)},
+            "reconciliation": {
+                "verified": verified,
+                "expected_count": len(expected_ids),
+                "missing_ids_count": len(missing_ids),
+            },
+        }
+
+    return {
+        "status": SYNC_STATUS_SUCCESS,
+        "reason": "dry_run",
+        "count": len(by_id),
+        "source_exists": True,
+        "target_exists": idx2.exists(),
+        "before": {
+            "source_count": len(source_eligible_ids),
+            "target_count": len(target_before_ids),
+        },
+        "after": {"target_count": len(expected_ids)},
+        "reconciliation": {
+            "verified": True,
+            "expected_count": len(expected_ids),
+            "missing_ids_count": 0,
+        },
+    }
+
+
+def sync_session_index(
+    lane1: str,
+    lane2: str,
+    dry_run: bool,
+    allowed_ids: set[str] | None = None,
+) -> int:
+    """
+    Merge `session_index.jsonl` entries by thread `id` from `lane1` into `lane2`,
+    preserving all existing target entries, preferring newer timestamped entries
+    on conflict, and atomically writing the merged JSONL file (skipped in
+    `--dry-run`).
+
+    Security invariants:
+      - Rejects identical `lane1`/`lane2` directories and rejects symlinks or
+        path traversal on either `session_index.jsonl` (including dangling links).
+      - Skips malformed JSON lines and non-object JSON values safely.
+      - Never prints session titles or JSONL contents to stdout/stderr.
+    """
+    result = sync_session_index_detailed(lane1, lane2, dry_run, allowed_ids)
+    return int(result["count"])
 
 
 def _prepare_shared_table_payload(
@@ -1196,7 +1481,7 @@ def _checkpoint_wal_best_effort(conn: sqlite3.Connection) -> None:
         pass
 
 
-def sync_state_db(
+def sync_state_db_detailed(
     lane1: str,
     lane2: str,
     repo_path: str | None,
@@ -1207,38 +1492,222 @@ def sync_state_db(
     backup_target: bool = False,
     max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
     force_openai_provider: bool = True,
-) -> tuple[str | None, int, int, int, set[str]]:
+    require_source_db: bool = False,
+) -> dict[str, object]:
     """
     Perform schema-adaptive, conflict-safe, transactional UPSERT sync of
     `threads` and shared metadata tables (`thread_sections`, `projects`,
-    `project_roots`) from `lane1` (source) into `lane2` (target).
-
-    Returns:
-        `(db_basename, inserted_count, updated_count, pinned_count, synced_thread_ids)`
-
-    Safety & Fault Tolerance:
-      - Raises ValueError on security violations (symlinks, path traversal,
-        identical lanes, unsafe SQL identifiers).
-      - Preserves `is_pinned = 1` / `pinned = 1` monotonically (never downgrades
-        a pinned thread on either side).
-      - When `updated_at` (or `updated_at_ms`) exists on both sides, only
-        overwrites mutable fields if source is strictly newer or the target
-        field is NULL/empty.
-      - Creates a verified online SQLite backup via `.backup()` before writing
-        when `backup_target=True` and `dry_run=False`.
-      - Handles missing, locked, or corrupt SQLite databases gracefully without
-        corrupting the target DB.
-      - Opens target DB read-only as well when `dry_run=True` for zero mutation.
+    `project_roots`) from `lane1` (source) into `lane2` (target), returning a
+    structured result with explicit status (`SUCCESS`, `PARTIAL`, `FAILED`,
+    `SKIPPED`) and before/after reconciliation of record counts, thread IDs,
+    and Pinned threads.
     """
     lane1, lane2 = _normalize_distinct_lanes(lane1, lane2)
 
-    st1 = find_latest_versioned_db(lane1, "state")
-    st2 = find_latest_versioned_db(lane2, "state")
-    if not st1 or not st2:
-        print(
-            "[!] state_*.sqlite not found in both homes. Launch 'codex' once to initialize the secondary DB first."
-        )
-        return (None, 0, 0, 0, set())
+    st1 = find_latest_versioned_db(lane1, "state", strict=require_source_db)
+    st2 = find_latest_versioned_db(lane2, "state", strict=require_source_db)
+    if not st1:
+        return {
+            "status": SYNC_STATUS_SKIPPED,
+            "reason": "missing_source_db",
+            "db_name": None,
+            "inserted": 0,
+            "updated": 0,
+            "pinned": 0,
+            "synced_ids": set(),
+            "source_exists": False,
+            "target_exists": bool(st2),
+            "before": {
+                "source_threads": 0,
+                "source_pinned": 0,
+                "target_threads": 0,
+                "target_pinned": 0,
+            },
+            "after": {"target_threads": 0, "target_pinned": 0},
+            "reconciliation": {
+                "verified": True,
+                "expected_threads": 0,
+                "expected_pinned": 0,
+                "missing_ids_count": 0,
+                "missing_pinned_count": 0,
+            },
+        }
+
+    if not st2:
+        if not require_source_db:
+            print(
+                "[!] state_*.sqlite not found in both homes. Launch 'codex' once to initialize the secondary DB first."
+            )
+            return {
+                "status": SYNC_STATUS_SKIPPED,
+                "reason": "missing_target_db",
+                "db_name": None,
+                "inserted": 0,
+                "updated": 0,
+                "pinned": 0,
+                "synced_ids": set(),
+                "source_exists": True,
+                "target_exists": False,
+                "before": {
+                    "source_threads": 0,
+                    "source_pinned": 0,
+                    "target_threads": 0,
+                    "target_pinned": 0,
+                },
+                "after": {"target_threads": 0, "target_pinned": 0},
+                "reconciliation": {
+                    "verified": True,
+                    "expected_threads": 0,
+                    "expected_pinned": 0,
+                    "missing_ids_count": 0,
+                    "missing_pinned_count": 0,
+                },
+            }
+
+        # Strict / rescue mode: source state_*.sqlite exists while target has none.
+        # Verify source DB is readable (fail closed if locked/corrupt) and atomically
+        # bootstrap target via SQLite online backup when not in --dry-run.
+        _validate_sqlite_and_sidecars(lane1, st1)
+        c1_boot: sqlite3.Connection | None = None
+        try:
+            c1_boot = connect_readonly(st1)
+            _verify_sqlite_readable(c1_boot)
+            src_ids_all, src_pinned_all = _snapshot_state_threads(c1_boot)
+            if dry_run:
+                return {
+                    "status": SYNC_STATUS_SUCCESS,
+                    "reason": "dry_run_bootstrap",
+                    "db_name": os.path.basename(st1),
+                    "inserted": len(src_ids_all),
+                    "updated": 0,
+                    "pinned": len(src_pinned_all),
+                    "synced_ids": set(src_ids_all),
+                    "source_exists": True,
+                    "target_exists": False,
+                    "before": {
+                        "source_threads": len(src_ids_all),
+                        "source_pinned": len(src_pinned_all),
+                        "target_threads": 0,
+                        "target_pinned": 0,
+                    },
+                    "after": {
+                        "target_threads": len(src_ids_all),
+                        "target_pinned": len(src_pinned_all),
+                    },
+                    "reconciliation": {
+                        "verified": True,
+                        "expected_threads": len(src_ids_all),
+                        "expected_pinned": len(src_pinned_all),
+                        "missing_ids_count": 0,
+                        "missing_pinned_count": 0,
+                    },
+                }
+            boot_dest = _bootstrap_target_sqlite_from_source(lane2, st1, c1_boot)
+        except sqlite3.Error as exc:
+            print(
+                f"[WARN] Source state DB ({os.path.basename(st1)}) could not be read or rescued: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return {
+                "status": SYNC_STATUS_FAILED,
+                "reason": f"source_db_error:{type(exc).__name__}",
+                "db_name": None,
+                "inserted": 0,
+                "updated": 0,
+                "pinned": 0,
+                "synced_ids": set(),
+                "source_exists": True,
+                "target_exists": False,
+                "before": {
+                    "source_threads": 0,
+                    "source_pinned": 0,
+                    "target_threads": 0,
+                    "target_pinned": 0,
+                },
+                "after": {"target_threads": 0, "target_pinned": 0},
+                "reconciliation": {
+                    "verified": False,
+                    "expected_threads": 0,
+                    "expected_pinned": 0,
+                    "missing_ids_count": 0,
+                    "missing_pinned_count": 0,
+                },
+            }
+        finally:
+            if c1_boot is not None:
+                c1_boot.close()
+
+        # Reconcile bootstrapped target DB with a fresh read-only connection.
+        c_verify: sqlite3.Connection | None = None
+        try:
+            c_verify = connect_readonly(str(boot_dest))
+            _verify_sqlite_readable(c_verify)
+            after_ids, after_pinned = _snapshot_state_threads(c_verify)
+        except sqlite3.Error as exc:
+            print(
+                f"[WARN] Post-rescue verification failed for {boot_dest.name}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return {
+                "status": SYNC_STATUS_FAILED,
+                "reason": f"post_verify_error:{type(exc).__name__}",
+                "db_name": boot_dest.name,
+                "inserted": len(src_ids_all),
+                "updated": 0,
+                "pinned": len(src_pinned_all),
+                "synced_ids": set(src_ids_all),
+                "source_exists": True,
+                "target_exists": True,
+                "before": {
+                    "source_threads": len(src_ids_all),
+                    "source_pinned": len(src_pinned_all),
+                    "target_threads": 0,
+                    "target_pinned": 0,
+                },
+                "after": {"target_threads": 0, "target_pinned": 0},
+                "reconciliation": {
+                    "verified": False,
+                    "expected_threads": len(src_ids_all),
+                    "expected_pinned": len(src_pinned_all),
+                    "missing_ids_count": len(src_ids_all),
+                    "missing_pinned_count": len(src_pinned_all),
+                },
+            }
+        finally:
+            if c_verify is not None:
+                c_verify.close()
+
+        missing_ids = src_ids_all - after_ids
+        missing_pinned = src_pinned_all - after_pinned
+        verified = len(missing_ids) == 0 and len(missing_pinned) == 0
+        return {
+            "status": SYNC_STATUS_SUCCESS if verified else SYNC_STATUS_PARTIAL,
+            "reason": "ok" if verified else "reconciliation_mismatch",
+            "db_name": boot_dest.name,
+            "inserted": len(src_ids_all),
+            "updated": 0,
+            "pinned": len(src_pinned_all),
+            "synced_ids": set(src_ids_all),
+            "source_exists": True,
+            "target_exists": True,
+            "before": {
+                "source_threads": len(src_ids_all),
+                "source_pinned": len(src_pinned_all),
+                "target_threads": 0,
+                "target_pinned": 0,
+            },
+            "after": {
+                "target_threads": len(after_ids),
+                "target_pinned": len(after_pinned),
+            },
+            "reconciliation": {
+                "verified": verified,
+                "expected_threads": len(src_ids_all),
+                "expected_pinned": len(src_pinned_all),
+                "missing_ids_count": len(missing_ids),
+                "missing_pinned_count": len(missing_pinned),
+            },
+        }
 
     # Validate DB files and any existing -wal/-shm/-journal sidecars against symlinks.
     _validate_sqlite_and_sidecars(lane1, st1)
@@ -1246,6 +1715,15 @@ def sync_state_db(
 
     c1: sqlite3.Connection | None = None
     c2: sqlite3.Connection | None = None
+    target_before_ids: set[str] = set()
+    target_before_pinned: set[str] = set()
+    eligible_source_ids: set[str] = set()
+    eligible_source_pinned: set[str] = set()
+    inserted_count = 0
+    updated_count = 0
+    pinned_count = 0
+    synced_ids: set[str] = set()
+
     try:
         c1 = connect_readonly(st1)
         _verify_sqlite_readable(c1)
@@ -1254,15 +1732,70 @@ def sync_state_db(
         c2 = connect_readonly(st2) if dry_run else connect_readwrite(st2)
         _verify_sqlite_readable(c2)
 
-        if "threads" not in get_tables(c1) or "threads" not in get_tables(c2):
-            return (os.path.basename(st2), 0, 0, 0, set())
+        c1_tables = get_tables(c1)
+        c2_tables = get_tables(c2)
+        if "threads" not in c1_tables or "threads" not in c2_tables:
+            incompatible_strict = require_source_db and ("threads" in c1_tables) and ("threads" not in c2_tables)
+            return {
+                "status": SYNC_STATUS_FAILED if incompatible_strict else SYNC_STATUS_SKIPPED,
+                "reason": "target_schema_missing_threads" if incompatible_strict else "missing_threads_table",
+                "db_name": os.path.basename(st2),
+                "inserted": 0,
+                "updated": 0,
+                "pinned": 0,
+                "synced_ids": set(),
+                "source_exists": True,
+                "target_exists": True,
+                "before": {
+                    "source_threads": 0,
+                    "source_pinned": 0,
+                    "target_threads": 0,
+                    "target_pinned": 0,
+                },
+                "after": {"target_threads": 0, "target_pinned": 0},
+                "reconciliation": {
+                    "verified": not incompatible_strict,
+                    "expected_threads": 0,
+                    "expected_pinned": 0,
+                    "missing_ids_count": 0,
+                    "missing_pinned_count": 0,
+                },
+            }
 
         cols1 = get_columns(c1, "threads")
         cols2_info = get_column_info(c2, "threads")
         cols2 = set(cols2_info.keys())
         common_cols = [c for c in cols1 if c in cols2]
         if "id" not in common_cols:
-            return (os.path.basename(st2), 0, 0, 0, set())
+            incompatible_strict = require_source_db and ("id" in cols1)
+            return {
+                "status": SYNC_STATUS_FAILED if incompatible_strict else SYNC_STATUS_SKIPPED,
+                "reason": "target_schema_missing_id" if incompatible_strict else "missing_id_column",
+                "db_name": os.path.basename(st2),
+                "inserted": 0,
+                "updated": 0,
+                "pinned": 0,
+                "synced_ids": set(),
+                "source_exists": True,
+                "target_exists": True,
+                "before": {
+                    "source_threads": 0,
+                    "source_pinned": 0,
+                    "target_threads": 0,
+                    "target_pinned": 0,
+                },
+                "after": {"target_threads": 0, "target_pinned": 0},
+                "reconciliation": {
+                    "verified": not incompatible_strict,
+                    "expected_threads": 0,
+                    "expected_pinned": 0,
+                    "missing_ids_count": 0,
+                    "missing_pinned_count": 0,
+                },
+            }
+
+        # Pre-sync baseline snapshot for before/after reconciliation.
+        target_before_ids, target_before_pinned = _snapshot_state_threads(c2)
 
         # Any target-only NOT NULL columns without a default need a safe fallback on INSERT.
         extra_notnull_cols: list[str] = [
@@ -1310,10 +1843,6 @@ def sync_state_db(
         pk_cols = {col for col, meta in cols2_info.items() if meta["pk"]}
 
         norm_cwd = normalize_repo_cwd(repo_path) if repo_path else None
-        inserted_count = 0
-        updated_count = 0
-        pinned_count = 0
-        synced_ids: set[str] = set()
         thread_statements: list[tuple[str, list[object]]] = []
 
         for row in src_rows:
@@ -1327,6 +1856,9 @@ def sync_state_db(
             if pinned_only and not src_pinned:
                 continue
 
+            eligible_source_ids.add(tid)
+            if src_pinned:
+                eligible_source_pinned.add(tid)
             synced_ids.add(tid)
 
             if tid not in existing_dst_rows:
@@ -1511,14 +2043,6 @@ def sync_state_db(
                 c2.execute(sql, params)
             c2.execute("COMMIT")
             _checkpoint_wal_best_effort(c2)
-
-        return (
-            os.path.basename(st2),
-            inserted_count,
-            updated_count,
-            pinned_count,
-            synced_ids,
-        )
     except sqlite3.Error as exc:
         if c2 is not None and not dry_run and c2.in_transaction:
             try:
@@ -1529,7 +2053,34 @@ def sync_state_db(
             f"[WARN] Skipping state DB sync ({os.path.basename(st2)}): {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        return (None, 0, 0, 0, set())
+        return {
+            "status": SYNC_STATUS_FAILED,
+            "reason": f"sqlite_error:{type(exc).__name__}",
+            "db_name": None,
+            "inserted": 0,
+            "updated": 0,
+            "pinned": 0,
+            "synced_ids": set(),
+            "source_exists": True,
+            "target_exists": True,
+            "before": {
+                "source_threads": len(eligible_source_ids),
+                "source_pinned": len(eligible_source_pinned),
+                "target_threads": len(target_before_ids),
+                "target_pinned": len(target_before_pinned),
+            },
+            "after": {
+                "target_threads": len(target_before_ids),
+                "target_pinned": len(target_before_pinned),
+            },
+            "reconciliation": {
+                "verified": False,
+                "expected_threads": len(target_before_ids | eligible_source_ids),
+                "expected_pinned": len(target_before_pinned | eligible_source_pinned),
+                "missing_ids_count": len(eligible_source_ids - target_before_ids),
+                "missing_pinned_count": len(eligible_source_pinned - target_before_pinned),
+            },
+        }
     except Exception:
         if c2 is not None and not dry_run and c2.in_transaction:
             try:
@@ -1543,8 +2094,162 @@ def sync_state_db(
         if c2 is not None:
             c2.close()
 
+    expected_ids = target_before_ids | eligible_source_ids
+    expected_pinned = target_before_pinned | eligible_source_pinned
+    if dry_run:
+        return {
+            "status": SYNC_STATUS_SUCCESS,
+            "reason": "dry_run",
+            "db_name": os.path.basename(st2),
+            "inserted": inserted_count,
+            "updated": updated_count,
+            "pinned": pinned_count,
+            "synced_ids": synced_ids,
+            "source_exists": True,
+            "target_exists": True,
+            "before": {
+                "source_threads": len(eligible_source_ids),
+                "source_pinned": len(eligible_source_pinned),
+                "target_threads": len(target_before_ids),
+                "target_pinned": len(target_before_pinned),
+            },
+            "after": {
+                "target_threads": len(expected_ids),
+                "target_pinned": len(expected_pinned),
+            },
+            "reconciliation": {
+                "verified": True,
+                "expected_threads": len(expected_ids),
+                "expected_pinned": len(expected_pinned),
+                "missing_ids_count": 0,
+                "missing_pinned_count": 0,
+            },
+        }
 
-def sync_goals_db(
+    # Post-sync reconciliation using a fresh read-only connection on target DB.
+    c_verify: sqlite3.Connection | None = None
+    try:
+        c_verify = connect_readonly(st2)
+        _verify_sqlite_readable(c_verify)
+        target_after_ids, target_after_pinned = _snapshot_state_threads(c_verify)
+    except sqlite3.Error as exc:
+        print(
+            f"[WARN] Post-sync verification failed for state DB ({os.path.basename(st2)}): {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return {
+            "status": SYNC_STATUS_FAILED,
+            "reason": f"post_verify_error:{type(exc).__name__}",
+            "db_name": os.path.basename(st2),
+            "inserted": inserted_count,
+            "updated": updated_count,
+            "pinned": pinned_count,
+            "synced_ids": synced_ids,
+            "source_exists": True,
+            "target_exists": True,
+            "before": {
+                "source_threads": len(eligible_source_ids),
+                "source_pinned": len(eligible_source_pinned),
+                "target_threads": len(target_before_ids),
+                "target_pinned": len(target_before_pinned),
+            },
+            "after": {"target_threads": 0, "target_pinned": 0},
+            "reconciliation": {
+                "verified": False,
+                "expected_threads": len(expected_ids),
+                "expected_pinned": len(expected_pinned),
+                "missing_ids_count": len(expected_ids),
+                "missing_pinned_count": len(expected_pinned),
+            },
+        }
+    finally:
+        if c_verify is not None:
+            c_verify.close()
+
+    missing_ids = expected_ids - target_after_ids
+    missing_pinned = expected_pinned - target_after_pinned
+    verified = (
+        len(missing_ids) == 0
+        and len(missing_pinned) == 0
+        and len(target_after_ids) >= len(expected_ids)
+        and len(target_after_pinned) >= len(expected_pinned)
+    )
+    if not verified:
+        print(
+            f"[WARN] Post-sync reconciliation mismatch on {os.path.basename(st2)}: "
+            f"missing_ids={len(missing_ids)}, missing_pinned={len(missing_pinned)}",
+            file=sys.stderr,
+        )
+
+    return {
+        "status": SYNC_STATUS_SUCCESS if verified else SYNC_STATUS_PARTIAL,
+        "reason": "ok" if verified else "reconciliation_mismatch",
+        "db_name": os.path.basename(st2),
+        "inserted": inserted_count,
+        "updated": updated_count,
+        "pinned": pinned_count,
+        "synced_ids": synced_ids,
+        "source_exists": True,
+        "target_exists": True,
+        "before": {
+            "source_threads": len(eligible_source_ids),
+            "source_pinned": len(eligible_source_pinned),
+            "target_threads": len(target_before_ids),
+            "target_pinned": len(target_before_pinned),
+        },
+        "after": {
+            "target_threads": len(target_after_ids),
+            "target_pinned": len(target_after_pinned),
+        },
+        "reconciliation": {
+            "verified": verified,
+            "expected_threads": len(expected_ids),
+            "expected_pinned": len(expected_pinned),
+            "missing_ids_count": len(missing_ids),
+            "missing_pinned_count": len(missing_pinned),
+        },
+    }
+
+
+def sync_state_db(
+    lane1: str,
+    lane2: str,
+    repo_path: str | None,
+    approval_mode: str | None,
+    pinned_only: bool,
+    dry_run: bool,
+    *,
+    backup_target: bool = False,
+    max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
+    force_openai_provider: bool = True,
+) -> tuple[str | None, int, int, int, set[str]]:
+    """
+    Backward-compatible tuple wrapper around `sync_state_db_detailed(...)`.
+
+    Returns:
+        `(db_basename, inserted_count, updated_count, pinned_count, synced_thread_ids)`
+    """
+    res = sync_state_db_detailed(
+        lane1,
+        lane2,
+        repo_path,
+        approval_mode,
+        pinned_only,
+        dry_run,
+        backup_target=backup_target,
+        max_backups=max_backups,
+        force_openai_provider=force_openai_provider,
+    )
+    return (
+        res["db_name"],
+        int(res["inserted"]),
+        int(res["updated"]),
+        int(res["pinned"]),
+        set(res["synced_ids"]),
+    )
+
+
+def sync_goals_db_detailed(
     lane1: str,
     lane2: str,
     dry_run: bool,
@@ -1552,28 +2257,159 @@ def sync_goals_db(
     backup_target: bool = False,
     max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
     preserve_existing_on_conflict: bool = False,
-) -> int:
+    require_source_db: bool = False,
+) -> dict[str, object]:
     """
     Sync Codex Goals tables (`thread_goals`, `thread_goal_continuation_deferrals`)
-    from `lane1` (read-only) into `lane2` inside an atomic transaction using
-    conflict-safe merge semantics (never deleting target-only rows or
-    downgrading newer target rows).
-
-    Handles missing, locked, or corrupt Goals databases gracefully without
-    modifying the target database.
+    from `lane1` (read-only) into `lane2` inside an atomic transaction, returning
+    a structured result with explicit status (`SUCCESS`, `PARTIAL`, `FAILED`,
+    `SKIPPED`) and before/after Goals reconciliation.
     """
     lane1, lane2 = _normalize_distinct_lanes(lane1, lane2)
 
-    g1 = find_latest_versioned_db(lane1, "goals")
-    g2 = find_latest_versioned_db(lane2, "goals")
-    if not g1 or not g2:
-        return 0
+    g1 = find_latest_versioned_db(lane1, "goals", strict=require_source_db)
+    g2 = find_latest_versioned_db(lane2, "goals", strict=require_source_db)
+    if not g1:
+        return {
+            "status": SYNC_STATUS_SKIPPED,
+            "reason": "missing_source_db",
+            "db_name": None,
+            "count": 0,
+            "source_exists": False,
+            "target_exists": bool(g2),
+            "before": {"source_goals": 0, "target_goals": 0},
+            "after": {"target_goals": 0},
+            "reconciliation": {
+                "verified": True,
+                "expected_goals": 0,
+                "missing_goals_count": 0,
+            },
+        }
+
+    if not g2:
+        if not require_source_db:
+            return {
+                "status": SYNC_STATUS_SKIPPED,
+                "reason": "missing_target_db",
+                "db_name": None,
+                "count": 0,
+                "source_exists": True,
+                "target_exists": False,
+                "before": {"source_goals": 0, "target_goals": 0},
+                "after": {"target_goals": 0},
+                "reconciliation": {
+                    "verified": True,
+                    "expected_goals": 0,
+                    "missing_goals_count": 0,
+                },
+            }
+
+        # Strict / rescue mode: source goals_*.sqlite exists while target has none.
+        _validate_sqlite_and_sidecars(lane1, g1)
+        c1_boot: sqlite3.Connection | None = None
+        try:
+            c1_boot = connect_readonly(g1)
+            _verify_sqlite_readable(c1_boot)
+            src_count, src_keys = _snapshot_goals_keys(c1_boot)
+            if dry_run:
+                return {
+                    "status": SYNC_STATUS_SUCCESS,
+                    "reason": "dry_run_bootstrap",
+                    "db_name": os.path.basename(g1),
+                    "count": src_count,
+                    "source_exists": True,
+                    "target_exists": False,
+                    "before": {"source_goals": src_count, "target_goals": 0},
+                    "after": {"target_goals": src_count},
+                    "reconciliation": {
+                        "verified": True,
+                        "expected_goals": len(src_keys),
+                        "missing_goals_count": 0,
+                    },
+                }
+            boot_dest = _bootstrap_target_sqlite_from_source(lane2, g1, c1_boot)
+        except sqlite3.Error as exc:
+            print(
+                f"[WARN] Source goals DB ({os.path.basename(g1)}) could not be read or rescued: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return {
+                "status": SYNC_STATUS_FAILED,
+                "reason": f"source_db_error:{type(exc).__name__}",
+                "db_name": None,
+                "count": 0,
+                "source_exists": True,
+                "target_exists": False,
+                "before": {"source_goals": 0, "target_goals": 0},
+                "after": {"target_goals": 0},
+                "reconciliation": {
+                    "verified": False,
+                    "expected_goals": 0,
+                    "missing_goals_count": 0,
+                },
+            }
+        finally:
+            if c1_boot is not None:
+                c1_boot.close()
+
+        c_verify: sqlite3.Connection | None = None
+        try:
+            c_verify = connect_readonly(str(boot_dest))
+            _verify_sqlite_readable(c_verify)
+            after_count, after_keys = _snapshot_goals_keys(c_verify)
+        except sqlite3.Error as exc:
+            print(
+                f"[WARN] Post-rescue verification failed for goals DB ({boot_dest.name}): {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return {
+                "status": SYNC_STATUS_FAILED,
+                "reason": f"post_verify_error:{type(exc).__name__}",
+                "db_name": boot_dest.name,
+                "count": src_count,
+                "source_exists": True,
+                "target_exists": True,
+                "before": {"source_goals": src_count, "target_goals": 0},
+                "after": {"target_goals": 0},
+                "reconciliation": {
+                    "verified": False,
+                    "expected_goals": len(src_keys),
+                    "missing_goals_count": len(src_keys),
+                },
+            }
+        finally:
+            if c_verify is not None:
+                c_verify.close()
+
+        missing_keys = src_keys - after_keys
+        verified = len(missing_keys) == 0 and after_count >= len(src_keys)
+        return {
+            "status": SYNC_STATUS_SUCCESS if verified else SYNC_STATUS_PARTIAL,
+            "reason": "ok" if verified else "reconciliation_mismatch",
+            "db_name": boot_dest.name,
+            "count": src_count,
+            "source_exists": True,
+            "target_exists": True,
+            "before": {"source_goals": src_count, "target_goals": 0},
+            "after": {"target_goals": after_count},
+            "reconciliation": {
+                "verified": verified,
+                "expected_goals": len(src_keys),
+                "missing_goals_count": len(missing_keys),
+            },
+        }
 
     _validate_sqlite_and_sidecars(lane1, g1)
     _validate_sqlite_and_sidecars(lane2, g2)
 
     c1: sqlite3.Connection | None = None
     c2: sqlite3.Connection | None = None
+    src_goals_count = 0
+    src_goal_keys: set[tuple[object, ...]] = set()
+    target_before_count = 0
+    target_before_keys: set[tuple[object, ...]] = set()
+    goals_count = 0
+
     try:
         c1 = connect_readonly(g1)
         _verify_sqlite_readable(c1)
@@ -1581,8 +2417,10 @@ def sync_goals_db(
         c2 = connect_readonly(g2) if dry_run else connect_readwrite(g2)
         _verify_sqlite_readable(c2)
 
+        src_goals_count, src_goal_keys = _snapshot_goals_keys(c1)
+        target_before_count, target_before_keys = _snapshot_goals_keys(c2)
+
         # Stage all reads from source and target before starting a write transaction.
-        goals_count = 0
         all_statements: list[tuple[str, list[object]]] = []
         for tbl in SHARED_GOALS_TABLES:
             row_count, stmts = _plan_shared_table_merge(
@@ -1603,8 +2441,6 @@ def sync_goals_db(
                 c2.execute(sql, params)
             c2.execute("COMMIT")
             _checkpoint_wal_best_effort(c2)
-
-        return goals_count
     except sqlite3.Error as exc:
         if c2 is not None and not dry_run and c2.in_transaction:
             try:
@@ -1615,7 +2451,24 @@ def sync_goals_db(
             f"[WARN] Skipping goals DB sync ({os.path.basename(g2)}): {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        return 0
+        return {
+            "status": SYNC_STATUS_FAILED,
+            "reason": f"sqlite_error:{type(exc).__name__}",
+            "db_name": None,
+            "count": 0,
+            "source_exists": True,
+            "target_exists": True,
+            "before": {
+                "source_goals": src_goals_count,
+                "target_goals": target_before_count,
+            },
+            "after": {"target_goals": target_before_count},
+            "reconciliation": {
+                "verified": False,
+                "expected_goals": len(target_before_keys | src_goal_keys),
+                "missing_goals_count": len(src_goal_keys - target_before_keys),
+            },
+        }
     except Exception:
         if c2 is not None and not dry_run and c2.in_transaction:
             try:
@@ -1628,6 +2481,110 @@ def sync_goals_db(
             c1.close()
         if c2 is not None:
             c2.close()
+
+    expected_goal_keys = target_before_keys | src_goal_keys
+    if dry_run:
+        return {
+            "status": SYNC_STATUS_SUCCESS,
+            "reason": "dry_run",
+            "db_name": os.path.basename(g2),
+            "count": goals_count,
+            "source_exists": True,
+            "target_exists": True,
+            "before": {
+                "source_goals": src_goals_count,
+                "target_goals": target_before_count,
+            },
+            "after": {"target_goals": len(expected_goal_keys)},
+            "reconciliation": {
+                "verified": True,
+                "expected_goals": len(expected_goal_keys),
+                "missing_goals_count": 0,
+            },
+        }
+
+    c_verify: sqlite3.Connection | None = None
+    try:
+        c_verify = connect_readonly(g2)
+        _verify_sqlite_readable(c_verify)
+        target_after_count, target_after_keys = _snapshot_goals_keys(c_verify)
+    except sqlite3.Error as exc:
+        print(
+            f"[WARN] Post-sync verification failed for goals DB ({os.path.basename(g2)}): {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return {
+            "status": SYNC_STATUS_FAILED,
+            "reason": f"post_verify_error:{type(exc).__name__}",
+            "db_name": os.path.basename(g2),
+            "count": goals_count,
+            "source_exists": True,
+            "target_exists": True,
+            "before": {
+                "source_goals": src_goals_count,
+                "target_goals": target_before_count,
+            },
+            "after": {"target_goals": 0},
+            "reconciliation": {
+                "verified": False,
+                "expected_goals": len(expected_goal_keys),
+                "missing_goals_count": len(expected_goal_keys),
+            },
+        }
+    finally:
+        if c_verify is not None:
+            c_verify.close()
+
+    missing_keys = expected_goal_keys - target_after_keys
+    verified = len(missing_keys) == 0 and target_after_count >= len(expected_goal_keys)
+    if not verified:
+        print(
+            f"[WARN] Post-sync reconciliation mismatch on {os.path.basename(g2)}: "
+            f"missing_goals={len(missing_keys)}",
+            file=sys.stderr,
+        )
+
+    return {
+        "status": SYNC_STATUS_SUCCESS if verified else SYNC_STATUS_PARTIAL,
+        "reason": "ok" if verified else "reconciliation_mismatch",
+        "db_name": os.path.basename(g2),
+        "count": goals_count,
+        "source_exists": True,
+        "target_exists": True,
+        "before": {
+            "source_goals": src_goals_count,
+            "target_goals": target_before_count,
+        },
+        "after": {"target_goals": target_after_count},
+        "reconciliation": {
+            "verified": verified,
+            "expected_goals": len(expected_goal_keys),
+            "missing_goals_count": len(missing_keys),
+        },
+    }
+
+
+def sync_goals_db(
+    lane1: str,
+    lane2: str,
+    dry_run: bool,
+    *,
+    backup_target: bool = False,
+    max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
+    preserve_existing_on_conflict: bool = False,
+) -> int:
+    """
+    Backward-compatible integer wrapper around `sync_goals_db_detailed(...)`.
+    """
+    res = sync_goals_db_detailed(
+        lane1,
+        lane2,
+        dry_run,
+        backup_target=backup_target,
+        max_backups=max_backups,
+        preserve_existing_on_conflict=preserve_existing_on_conflict,
+    )
+    return int(res["count"])
 
 
 def _run_directional_sync(
@@ -1642,9 +2599,10 @@ def _run_directional_sync(
     max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
     rescue_shared: bool,
     force_openai_provider: bool,
+    require_source_dbs: bool = False,
 ) -> dict[str, object]:
     """Execute one full sync pass (`source -> target`) across state DB, index, goals, and optional shared files."""
-    db_name, inserted_count, updated_count, pinned_count, synced_ids = sync_state_db(
+    state_res = sync_state_db_detailed(
         source,
         target,
         repo_path,
@@ -1654,31 +2612,87 @@ def _run_directional_sync(
         backup_target=backup_target,
         max_backups=max_backups,
         force_openai_provider=force_openai_provider,
+        require_source_db=require_source_dbs,
     )
-    allowed_ids = synced_ids if pinned_only else None
-    idx_count = sync_session_index(source, target, dry_run, allowed_ids)
-    goals_count = sync_goals_db(
+    allowed_ids = set(state_res["synced_ids"]) if pinned_only else None
+    index_res = sync_session_index_detailed(source, target, dry_run, allowed_ids)
+    goals_res = sync_goals_db_detailed(
         source,
         target,
         dry_run,
         backup_target=backup_target,
         max_backups=max_backups,
         preserve_existing_on_conflict=not force_openai_provider,
+        require_source_db=require_source_dbs,
     )
     rescued = (0, 0, 0)
+    rescue_status = SYNC_STATUS_SKIPPED
     if rescue_shared:
         rescued = rescue_shared_files(source, target, dry_run)
+        rescue_status = (
+            SYNC_STATUS_SUCCESS
+            if (rescued[0] > 0 or rescued[1] > 0 or rescued[2] > 0)
+            else SYNC_STATUS_SKIPPED
+        )
+
+    component_statuses = [
+        str(state_res["status"]),
+        str(index_res["status"]),
+        str(goals_res["status"]),
+    ]
+    if rescue_shared:
+        component_statuses.append(rescue_status)
+    overall_status = _aggregate_sync_status(component_statuses)
+
+    state_before = dict(state_res["before"])
+    state_after = dict(state_res["after"])
+    state_rec = dict(state_res["reconciliation"])
+    index_rec = dict(index_res["reconciliation"])
+    goals_before = dict(goals_res["before"])
+    goals_after = dict(goals_res["after"])
+    goals_rec = dict(goals_res["reconciliation"])
+
+    reconcile_verified = (
+        bool(state_rec.get("verified", True))
+        and bool(index_rec.get("verified", True))
+        and bool(goals_rec.get("verified", True))
+    )
+    total_missing_ids = int(state_rec.get("missing_ids_count", 0)) + int(
+        index_rec.get("missing_ids_count", 0)
+    )
+    total_missing_pinned = int(state_rec.get("missing_pinned_count", 0))
+    total_missing_goals = int(goals_rec.get("missing_goals_count", 0))
 
     return {
-        "db_name": db_name,
-        "inserted": inserted_count,
-        "updated": updated_count,
-        "pinned": pinned_count,
-        "session_index": idx_count,
-        "goals": goals_count,
+        "status": overall_status,
+        "state_status": str(state_res["status"]),
+        "state_reason": str(state_res["reason"]),
+        "index_status": str(index_res["status"]),
+        "index_reason": str(index_res["reason"]),
+        "goals_status": str(goals_res["status"]),
+        "goals_reason": str(goals_res["reason"]),
+        "rescue_status": rescue_status,
+        "db_name": state_res["db_name"],
+        "inserted": int(state_res["inserted"]),
+        "updated": int(state_res["updated"]),
+        "pinned": int(state_res["pinned"]),
+        "session_index": int(index_res["count"]),
+        "goals": int(goals_res["count"]),
         "rescued_copied": rescued[0],
         "rescued_skipped_existing": rescued[1],
         "rescued_skipped_links": rescued[2],
+        "reconciliation": {
+            "verified": reconcile_verified,
+            "threads_before": int(state_before.get("target_threads", 0)),
+            "threads_after": int(state_after.get("target_threads", 0)),
+            "pinned_before": int(state_before.get("target_pinned", 0)),
+            "pinned_after": int(state_after.get("target_pinned", 0)),
+            "goals_before": int(goals_before.get("target_goals", 0)),
+            "goals_after": int(goals_after.get("target_goals", 0)),
+            "missing_ids_count": total_missing_ids,
+            "missing_pinned_count": total_missing_pinned,
+            "missing_goals_count": total_missing_goals,
+        },
     }
 
 
@@ -1689,13 +2703,33 @@ def _format_sync_summary(
     direction_label: str | None = None,
     include_rescue: bool = False,
 ) -> str:
-    """Format a secret-free summary line containing only DB basenames and integer counts."""
-    prefix = f"[{mode}] [{direction_label}]" if direction_label else f"[{mode}]"
+    """Format a secret-free summary line containing explicit status, DB basenames, integer counts, and reconciliation metrics."""
+    status = str(stats.get("status", SYNC_STATUS_SUCCESS))
+    if mode == "DRY-RUN":
+        tag = "DRY-RUN"
+    elif status == SYNC_STATUS_FAILED:
+        tag = "FAIL"
+    elif status == SYNC_STATUS_PARTIAL:
+        tag = "PARTIAL"
+    else:
+        tag = "OK"
+
+    prefix = f"[{tag}] [{direction_label}]" if direction_label else f"[{tag}]"
+    rec = dict(stats.get("reconciliation", {}))
+    rec_label = "OK" if rec.get("verified", True) else "MISMATCH"
     line = (
-        f"{prefix} session_index={stats['session_index']} | "
-        f"state_db={stats['db_name'] or 'N/A'} "
-        f"(inserted={stats['inserted']}, updated={stats['updated']}, pinned={stats['pinned']}) | "
-        f"goals={stats['goals']}"
+        f"{prefix} status={status} | "
+        f"session_index={stats['session_index']}({stats.get('index_status', SYNC_STATUS_SKIPPED)}) | "
+        f"state_db={stats['db_name'] or 'N/A'}({stats.get('state_status', SYNC_STATUS_SKIPPED)}: "
+        f"inserted={stats['inserted']}, updated={stats['updated']}, pinned={stats['pinned']}) | "
+        f"goals={stats['goals']}({stats.get('goals_status', SYNC_STATUS_SKIPPED)}) | "
+        f"reconcile={rec_label}("
+        f"threads={rec.get('threads_before', 0)}->{rec.get('threads_after', 0)}, "
+        f"pinned={rec.get('pinned_before', 0)}->{rec.get('pinned_after', 0)}, "
+        f"goals={rec.get('goals_before', 0)}->{rec.get('goals_after', 0)}, "
+        f"missing_ids={rec.get('missing_ids_count', 0)}, "
+        f"missing_pinned={rec.get('missing_pinned_count', 0)}, "
+        f"missing_goals={rec.get('missing_goals_count', 0)})"
     )
     if include_rescue:
         line += (
@@ -1764,6 +2798,23 @@ def main() -> int:
         help="Copy missing regular files from real local sessions/archived_sessions/memories/memories_v2 directories into target (skipping existing symlinks/junctions)",
     )
     parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail closed if any existing source SQLite DB cannot be read/synced or if post-sync reconciliation mismatches",
+    )
+    parser.add_argument(
+        "--busy-timeout",
+        type=float,
+        default=None,
+        help=f"SQLite busy timeout in seconds (default: {DEFAULT_BUSY_TIMEOUT_SEC}s; can also be set via CODEX_SYNC_BUSY_TIMEOUT_SEC)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit secret-free structured JSON summary instead of plain text",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Inspect schemas and report what would be synced without writing any file",
@@ -1772,8 +2823,16 @@ def main() -> int:
     if args.max_backups < 0:
         print("[FAIL] --max-backups must be >= 0.", file=sys.stderr)
         return 1
+    if args.busy_timeout is not None and args.busy_timeout < 0:
+        print("[FAIL] --busy-timeout must be >= 0.", file=sys.stderr)
+        return 1
+
+    prev_env_timeout = os.environ.get("CODEX_SYNC_BUSY_TIMEOUT_SEC")
+    if args.busy_timeout is not None:
+        os.environ["CODEX_SYNC_BUSY_TIMEOUT_SEC"] = str(args.busy_timeout)
 
     mode = "DRY-RUN" if args.dry_run else "OK"
+    require_source_dbs = bool(args.strict or args.rescue_shared_files)
     try:
         # When rescuing back to GPT 1 (unidirectional --rescue-shared-files), preserve
         # target's existing model_provider instead of forcing "openai".
@@ -1789,6 +2848,7 @@ def main() -> int:
             max_backups=args.max_backups,
             rescue_shared=args.rescue_shared_files,
             force_openai_provider=fwd_force_openai,
+            require_source_dbs=require_source_dbs,
         )
 
         if args.bidirectional:
@@ -1805,39 +2865,77 @@ def main() -> int:
                 max_backups=args.max_backups,
                 rescue_shared=args.rescue_shared_files,
                 force_openai_provider=False,
+                require_source_dbs=require_source_dbs,
             )
-            # Print only basenames and integer counts; never log thread content or secrets.
-            print(
-                _format_sync_summary(
-                    mode,
-                    fwd_stats,
-                    direction_label="forward",
-                    include_rescue=args.rescue_shared_files,
+            overall_status = _aggregate_sync_status(
+                [str(fwd_stats["status"]), str(rev_stats["status"])]
+            )
+            if args.json_output:
+                print(
+                    json.dumps(
+                        {
+                            "status": overall_status,
+                            "dry_run": args.dry_run,
+                            "forward": fwd_stats,
+                            "reverse": rev_stats,
+                        },
+                        ensure_ascii=False,
+                    )
                 )
-            )
-            print(
-                _format_sync_summary(
-                    mode,
-                    rev_stats,
-                    direction_label="reverse",
-                    include_rescue=args.rescue_shared_files,
+            else:
+                # Print only status, basenames, and integer counts; never log thread content or secrets.
+                print(
+                    _format_sync_summary(
+                        mode,
+                        fwd_stats,
+                        direction_label="forward",
+                        include_rescue=args.rescue_shared_files,
+                    )
                 )
-            )
+                print(
+                    _format_sync_summary(
+                        mode,
+                        rev_stats,
+                        direction_label="reverse",
+                        include_rescue=args.rescue_shared_files,
+                    )
+                )
         else:
-            print(
-                _format_sync_summary(
-                    mode,
-                    fwd_stats,
-                    include_rescue=args.rescue_shared_files,
+            overall_status = str(fwd_stats["status"])
+            if args.json_output:
+                print(
+                    json.dumps(
+                        {
+                            "status": overall_status,
+                            "dry_run": args.dry_run,
+                            "forward": fwd_stats,
+                        },
+                        ensure_ascii=False,
+                    )
                 )
-            )
+            else:
+                print(
+                    _format_sync_summary(
+                        mode,
+                        fwd_stats,
+                        include_rescue=args.rescue_shared_files,
+                    )
+                )
     except ValueError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1
     except OSError as exc:
         print(f"[FAIL] Filesystem error ({type(exc).__name__}).", file=sys.stderr)
         return 1
+    finally:
+        if args.busy_timeout is not None:
+            if prev_env_timeout is None:
+                os.environ.pop("CODEX_SYNC_BUSY_TIMEOUT_SEC", None)
+            else:
+                os.environ["CODEX_SYNC_BUSY_TIMEOUT_SEC"] = prev_env_timeout
 
+    if overall_status in (SYNC_STATUS_FAILED, SYNC_STATUS_PARTIAL):
+        return 1
     return 0
 
 
