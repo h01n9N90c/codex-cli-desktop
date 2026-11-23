@@ -8,6 +8,11 @@ The format follows semantic versioning (`MAJOR.MINOR.PATCH`).
 
 ## [1.4] — 2026-11-23 (Interactive Sandbox 2 Control Center, Native-Parity CLI Containment & 3 Permission Modes, HTTPS/No-Redirect Probe Hardening, Explicit Opt-In Project Trust & History-Preserving CLI Uninstall)
 
+### Resource & Crash-Prevention Hardening
+- **Bounded SQLite `.sync-backup-*` Rotation (`scripts/sync-sessions.py --max-backups 5`):** Automatically prunes older regular `.sync-backup-*` files beyond the newest `5` per SQLite database (configurable via `--max-backups`, symlink-safe) so repeated `codex-manage` runs never bloat disk space; `doctor.ps1` / `doctor.sh` also report backup hygiene.
+- **2 MiB Bounded HTTP Probe Reads (`scripts/codex-manager.ps1` & `scripts/codex-manager.sh`):** Caps `/models` online-probe response reads at `2 MiB` (`response >2 MiB truncated`) so misconfigured or streaming endpoints cannot cause OOM crashes.
+- **Safe Parallel Cargo Concurrency Cap (`-CargoBuildJobs` / `--cargo-build-jobs` in `scripts/setup-dual-lane.*`):** Auto-caps Lane 2 `CARGO_BUILD_JOBS` to `max(1, min(4, floor(CPU/2)))` in both `[shell_environment_policy.set]` and generated wrappers (and warns on Windows when free RAM is below `4 GiB`), preventing dual-lane parallel Rust builds from exhausting host CPU/RAM.
+
 ### Security Fixes
 - **Fixed (Security — High): Online API Key Probe HTTPS-Only & No-Redirect Enforcement (`scripts/codex-manager.sh` & `scripts/codex-manager.ps1`):**
   - Enforced **HTTPS-only** for all remote `/models` probe URLs (plain `http://` is permitted strictly on loopback `127.0.0.1` / `localhost` / `::1` for local mock testing; any non-loopback `http://` URL or URL containing embedded `user:pass@` credentials is refused fail-closed with `REFUSED (https_required...)` BEFORE building an HTTP request).

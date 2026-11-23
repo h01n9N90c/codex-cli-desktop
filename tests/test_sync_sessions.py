@@ -1557,5 +1557,39 @@ class TestSyncSessionsSafetyAndUpsert(unittest.TestCase):
         self.assertTrue((l1 / "sessions" / "2026" / "rollout-l2.jsonl").is_file())
 
 
+    def test_backup_target_rotates_old_sync_backups_and_preserves_newest(self) -> None:
+        """
+        WHAT: Verifies `backup_sqlite_db` and `--max-backups` retain at most the
+              newest N `.sync-backup-*` files per SQLite DB, pruning older backups
+              to prevent unbounded disk bloat, while refusing negative `--max-backups`.
+        PREVENTS: Repeated `codex-manage` sync runs from accumulating gigabytes of
+                  stale SQLite `.sync-backup-*` copies on disk.
+        """
+        created: list[Path] = []
+        for idx in range(7):
+            bkp = sync_mod.backup_sqlite_db(self.lane2, self.st2, max_backups=3)
+            # Assign strictly increasing mtimes so newest-3 order is deterministic.
+            ts_ns = (1700000000 + idx * 10) * 1_000_000_000
+            os.utime(bkp, ns=(ts_ns, ts_ns))
+            created.append(bkp)
+
+        remaining = sorted(p.name for p in Path(self.lane2).glob("state_5.sqlite.sync-backup-*"))
+        self.assertEqual(len(remaining), 3)
+        self.assertEqual(remaining, sorted(p.name for p in created[-3:]))
+
+        # Verify negative --max-backups is rejected fail-closed with exit code 1.
+        err_buf = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["sync-sessions.py", "--lane1", self.lane1, "--lane2", self.lane2, "--max-backups", "-1"],
+            ),
+            contextlib.redirect_stderr(err_buf),
+        ):
+            rc = sync_mod.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("--max-backups", err_buf.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

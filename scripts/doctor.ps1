@@ -919,5 +919,29 @@ if ($realPy) {
     Report 'WARN' 'Python 3 (Optional Sync)' 'Not installed (only needed if running scripts/sync-sessions.py)'
 }
 
+# ============================================================================
+# Check 10: Resource & Sync-Backup Disk Hygiene (Read-Only)
+# ============================================================================
+$syncBkpCount = 0
+[int64]$syncBkpBytes = 0
+foreach ($laneDir in @($Lane1Home, $Lane2Home)) {
+    if (Test-Path -LiteralPath $laneDir -PathType Container) {
+        try {
+            foreach ($bf in @(Get-ChildItem -LiteralPath $laneDir -Filter '*.sync-backup-*' -File -ErrorAction SilentlyContinue)) {
+                if (-not ($bf.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                    $syncBkpCount++
+                    $syncBkpBytes += [int64]$bf.Length
+                }
+            }
+        } catch {}
+    }
+}
+$syncBkpMB = [math]::Round($syncBkpBytes / 1MB, 2)
+if ($syncBkpCount -gt 12 -or $syncBkpMB -gt 250) {
+    Report 'WARN' 'Resource & Backup Hygiene' "Found $syncBkpCount .sync-backup-* file(s) totaling $syncBkpMB MiB; sync-sessions.py rotates to newest 5 per DB (--max-backups 5)"
+} else {
+    Report 'PASS' 'Resource & Backup Hygiene' "sync-backups=$syncBkpCount ($syncBkpMB MiB) | auto-rotation keeps newest 5 per SQLite DB"
+}
+
 Write-Host "`nSummary: $script:passCount PASS | $script:warnCount WARN | $script:failCount FAIL" -ForegroundColor Cyan
 if ($script:failCount -gt 0) { exit 1 } else { exit 0 }

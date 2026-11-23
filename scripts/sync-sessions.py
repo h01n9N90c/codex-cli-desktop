@@ -370,10 +370,65 @@ def _verify_sqlite_readable(conn: sqlite3.Connection) -> None:
         raise sqlite3.DatabaseError("SQLite quick_check reported database corruption")
 
 
+DEFAULT_MAX_SYNC_BACKUPS = 5
+
+
+def _prune_old_sync_backups(
+    base_dir: str,
+    validated_db: Path,
+    *,
+    max_backups: int,
+) -> int:
+    """
+    Keep at most `max_backups` newest regular `.sync-backup-*` files for
+    `validated_db`, pruning older regular files safely without ever following
+    or unlinking symlinks. Returns the number of pruned files.
+    """
+    if max_backups <= 0:
+        return 0
+    prefix = f"{validated_db.name}.sync-backup-"
+    candidates: list[tuple[int, str, Path]] = []
+    try:
+        with os.scandir(validated_db.parent) as it:
+            for entry in it:
+                if not entry.name.startswith(prefix):
+                    continue
+                if entry.is_symlink():
+                    # Never follow or unlink symlinks during backup rotation.
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                candidates.append((st.st_mtime_ns, entry.name, Path(entry.path)))
+    except OSError:
+        return 0
+
+    if len(candidates) <= max_backups:
+        return 0
+
+    # Sort newest first by (mtime_ns, filename) so the latest backups are always kept.
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    pruned = 0
+    for _, _, old_path in candidates[max_backups:]:
+        try:
+            ensure_contained_path(base_dir, old_path, reject_symlinks=True)
+            if not os.path.islink(old_path):
+                os.unlink(old_path)
+                pruned += 1
+        except (OSError, ValueError):
+            continue
+    return pruned
+
+
 def backup_sqlite_db(
     base_dir: str,
     db_path: str,
     src_conn: sqlite3.Connection | None = None,
+    *,
+    max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
 ) -> Path:
     """
     Create a consistent standalone SQLite backup copy at
@@ -421,6 +476,7 @@ def backup_sqlite_db(
         ensure_contained_path(base_dir, backup_path, reject_symlinks=True)
         os.replace(tmp_path, backup_path)
         tmp_path = None
+        _prune_old_sync_backups(base_dir, validated_db, max_backups=max_backups)
         return backup_path
     finally:
         if dst_conn is not None:
@@ -1149,6 +1205,7 @@ def sync_state_db(
     dry_run: bool,
     *,
     backup_target: bool = False,
+    max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
     force_openai_provider: bool = True,
 ) -> tuple[str | None, int, int, int, set[str]]:
     """
@@ -1448,7 +1505,7 @@ def sync_state_db(
         all_statements = shared_statements + thread_statements
         if not dry_run and all_statements:
             if backup_target:
-                backup_sqlite_db(lane2, st2, src_conn=c2)
+                backup_sqlite_db(lane2, st2, src_conn=c2, max_backups=max_backups)
             c2.execute("BEGIN IMMEDIATE")
             for sql, params in all_statements:
                 c2.execute(sql, params)
@@ -1493,6 +1550,7 @@ def sync_goals_db(
     dry_run: bool,
     *,
     backup_target: bool = False,
+    max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
     preserve_existing_on_conflict: bool = False,
 ) -> int:
     """
@@ -1539,7 +1597,7 @@ def sync_goals_db(
 
         if not dry_run and all_statements:
             if backup_target:
-                backup_sqlite_db(lane2, g2, src_conn=c2)
+                backup_sqlite_db(lane2, g2, src_conn=c2, max_backups=max_backups)
             c2.execute("BEGIN IMMEDIATE")
             for sql, params in all_statements:
                 c2.execute(sql, params)
@@ -1581,6 +1639,7 @@ def _run_directional_sync(
     pinned_only: bool,
     dry_run: bool,
     backup_target: bool,
+    max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
     rescue_shared: bool,
     force_openai_provider: bool,
 ) -> dict[str, object]:
@@ -1593,6 +1652,7 @@ def _run_directional_sync(
         pinned_only,
         dry_run,
         backup_target=backup_target,
+        max_backups=max_backups,
         force_openai_provider=force_openai_provider,
     )
     allowed_ids = synced_ids if pinned_only else None
@@ -1602,6 +1662,7 @@ def _run_directional_sync(
         target,
         dry_run,
         backup_target=backup_target,
+        max_backups=max_backups,
         preserve_existing_on_conflict=not force_openai_provider,
     )
     rescued = (0, 0, 0)
@@ -1692,6 +1753,12 @@ def main() -> int:
         help="Create a verified SQLite .sync-backup-<timestamp> copy before modifying any target DB",
     )
     parser.add_argument(
+        "--max-backups",
+        type=int,
+        default=DEFAULT_MAX_SYNC_BACKUPS,
+        help=f"Maximum .sync-backup-* files to retain per SQLite DB when --backup-target is set (default: {DEFAULT_MAX_SYNC_BACKUPS}; 0=unlimited)",
+    )
+    parser.add_argument(
         "--rescue-shared-files",
         action="store_true",
         help="Copy missing regular files from real local sessions/archived_sessions/memories/memories_v2 directories into target (skipping existing symlinks/junctions)",
@@ -1702,6 +1769,9 @@ def main() -> int:
         help="Inspect schemas and report what would be synced without writing any file",
     )
     args = parser.parse_args()
+    if args.max_backups < 0:
+        print("[FAIL] --max-backups must be >= 0.", file=sys.stderr)
+        return 1
 
     mode = "DRY-RUN" if args.dry_run else "OK"
     try:
@@ -1716,6 +1786,7 @@ def main() -> int:
             pinned_only=args.pinned_only,
             dry_run=args.dry_run,
             backup_target=args.backup_target,
+            max_backups=args.max_backups,
             rescue_shared=args.rescue_shared_files,
             force_openai_provider=fwd_force_openai,
         )
@@ -1731,6 +1802,7 @@ def main() -> int:
                 pinned_only=args.pinned_only,
                 dry_run=args.dry_run,
                 backup_target=args.backup_target,
+                max_backups=args.max_backups,
                 rescue_shared=args.rescue_shared_files,
                 force_openai_provider=False,
             )

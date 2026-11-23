@@ -675,6 +675,25 @@ elif [ -f "${ROLLBACK_LATEST}" ]; then
   fi
 fi
 
+# ------------------------------------------------------------------------------
+# 9. Resource & Sync-Backup Disk Hygiene (Read-Only)
+# ------------------------------------------------------------------------------
+SYNC_BKP_COUNT=0
+for bdir in "${LANE1_HOME}" "${LANE2_HOME}"; do
+  if [ -d "${bdir}" ] && [ ! -L "${bdir}" ]; then
+    for bf in "${bdir}"/*.sync-backup-*; do
+      if [ -f "${bf}" ] && [ ! -L "${bf}" ]; then
+        SYNC_BKP_COUNT=$((SYNC_BKP_COUNT + 1))
+      fi
+    done
+  fi
+done
+if [ "${SYNC_BKP_COUNT}" -gt 12 ]; then
+  report "WARN" "Resource & Backup Hygiene" "Found ${SYNC_BKP_COUNT} .sync-backup-* file(s); sync-sessions.py rotates to newest 5 per DB (--max-backups 5)"
+else
+  report "PASS" "Resource & Backup Hygiene" "sync-backups=${SYNC_BKP_COUNT} (auto-rotation keeps newest 5 per SQLite DB)"
+fi
+
 printf '\nSummary: %d PASS | %d WARN | %d FAIL\n' "${PASS}" "${WARN}" "${FAIL}"
 if [ "${FAIL}" -gt 0 ]; then
   exit 1

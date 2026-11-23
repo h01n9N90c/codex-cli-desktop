@@ -798,6 +798,7 @@ jobs:
           # + zero plaintext secrets, coexisting with harvested auth.json (0600).
           grep -Fq 'model_provider = "OpenAI"' "${P9_L2}/config.toml"
           grep -Fq 'env_key = "CODEX_CLI_API_KEY"' "${P9_L2}/config.toml"
+          grep -Eq '^CARGO_BUILD_JOBS = "[1-9][0-9]*"$' "${P9_L2}/config.toml"
           grep -Fq 'model = "p9-original"' "${P9_L2}/config.toml"
           grep -Fq '[projects."/tmp/desktop-trusted-proj"]' "${P9_L2}/config.toml"
           grep -Fq '[projects."/tmp/desktop-untrusted-proj"]' "${P9_L2}/config.toml"
@@ -1151,6 +1152,13 @@ jobs:
               def log_message(self, fmt, *args):
                   pass
               def do_GET(self):
+                  if self.path == "/huge/v1/models":
+                      payload = b"A" * 2200000
+                      self.send_response(200)
+                      self.send_header("Content-Length", str(len(payload)))
+                      self.end_headers()
+                      self.wfile.write(payload)
+                      return
                   if self.path == "/redir/v1/models":
                       self.send_response(302)
                       self.send_header("Location", f"http://{self.headers.get('Host')}/leak/v1/models")
@@ -1336,6 +1344,34 @@ jobs:
           fi
           if printf '%s' "${P10_REDIR_OUT}" | grep -Fq "${P10_VALID_KEY}"; then
             echo "[FAIL] Section 10d: redirect probe leaked plaintext key!" >&2; exit 1
+          fi
+          # RESOURCE GUARD: oversized (>2 MiB) HTTP response is safely capped without OOM.
+          P10_ED_HUGE="${P10_DIR}/fake-editor-huge.sh"
+          cat > "${P10_ED_HUGE}" <<EOF
+          #!/usr/bin/env bash
+          cat > "\$1" <<'TOML'
+          model_provider = "HugeMock"
+          sandbox_mode = "workspace-write"
+          
+          [model_providers."HugeMock"]
+          name = "HugeMock"
+          base_url = "http://127.0.0.1:${P10_MOCK_PORT}/huge/v1"
+          wire_api = "responses"
+          env_key = "MOCK_GW_API_KEY"
+          TOML
+          EOF
+          chmod +x "${P10_ED_HUGE}"
+          ./scripts/codex-manager.sh --action api-other \
+            --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" \
+            --editor "${P10_ED_HUGE}" --non-interactive
+          P10_HUGE_OUT="$(
+            MOCK_GW_API_KEY="${P10_VALID_KEY}" \
+            ./scripts/codex-manager.sh --action check-api-key --online-check \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" --non-interactive 2>&1
+          )"
+          printf '%s\n' "${P10_HUGE_OUT}" | grep -Fq 'response >2 MiB truncated'
+          if printf '%s' "${P10_HUGE_OUT}" | grep -Fq "${P10_VALID_KEY}"; then
+            echo "[FAIL] Section 10d: oversized probe leaked plaintext key!" >&2; exit 1
           fi
           # Restore the clean MockLocal provider config used by the following sections.
           ./scripts/codex-manager.sh --action api-other \

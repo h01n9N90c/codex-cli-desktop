@@ -1676,6 +1676,7 @@ Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
         Assert-True ($p12Merged2 -match 'env_key = "CODEX_CLI_API_KEY"') 'Lane 2 config.toml missing env_key = "CODEX_CLI_API_KEY"'
         Assert-True ($p12Merged2 -match 'sandbox_mode = "workspace-write"') 'Lane 2 config.toml missing sandbox_mode = "workspace-write"'
         Assert-True ($p12Merged2 -match 'CODEX_ACTIVE_LANE = "LANE_2"') 'Lane 2 config.toml missing CODEX_ACTIVE_LANE = "LANE_2"'
+        Assert-True ($p12Merged2 -match 'CARGO_BUILD_JOBS = "[1-9][0-9]*"') 'Lane 2 config.toml missing auto-capped CARGO_BUILD_JOBS!'
 
         $p12ProjMapL2 = & $parseProjectSections $p12Merged2
         # 1) Lane 1 genuinely trusted project IS inherited into Lane 2 as trust_level = "trusted".
@@ -2430,7 +2431,11 @@ env_key = "CODEX_P13_PROBE_KEY"
                     while ($Listener.IsListening) {
                         try { $ctx = $Listener.GetContext() } catch { break }
                         try {
-                            if ($ctx.Request.Url.Port -eq $PortA) {
+                            if ($ctx.Request.Url.Port -eq $PortA -and $ctx.Request.RawUrl -like '/huge/*') {
+                                $ctx.Response.StatusCode = 200
+                                $payload = New-Object byte[] (2200000)
+                                for ($bi = 0; $bi -lt $payload.Length; $bi++) { $payload[$bi] = 65 }
+                            } elseif ($ctx.Request.Url.Port -eq $PortA) {
                                 $ctx.Response.StatusCode = 302
                                 $ctx.Response.RedirectLocation = "http://127.0.0.1:$PortB/v1/models"
                                 $payload = [System.Text.Encoding]::UTF8.GetBytes('redirect')
@@ -2461,6 +2466,26 @@ env_key = "CODEX_P13_PROBE_KEY"
                 Assert-True ($res13dRedir.Output -match 'REDIRECT_BLOCKED \(HTTP 302') "CheckApiKey did not report REDIRECT_BLOCKED:`n$($res13dRedir.Output)"
                 Assert-True ([int]$redirState.TargetHits -eq 0) "SECURITY REGRESSION: probe followed a redirect (target hit $($redirState.TargetHits)x, Authorization header seen: '$($redirState.TargetAuth)')!"
                 Assert-True (-not $res13dRedir.Output.Contains($redirKey)) 'CRITICAL: CheckApiKey leaked plaintext API key on redirect probe!'
+
+                # (3) Oversized (>2 MiB) HTTP response is safely capped without OOM.
+                $p13HugeCfg = @"
+model_provider = "hugemock"
+sandbox_mode = "workspace-write"
+
+[model_providers.hugemock]
+name = "HugeMock"
+base_url = "http://127.0.0.1:$redirPortA/huge/v1"
+wire_api = "responses"
+env_key = "CODEX_P13_PROBE_KEY"
+"@
+                [System.IO.File]::WriteAllText($p13Cfg2Path, $p13HugeCfg, (New-Object System.Text.UTF8Encoding($false)))
+                $res13dHuge = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                    '-Action', 'CheckApiKey', '-OnlineCheck', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+                    '-LocalBin', $p13Bin, '-NonInteractive'
+                )
+                Assert-True ($res13dHuge.ExitCode -eq 0) "CheckApiKey online (>2 MiB cap) failed (exit=$($res13dHuge.ExitCode)):`n$($res13dHuge.Output)"
+                Assert-True ($res13dHuge.Output -match 'response >2 MiB truncated') "CheckApiKey did not cap >2 MiB HTTP response:`n$($res13dHuge.Output)"
+                Assert-True (-not $res13dHuge.Output.Contains($redirKey)) 'CRITICAL: CheckApiKey leaked plaintext API key on >2 MiB probe!'
             } finally {
                 try { $redirListener.Stop() } catch {}
                 try { $redirListener.Close() } catch {}

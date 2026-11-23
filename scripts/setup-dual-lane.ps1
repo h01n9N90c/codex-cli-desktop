@@ -227,6 +227,8 @@ param(
     [string]$Lane2Home = (Join-Path $env:USERPROFILE '.codex-official'),
     [string]$LocalBin  = (Join-Path $env:USERPROFILE '.local\bin'),
     [string]$CargoTargetDir = (Join-Path $env:TEMP 'codex-lane2-target'),
+    [ValidateRange(0, 64)]
+    [int]$CargoBuildJobs = 0,
     [string]$OfficialModel = '',
     [string]$OfficialReasoning = '',
     [string]$OfficialServiceTier = '',
@@ -2109,6 +2111,17 @@ if ($targetVol) {
         Write-Warning "Drive ${targetDrive}: has less than 10 GB free ($freeGB GB). For large Rust projects, pass -CargoTargetDir on a drive with more space."
     }
 }
+$effectiveCargoJobs = if ($CargoBuildJobs -gt 0) { $CargoBuildJobs } else { [Math]::Max(1, [Math]::Min(4, [int][Math]::Floor([Environment]::ProcessorCount / 2))) }
+Write-Host ("    Parallel build safety cap: CARGO_BUILD_JOBS={0} (CPU logical cores={1})" -f $effectiveCargoJobs, [Environment]::ProcessorCount)
+try {
+    $osMem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+    if ($osMem -and $osMem.FreePhysicalMemory) {
+        $freeRamGB = [math]::Round(($osMem.FreePhysicalMemory * 1KB) / 1GB, 2)
+        if ($freeRamGB -lt 4) {
+            Write-Warning ("Low free RAM detected ({0} GB free). Running 2 Codex lanes simultaneously with heavy builds may cause OOM; consider closing background apps or lowering -CargoBuildJobs." -f $freeRamGB)
+        }
+    }
+} catch {}
 
 # ============================================================================
 # Step 3: Dynamically Probe Supported Codex Feature Flags
@@ -2598,6 +2611,7 @@ exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*"]
 [shell_environment_policy.set]
 CODEX_ACTIVE_LANE = "LANE_2"
 CARGO_TARGET_DIR = "$(Escape-TomlBasicString $CargoTargetDir)"
+CARGO_BUILD_JOBS = "$effectiveCargoJobs"
 "@
 
 $mergedLane2Config = Merge-CodexConfigToml `
@@ -2958,6 +2972,7 @@ setlocal
 ${utf8Header}set "CODEX_HOME=$cmdLane2Home"
 set "CODEX_ACTIVE_LANE=LANE_2"
 set "CARGO_TARGET_DIR=$cmdCargoDir"
+if not defined CARGO_BUILD_JOBS set "CARGO_BUILD_JOBS=$effectiveCargoJobs"
 set "CODEX_EXE=$cmdCodexExe"
 ${worktreeCdBlock}${windowsAppsRefresh}if exist "%CODEX_EXE%" goto :_dl_exec_codex
 echo [ERROR] Codex binary not found at "%CODEX_EXE%". Re-run setup-dual-lane.ps1. >&2

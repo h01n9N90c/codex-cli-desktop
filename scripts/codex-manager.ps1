@@ -2196,9 +2196,38 @@ function Invoke-OnlineModelsProbe {
                 Write-WarnLine "Online API Key Check: REDIRECT_BLOCKED (HTTP $statusCode; redirects are never followed with an API key) | endpoint=$endpoint"
                 return 1
             }
-            $sr = New-Object System.IO.StreamReader($httpResp.GetResponseStream(), [System.Text.Encoding]::UTF8)
-            try { $body = $sr.ReadToEnd() } finally { $sr.Dispose() }
+            # RESOURCE GUARD: cap response body read at 2 MiB so an oversized/streaming endpoint cannot OOM PowerShell.
+            $maxBodyBytes = 2097152
+            $respStream = $httpResp.GetResponseStream()
+            $ms = New-Object System.IO.MemoryStream
+            $truncated = $false
+            try {
+                $buf = New-Object byte[] 16384
+                $totalRead = 0
+                while ($true) {
+                    $toRead = [Math]::Min($buf.Length, ($maxBodyBytes + 1) - $totalRead)
+                    if ($toRead -le 0) { $truncated = $true; break }
+                    $n = $respStream.Read($buf, 0, $toRead)
+                    if ($n -le 0) { break }
+                    if (($totalRead + $n) -gt $maxBodyBytes) {
+                        $keep = $maxBodyBytes - $totalRead
+                        if ($keep -gt 0) { $ms.Write($buf, 0, $keep) }
+                        $truncated = $true
+                        break
+                    }
+                    $ms.Write($buf, 0, $n)
+                    $totalRead += $n
+                }
+                $body = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+            } finally {
+                $ms.Dispose()
+                if ($null -ne $respStream) { $respStream.Dispose() }
+            }
 
+            if ($truncated) {
+                Write-Ok "Online API Key Check: VALID (HTTP $statusCode, response >2 MiB truncated) | endpoint=$endpoint"
+                return 0
+            }
             $modelCount = 0
             try {
                 $json = $body | ConvertFrom-Json -ErrorAction Stop

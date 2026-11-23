@@ -1629,20 +1629,27 @@ req = urllib.request.Request(
 try:
     with opener.open(req, timeout=10) as resp:
         code = resp.getcode()
-        body = resp.read().decode("utf-8", errors="replace")
-        n_models = None
-        try:
-            parsed = json.loads(body)
-            if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
-                n_models = len(parsed["data"])
-            elif isinstance(parsed, list):
-                n_models = len(parsed)
-        except Exception:
-            pass
-        if n_models is not None:
-            print(f"VALID (HTTP {code}, {n_models} models)")
+        # RESOURCE GUARD: cap response body read at 2 MiB so an oversized/streaming endpoint cannot OOM Python.
+        max_bytes = 2 * 1024 * 1024
+        raw = resp.read(max_bytes + 1)
+        truncated = len(raw) > max_bytes
+        if truncated:
+            print(f"VALID (HTTP {code}, response >2 MiB truncated)")
         else:
-            print(f"VALID (HTTP {code})")
+            body = raw.decode("utf-8", errors="replace")
+            n_models = None
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
+                    n_models = len(parsed["data"])
+                elif isinstance(parsed, list):
+                    n_models = len(parsed)
+            except Exception:
+                pass
+            if n_models is not None:
+                print(f"VALID (HTTP {code}, {n_models} models)")
+            else:
+                print(f"VALID (HTTP {code})")
 except urllib.error.HTTPError as e:
     if e.code in (401, 403):
         print(f"INVALID/EXPIRED (HTTP {e.code})")

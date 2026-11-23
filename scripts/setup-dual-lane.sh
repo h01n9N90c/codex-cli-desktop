@@ -105,6 +105,7 @@ Environment overrides:
   CODEX_LANE2_HOME            Secondary CODEX_HOME (CLI: Login + API Key, default: ~/.codex-official)
   CODEX_LOCAL_BIN             Launcher install directory (default: ~/.local/bin)
   CODEX_CARGO_TARGET_DIR      Isolated Rust Cargo target dir for Lane 2
+  CODEX_CARGO_BUILD_JOBS      Safe Cargo parallel jobs cap for Lane 2 (auto: max(1, min(4, nproc/2)))
   CODEX_CLI_MODE              Default Lane 2 CLI mode ('ask', 'config', or 'full-access')
   CODEX_APPROVAL_POLICY       Default approval policy ('on-request' or 'never')
   CODEX_SANDBOX_NETWORK       Default sandbox network flag ('false' or 'true')
@@ -494,6 +495,7 @@ LANE1_HOME="${CODEX_LANE1_HOME:-${HOME}/.codex}"
 LANE2_HOME="${CODEX_LANE2_HOME:-${HOME}/.codex-official}"
 LOCAL_BIN="${CODEX_LOCAL_BIN:-${HOME}/.local/bin}"
 CARGO_TARGET_LANE2="${CODEX_CARGO_TARGET_DIR:-${SAFE_TMPDIR}/codex-lane2-target}"
+CARGO_BUILD_JOBS_OPT="${CODEX_CARGO_BUILD_JOBS:-}"
 CLI_MODE="${CODEX_CLI_MODE:-ask}"
 CONFIRM_FULL_ACCESS=0
 APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-on-request}"
@@ -535,6 +537,11 @@ while [ "$#" -gt 0 ]; do
     --approval-policy)
       require_arg "$1" "$#"
       APPROVAL_POLICY="$2"
+      shift 2
+      ;;
+    --cargo-build-jobs)
+      require_arg "$1" "$#"
+      CARGO_BUILD_JOBS_OPT="$2"
       shift 2
       ;;
     --allow-sandbox-network)
@@ -1031,6 +1038,19 @@ else
 fi
 ESC_REPO="$(escape_toml "${REPO_PATH}")"
 ESC_LANE2_REPO="$(escape_toml "${EFFECTIVE_LANE2_REPO}")"
+if [ -n "${CARGO_BUILD_JOBS_OPT}" ]; then
+  if ! printf '%s' "${CARGO_BUILD_JOBS_OPT}" | grep -Eq '^[1-9][0-9]*$' || [ "${CARGO_BUILD_JOBS_OPT}" -gt 64 ]; then
+    echo "[FAIL] --cargo-build-jobs must be an integer between 1 and 64 (got '${CARGO_BUILD_JOBS_OPT}')." >&2
+    exit 1
+  fi
+  EFFECTIVE_CARGO_JOBS="${CARGO_BUILD_JOBS_OPT}"
+else
+  _cpu_cnt="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  if ! printf '%s' "${_cpu_cnt}" | grep -Eq '^[1-9][0-9]*$'; then _cpu_cnt=4; fi
+  EFFECTIVE_CARGO_JOBS=$(( _cpu_cnt / 2 ))
+  [ "${EFFECTIVE_CARGO_JOBS}" -lt 1 ] && EFFECTIVE_CARGO_JOBS=1
+  [ "${EFFECTIVE_CARGO_JOBS}" -gt 4 ] && EFFECTIVE_CARGO_JOBS=4
+fi
 ESC_CARGO="$(escape_toml "${CARGO_TARGET_LANE2}")"
 ESC_GW_PROV="$(escape_toml "${GATEWAY_PROVIDER}")"
 ESC_GW_URL="$(escape_toml "${GATEWAY_BASE_URL}")"
@@ -1899,6 +1919,7 @@ render_lane2_config() {
   printf '[shell_environment_policy.set]\n'
   printf 'CODEX_ACTIVE_LANE = "LANE_2"\n'
   printf 'CARGO_TARGET_DIR = "%s"\n' "${ESC_CARGO}"
+  printf 'CARGO_BUILD_JOBS = "%s"\n' "${EFFECTIVE_CARGO_JOBS}"
   if [ -n "${PRESERVED_USER_SECTIONS}" ]; then
     printf '\n# Preserved existing sections\n%s\n' "${PRESERVED_USER_SECTIONS}"
   fi
@@ -2094,6 +2115,7 @@ render_lane2_wrapper() {
   printf 'export CODEX_HOME=%s\n' "${Q_LANE2_HOME}"
   printf 'export CODEX_ACTIVE_LANE=%s\n' "'LANE_2'"
   printf 'export CARGO_TARGET_DIR=%s\n' "${Q_CARGO_TARGET}"
+  printf ': "${CARGO_BUILD_JOBS:=%s}"; export CARGO_BUILD_JOBS\n' "${EFFECTIVE_CARGO_JOBS}"
   if [ "${USE_GIT_WORKTREE}" -eq 1 ] && [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ]; then
     printf 'export CODEX_PRIMARY_REPO=%s\n' "${Q_PRIMARY_REPO}"
     printf 'export CODEX_LANE2_WORKTREE=%s\n' "${Q_LANE2_REPO}"
