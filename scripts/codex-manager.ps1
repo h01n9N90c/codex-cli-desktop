@@ -562,7 +562,7 @@ function Get-FileAclStatus([string]$FilePath) {
 
 function Get-ProtectedRollbackBackupNames([string]$ParentDir) {
     $protected = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    if ([string]::IsNullOrWhiteSpace($ParentDir)) { return $protected }
+    if ([string]::IsNullOrWhiteSpace($ParentDir)) { return ,$protected }
     $rbDir = Join-Path $ParentDir '.rollback'
     foreach ($mf in @((Join-Path $rbDir 'latest.json'), (Join-Path $rbDir 'manifest.env'))) {
         if ((Test-Path -LiteralPath $mf -PathType Leaf) -and (-not (Test-IsReparsePoint $mf))) {
@@ -572,7 +572,7 @@ function Get-ProtectedRollbackBackupNames([string]$ParentDir) {
             }
         }
     }
-    return $protected
+    return ,$protected
 }
 
 function Rotate-FileBackups([string]$BaseFilePath, [int]$MaxKeep = 5) {
@@ -585,7 +585,7 @@ function Rotate-FileBackups([string]$BaseFilePath, [int]$MaxKeep = 5) {
         Get-ChildItem -LiteralPath $parent -File -ErrorAction SilentlyContinue |
         Where-Object {
             (-not (Test-IsReparsePoint $_.FullName)) -and
-            (-not $protectedNames.Contains($_.Name)) -and
+            (-not ($null -ne $protectedNames -and $protectedNames.Contains($_.Name))) -and
             ($_.Name.StartsWith("$leaf.backup-", [System.StringComparison]::OrdinalIgnoreCase) -or
              $_.Name.StartsWith("$leaf.pre-", [System.StringComparison]::OrdinalIgnoreCase))
         } |
@@ -3139,8 +3139,9 @@ Add-Type -AssemblyName System.Windows.Forms
 $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
 $dlg.Description = 'Chon thu muc du an (Project Directory) de chay Codex CLI:'
 $dlg.ShowNewFolderButton = $true
-if ($args.Count -ge 1 -and -not [string]::IsNullOrWhiteSpace($args[0]) -and (Test-Path -LiteralPath $args[0] -PathType Container)) {
-    $dlg.SelectedPath = $args[0]
+$initDir = $env:CODEX_FOLDER_PICKER_INIT
+if (-not [string]::IsNullOrWhiteSpace($initDir) -and (Test-Path -LiteralPath $initDir -PathType Container)) {
+    $dlg.SelectedPath = $initDir
 }
 $topForm = New-Object System.Windows.Forms.Form
 $topForm.TopMost = $true
@@ -3159,16 +3160,29 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullO
     Write-Output $dlg.SelectedPath
 }
 '@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($staCode))
     $prevPref = $ErrorActionPreference
+    $hadPrevInit = Test-Path Env:CODEX_FOLDER_PICKER_INIT
+    $prevInit = if ($hadPrevInit) { $env:CODEX_FOLDER_PICKER_INIT } else { $null }
     try {
         $ErrorActionPreference = 'Continue'
-        $outLines = @(& $script:CurrentPsExe -NoProfile -Sta -ExecutionPolicy Bypass -Command $staCode -args @($InitialDir) 2>$null)
+        if ([string]::IsNullOrWhiteSpace($InitialDir)) {
+            Remove-Item Env:CODEX_FOLDER_PICKER_INIT -ErrorAction SilentlyContinue
+        } else {
+            $env:CODEX_FOLDER_PICKER_INIT = $InitialDir
+        }
+        $outLines = @(& $script:CurrentPsExe -NoProfile -STA -ExecutionPolicy Bypass -EncodedCommand $encoded 2>$null)
         $picked = ($outLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
         if ($null -ne $picked) { return ([string]$picked).Trim() }
         return ''
     } catch {
         return ''
     } finally {
+        if ($hadPrevInit) {
+            $env:CODEX_FOLDER_PICKER_INIT = $prevInit
+        } else {
+            Remove-Item Env:CODEX_FOLDER_PICKER_INIT -ErrorAction SilentlyContinue
+        }
         $ErrorActionPreference = $prevPref
         $global:LASTEXITCODE = 0
     }

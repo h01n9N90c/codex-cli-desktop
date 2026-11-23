@@ -66,15 +66,25 @@ while keeping GPT 1 (Codex Desktop: ~/.codex) and 100% of chat history safe.
 
 Options:
   --action ACTION        Action to execute (default: menu):
-                           menu            Interactive Control Center menu
-                           api-gpt         Configure OpenAI / GPT API Key for Sandbox 2
-                           api-other       Configure Third-Party / Custom Provider (opens config.toml)
-                           login           Official OpenAI / ChatGPT login for Sandbox 2
-                           check-api-key   Inspect Sandbox 2 API key sources (masked) + optional live probe
-                           check-accounts  Read-only inspection of GPT 1 & Sandbox 2 accounts/health
-                           sync-history    Bidirectional chat history sync (GPT 1 <-> Sandbox 2)
-                           remove-sandbox2 Safe uninstall Sandbox 2 WITHOUT deleting chat history
-                           set-cli-mode    Configure Sandbox 2 CLI permission mode (ask | config | full-access)
+                           menu              Interactive Control Center menu
+                           api-gpt           Configure OpenAI / GPT API Key for Sandbox 2
+                           api-other         Configure Third-Party / Custom Provider (opens config.toml)
+                           quick-third-party 1-touch Third-Party Gateway wizard (Base URL + Model + Key)
+                           login             Official OpenAI / ChatGPT login for Sandbox 2
+                           check-api-key     Inspect Sandbox 2 API key sources (masked) + optional live probe
+                           check-accounts    Read-only inspection of GPT 1 & Sandbox 2 accounts/health
+                           sync-history      Bidirectional chat history sync (GPT 1 <-> Sandbox 2)
+                           remove-sandbox2   Safe uninstall Sandbox 2 WITHOUT deleting chat history
+                           set-cli-mode      Configure Sandbox 2 CLI permission mode (ask | config | full-access)
+                           launch            1-touch launch Sandbox 2 Codex CLI in active project directory
+                           cleanup-storage   Compact SQLite DBs/WALs, rotate old backups, clean temp files
+  --repo-path PATH       Active project directory for menu/launch (alias: --repo)
+  --base-url URL         With quick-third-party: custom gateway base_url
+  --model NAME           With quick-third-party: default model name
+  --reasoning-effort LVL With quick-third-party: reasoning effort (default: high)
+  --provider-name NAME   With quick-third-party: provider section name (default: custom_gw)
+  --env-key NAME         With quick-third-party: API key env var name (default: CODEX_CLI_API_KEY)
+  --max-backups N        Max backups to keep per family during sync/cleanup-storage (default: 5)
   --lane1-home PATH      GPT 1 / Desktop CODEX_HOME (default: $CODEX_LANE1_HOME or ~/.codex)
   --lane2-home PATH      Sandbox 2 / CLI CODEX_HOME (default: $CODEX_LANE2_HOME or ~/.codex-official)
   --local-bin PATH       CLI wrapper directory (default: $CODEX_LOCAL_BIN or ~/.local/bin)

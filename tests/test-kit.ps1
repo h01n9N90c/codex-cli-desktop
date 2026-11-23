@@ -2897,7 +2897,52 @@ theme = "dark"
             $global:LASTEXITCODE = 0
             Assert-True ($launchDryExit -eq 0 -and (($res13gLaunchDry -join "`n") -match 'CARGO_BUILD_JOBS=')) "START-CODEX.cmd Launch -DryRun failed (exit=$launchDryExit):`n$($res13gLaunchDry -join "`n")"
 
-            Write-Host "    [OK] Stage 13g verified (SetCliMode Ask/Config/FullAccess fail-closed gate, setup -CliMode Config/FullAccess, native [features] preservation, doctor.ps1 CLI mode audit, and v1.5 QuickThirdParty + Mandatory Project Selection + CleanupStorage + START-CODEX.cmd)" -ForegroundColor Green
+            # (ix) v1.5 QA Regressions:
+            #      - Fresh Lane2Home WITHOUT .rollback\latest.json (empty HashSet unrolling regression in Get-ProtectedRollbackBackupNames / Rotate-FileBackups):
+            $p13gFreshL2 = Get-CanonicalLongPath -Path (Join-Path $tmpRoot 'p13g fresh lane 2 no rollback')
+            New-Item -ItemType Directory -Path $p13gFreshL2 -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $p13gFreshL2 'config.toml'), "model = `"gpt-5.4`"`r`n", (New-Object System.Text.UTF8Encoding($false)))
+            [System.IO.File]::WriteAllText((Join-Path $p13gFreshL2 'auth.json'), '{"auth_mode":"chatgpt"}', (New-Object System.Text.UTF8Encoding($false)))
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $p13gFreshL2 '.rollback\latest.json'))) 'Fresh Lane2Home test fixture must NOT have .rollback\latest.json!'
+
+            $res13gFreshQuick = & $invokePsWithStdin $ManagerScript @(
+                '-Action', 'QuickThirdParty', '-RepoPath', $p13gRepo,
+                '-BaseUrl', 'https://api.fresh-norel.example/v1', '-Model', 'gpt-6.1-sol',
+                '-ReasoningEffort', 'high', '-ProviderName', 'OpenAI', '-EnvKeyName', 'TEST_FRESH_GW_KEY',
+                '-ApiKeyFromStdin', '-SkipUserEnvPersist', '-NonInteractive',
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gFreshL2, '-LocalBin', $p13gBin
+            ) 'sk-FRESH-NO-ROLLBACK-HASHSET-TEST-KEY-123456'
+            Assert-True ($res13gFreshQuick.ExitCode -eq 0) "QuickThirdParty on fresh Lane2Home without .rollback\latest.json failed (exit=$($res13gFreshQuick.ExitCode)):`n$($res13gFreshQuick.Output)"
+
+            $res13gFreshClean = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'CleanupStorage', '-NonInteractive',
+                '-Lane1Home', $p13gL1, '-Lane2Home', $p13gFreshL2, '-LocalBin', $p13gBin
+            )
+            Assert-True ($res13gFreshClean.ExitCode -eq 0) "CleanupStorage on fresh Lane2Home without .rollback\latest.json failed (exit=$($res13gFreshClean.ExitCode)):`n$($res13gFreshClean.Output)"
+
+            #      - START-CODEX.cmd must propagate non-zero exit code from failing CLI args (outside-parens %ERRORLEVEL% regression):
+            $prevEapStartFail = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $res13gStartFail = & $startCmdPath -Action Launch -NonInteractive -Lane1Home $p13gL1 -Lane2Home $p13gL2 -LocalBin $p13gBin 2>&1
+                $startFailExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prevEapStartFail
+                $global:LASTEXITCODE = 0
+            }
+            Assert-True ($startFailExit -ne 0) "START-CODEX.cmd MUST propagate non-zero exit code on failing CLI args (got exit=$startFailExit):`n$($res13gStartFail -join "`n")"
+
+            #      - START-CODEX.cmd delayed expansion safety for ACTIVE_PROJ with '&' + Invoke-WindowsFolderBrowserDialog -EncodedCommand & CODEX_FOLDER_PICKER_INIT:
+            $startCmdRaw = [System.IO.File]::ReadAllText($startCmdPath, [System.Text.Encoding]::UTF8)
+            Assert-True ($startCmdRaw -match 'EnableDelayedExpansion' -and $startCmdRaw -match '!ACTIVE_PROJ!') 'START-CODEX.cmd must use EnableDelayedExpansion and !ACTIVE_PROJ! when echoing ACTIVE_PROJ!'
+            Assert-True ($startCmdRaw -notmatch '(?im)^\s*echo\b.*%ACTIVE_PROJ%') 'START-CODEX.cmd must NOT echo unquoted %ACTIVE_PROJ% (breaks on paths with &)!'
+
+            $mgrRaw13g = [System.IO.File]::ReadAllText($ManagerScript, [System.Text.Encoding]::UTF8)
+            $dlgMatch = [regex]::Match($mgrRaw13g, '(?s)function\s+Invoke-WindowsFolderBrowserDialog\b.*?(?=\r?\nfunction\s+)')
+            Assert-True ($dlgMatch.Success) 'Could not locate Invoke-WindowsFolderBrowserDialog in codex-manager.ps1!'
+            Assert-True ($dlgMatch.Value -match '-EncodedCommand' -and $dlgMatch.Value -match 'CODEX_FOLDER_PICKER_INIT') 'Invoke-WindowsFolderBrowserDialog must use -EncodedCommand and CODEX_FOLDER_PICKER_INIT (no unquoted -Command -args)!'
+
+            Write-Host "    [OK] Stage 13g verified (SetCliMode Ask/Config/FullAccess fail-closed gate, setup -CliMode Config/FullAccess, native [features] preservation, doctor.ps1 CLI mode audit, and v1.5 QuickThirdParty + Mandatory Project Selection + CleanupStorage + START-CODEX.cmd + v1.5 QA regressions)" -ForegroundColor Green
         } finally {
             Remove-TempTreeSafely -RootDir $null -Lane2Dir $p13gL2
         }

@@ -9,11 +9,11 @@ REM ============================================================================
 set "KIT_DIR=%~dp0"
 if "%KIT_DIR:~-1%"=="\" set "KIT_DIR=%KIT_DIR:~0,-1%"
 
-if not "%~1"=="" (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%KIT_DIR%\scripts\codex-manager.ps1" %*
-    exit /b %ERRORLEVEL%
-)
+if "%~1"=="" goto :interactive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%KIT_DIR%\scripts\codex-manager.ps1" %*
+exit /b %ERRORLEVEL%
 
+:interactive
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%KIT_DIR%\scripts\codex-manager.ps1"
 set "RC=%ERRORLEVEL%"
 
@@ -36,7 +36,9 @@ if not defined ACTIVE_PROJ set "ACTIVE_PROJ=%CD%"
 
 echo.
 echo ========================================================================
-echo   Terminal lam viec da mo san tai du an: %ACTIVE_PROJ%
+setlocal EnableDelayedExpansion
+echo   Terminal lam viec da mo san tai du an: !ACTIVE_PROJ!
+endlocal
 echo   Go 'codex' de chay Sandbox 2 CLI  ^|  Go 'codex-manage' de mo lai Menu
 echo ========================================================================
 echo.

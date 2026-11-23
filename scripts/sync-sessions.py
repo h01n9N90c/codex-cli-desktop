@@ -1542,7 +1542,7 @@ def compact_codex_home_storage(
     protected_backup_names: set[str] = set()
     rb_dir = Path(home_dir) / ".rollback"
     if rb_dir.is_dir() and not _is_reparse_or_symlink(rb_dir):
-        for mf_name in ("latest.json", "manifest.env"):
+        for mf_name in ("latest.json", "manifest.env", "latest.tsv"):
             mf_path = rb_dir / mf_name
             if mf_path.is_file() and not _is_reparse_or_symlink(mf_path):
                 try:
@@ -1641,15 +1641,20 @@ def compact_codex_home_storage(
 
             # 1) Bounded log table rotation in logs_*.sqlite (keep newest 200 rows).
             if prefix == "logs" and "logs" in tables:
-                cols = get_columns(conn, "logs") if "logs" in ALLOWED_TABLES else []
-                row_cnt = int(conn.execute('SELECT COUNT(*) FROM "logs"').fetchone()[0])
-                if row_cnt > 200:
-                    conn.execute("BEGIN IMMEDIATE")
-                    conn.execute(
-                        'DELETE FROM "logs" WHERE rowid NOT IN (SELECT rowid FROM "logs" ORDER BY rowid DESC LIMIT 200)'
-                    )
-                    conn.execute("COMMIT")
-                    did_prune_rows = True
+                try:
+                    row_cnt = int(conn.execute('SELECT COUNT(*) FROM "logs"').fetchone()[0])
+                    if row_cnt > 200:
+                        conn.execute("BEGIN IMMEDIATE")
+                        conn.execute(
+                            'DELETE FROM "logs" WHERE rowid NOT IN (SELECT rowid FROM "logs" ORDER BY rowid DESC LIMIT 200)'
+                        )
+                        conn.execute("COMMIT")
+                        did_prune_rows = True
+                except sqlite3.Error:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
 
             # 2) Bounded projection-cache pruning in thread_history_*.sqlite when file exceeds 32 MiB:
             #    preserves 100% of pinned threads + 25 most recently updated threads from state_*.sqlite
@@ -1689,20 +1694,37 @@ def compact_codex_home_storage(
                 if keep_thread_ids and "thread_items" in tables:
                     placeholders = ", ".join(["?"] * len(keep_thread_ids))
                     keep_params = list(keep_thread_ids)
-                    conn.execute("BEGIN IMMEDIATE")
-                    for hist_tbl in (
-                        "thread_items",
-                        "thread_turns",
-                        "thread_history_projection_state",
-                        "thread_realtime_items",
-                    ):
-                        if hist_tbl in tables:
-                            conn.execute(
-                                f'DELETE FROM "{hist_tbl}" WHERE thread_id NOT IN ({placeholders})',
-                                keep_params,
-                            )
-                    conn.execute("COMMIT")
-                    did_prune_rows = True
+                    try:
+                        prunable_tables: list[str] = []
+                        for hist_tbl in (
+                            "thread_items",
+                            "thread_turns",
+                            "thread_history_projection_state",
+                            "thread_realtime_items",
+                        ):
+                            if hist_tbl not in tables:
+                                continue
+                            tbl_cols = {
+                                str(row[1])
+                                for row in conn.execute(f'PRAGMA table_info("{hist_tbl}")').fetchall()
+                                if row and len(row) > 1
+                            }
+                            if "thread_id" in tbl_cols:
+                                prunable_tables.append(hist_tbl)
+                        if prunable_tables:
+                            conn.execute("BEGIN IMMEDIATE")
+                            for hist_tbl in prunable_tables:
+                                conn.execute(
+                                    f'DELETE FROM "{hist_tbl}" WHERE thread_id NOT IN ({placeholders})',
+                                    keep_params,
+                                )
+                            conn.execute("COMMIT")
+                            did_prune_rows = True
+                    except sqlite3.Error:
+                        try:
+                            conn.rollback()
+                        except sqlite3.Error:
+                            pass
 
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.execute("PRAGMA optimize")

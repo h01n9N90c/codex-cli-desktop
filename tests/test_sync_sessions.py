@@ -1895,6 +1895,105 @@ class TestSyncSessionsSafetyAndUpsert(unittest.TestCase):
         lines = list(sync_mod._iter_bounded_lines(idx1, max_chars=512))
         self.assertEqual(len(lines), 2)
 
+    def test_storage_compaction_protects_unix_rollback_latest_tsv_backups(self) -> None:
+        """
+        WHAT: Verifies `compact_codex_home_storage` scans `.rollback/latest.tsv`
+              (Unix rollback manifest) and never deletes backup filenames pinned
+              therein even when they are the oldest files beyond `max_backups`.
+        PREVENTS: Storage compaction pruning Unix rollback-pinned backups and
+                  breaking `restore-original.sh`.
+        """
+        rb_dir = Path(self.lane2, ".rollback")
+        rb_dir.mkdir(parents=True, exist_ok=True)
+        pinned_cfg = "config.toml.backup-20261123-120000"
+        pinned_auth = "auth.json.pre-20261123-120000"
+        (rb_dir / "latest.tsv").write_text(
+            f"FILE\t{self.lane2}/config.toml\t{self.lane2}/{pinned_cfg}\n"
+            f"FILE\t{self.lane2}/auth.json\t{self.lane2}/{pinned_auth}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        # Create 5 backups per family where index 0 is the oldest AND pinned in latest.tsv.
+        for idx in range(5):
+            cfg_name = pinned_cfg if idx == 0 else f"config.toml.backup-20261123-12000{idx}"
+            auth_name = pinned_auth if idx == 0 else f"auth.json.pre-20261123-12000{idx}"
+            for fname in (cfg_name, auth_name):
+                fpath = Path(self.lane2, fname)
+                fpath.write_text(f"backup-{idx}\n", encoding="utf-8")
+                ts_ns = (1700002000 + idx * 10) * 1_000_000_000
+                os.utime(fpath, ns=(ts_ns, ts_ns))
+
+        stats = sync_mod.compact_codex_home_storage(self.lane2, max_backups=2, dry_run=False)
+        # 4 non-pinned backups per family -> keep 2 newest, prune 2 per family = 4 pruned total.
+        self.assertEqual(stats["backups_pruned"], 4)
+        self.assertTrue(Path(self.lane2, pinned_cfg).is_file())
+        self.assertTrue(Path(self.lane2, pinned_auth).is_file())
+        self.assertEqual(len(list(Path(self.lane2).glob("config.toml.backup-*"))), 3)
+        self.assertEqual(len(list(Path(self.lane2).glob("auth.json.pre-*"))), 3)
+
+    def test_storage_compaction_tolerates_logs_without_rowid_and_thread_history_schema_drift(self) -> None:
+        """
+        WHAT: Verifies `compact_codex_home_storage` tolerates schema drift in both
+              `logs_*.sqlite` (`WITHOUT ROWID` table lacking `rowid`) and
+              `thread_history_*.sqlite` (table missing `thread_id` column) without
+              aborting compaction or skipping WAL checkpoint / VACUUM.
+        PREVENTS: Schema evolution in Codex auxiliary SQLite DBs from breaking
+                  storage compaction or leaving uncheckpointed WALs behind.
+        """
+        # Seed state_5.sqlite in lane2 with a pinned thread so thread_history pruning has keep_thread_ids.
+        c_st = sqlite3.connect(self.st2)
+        c_st.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("t-keep-pin", "Pinned", 1, None, None, None, None, "openai", "on-request", "C:\\x", 10, 1),
+        )
+        c_st.commit()
+        c_st.close()
+
+        # 1) Create logs_1.sqlite with a WITHOUT ROWID `logs` table (>200 rows) in WAL mode.
+        logs_db = Path(self.lane2, "logs_1.sqlite")
+        c_logs = sqlite3.connect(str(logs_db))
+        c_logs.execute("PRAGMA journal_mode=WAL")
+        c_logs.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, msg TEXT) WITHOUT ROWID")
+        c_logs.executemany("INSERT INTO logs VALUES (?, ?)", [(i, f"entry-{i}") for i in range(210)])
+        c_logs.commit()
+        c_logs.close()
+
+        # 2) Create thread_history_1.sqlite (>32 MiB) where `thread_turns` lacks `thread_id`.
+        hist_db = Path(self.lane2, "thread_history_1.sqlite")
+        c_hist = sqlite3.connect(str(hist_db))
+        c_hist.execute("CREATE TABLE thread_items (id TEXT PRIMARY KEY, thread_id TEXT, payload BLOB)")
+        c_hist.execute("CREATE TABLE thread_turns (turn_id TEXT PRIMARY KEY, body TEXT)")
+        c_hist.execute("INSERT INTO thread_items VALUES (?, ?, ?)", ("item-keep", "t-keep-pin", b"keep"))
+        chunk = b"Z" * (1024 * 1024)
+        c_hist.executemany(
+            "INSERT INTO thread_items VALUES (?, ?, ?)",
+            [(f"item-stale-{i}", "t-stale-old", chunk) for i in range(34)],
+        )
+        c_hist.execute("INSERT INTO thread_turns VALUES (?, ?)", ("turn-1", "schema-drift-row"))
+        c_hist.commit()
+        c_hist.close()
+        self.assertGreater(hist_db.stat().st_size, 32 * 1024 * 1024)
+
+        stats = sync_mod.compact_codex_home_storage(self.lane2, max_backups=3, dry_run=False)
+        # state_5.sqlite + logs_1.sqlite + thread_history_1.sqlite must all complete compaction.
+        self.assertGreaterEqual(stats["dbs_compacted"], 3)
+        self.assertGreater(stats["bytes_reclaimed"], 0)
+
+        # Verify logs_1.sqlite survived WITHOUT ROWID error and still completed WAL checkpoint.
+        c_logs_after = sqlite3.connect(str(logs_db))
+        self.assertEqual(c_logs_after.execute('SELECT COUNT(*) FROM "logs"').fetchone()[0], 210)
+        c_logs_after.close()
+
+        # Verify thread_history_1.sqlite pruned stale thread_items, kept pinned, skipped schema-drifted thread_turns, and vacuumed.
+        c_hist_after = sqlite3.connect(str(hist_db))
+        remaining_items = c_hist_after.execute("SELECT id, thread_id FROM thread_items").fetchall()
+        remaining_turns = c_hist_after.execute("SELECT turn_id, body FROM thread_turns").fetchall()
+        c_hist_after.close()
+        self.assertEqual(remaining_items, [("item-keep", "t-keep-pin")])
+        self.assertEqual(remaining_turns, [("turn-1", "schema-drift-row")])
+        self.assertLess(hist_db.stat().st_size, 1024 * 1024)
+
 
 if __name__ == "__main__":
     unittest.main()
