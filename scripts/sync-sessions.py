@@ -1516,6 +1516,7 @@ def compact_codex_home_storage(
     *,
     max_backups: int = DEFAULT_MAX_SYNC_BACKUPS,
     dry_run: bool = False,
+    fast: bool = False,
 ) -> dict[str, int]:
     """
     Safely compact and bound disk (ROM) and SQLite WAL usage inside `home_dir`
@@ -1613,7 +1614,8 @@ def compact_codex_home_storage(
         except (OSError, ValueError):
             continue
 
-    for prefix in ("state", "goals", "logs", "thread_history"):
+    db_prefixes = ("state", "goals", "logs") if fast else ("state", "goals", "logs", "thread_history")
+    for prefix in db_prefixes:
         db_file = find_latest_versioned_db(home_dir, prefix)
         if not db_file:
             continue
@@ -1639,17 +1641,25 @@ def compact_codex_home_storage(
             tables = get_tables(conn)
             did_prune_rows = False
 
+            if fast:
+                # Fast non-blocking pass for 1-Touch QuickThirdParty / Launch:
+                # never block on multi-hundred-MiB DELETE/VACUUM.
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                dbs_compacted += 1
+                continue
+
             # 1) Bounded log table rotation in logs_*.sqlite (keep newest 200 rows).
             if prefix == "logs" and "logs" in tables:
                 try:
                     row_cnt = int(conn.execute('SELECT COUNT(*) FROM "logs"').fetchone()[0])
                     if row_cnt > 200:
                         conn.execute("BEGIN IMMEDIATE")
-                        conn.execute(
+                        cur = conn.execute(
                             'DELETE FROM "logs" WHERE rowid NOT IN (SELECT rowid FROM "logs" ORDER BY rowid DESC LIMIT 200)'
                         )
                         conn.execute("COMMIT")
-                        did_prune_rows = True
+                        if cur.rowcount and cur.rowcount > 0:
+                            did_prune_rows = True
                 except sqlite3.Error:
                     try:
                         conn.rollback()
@@ -1712,14 +1722,18 @@ def compact_codex_home_storage(
                             if "thread_id" in tbl_cols:
                                 prunable_tables.append(hist_tbl)
                         if prunable_tables:
+                            deleted_rows = 0
                             conn.execute("BEGIN IMMEDIATE")
                             for hist_tbl in prunable_tables:
-                                conn.execute(
+                                cur = conn.execute(
                                     f'DELETE FROM "{hist_tbl}" WHERE thread_id NOT IN ({placeholders})',
                                     keep_params,
                                 )
+                                if cur.rowcount and cur.rowcount > 0:
+                                    deleted_rows += cur.rowcount
                             conn.execute("COMMIT")
-                            did_prune_rows = True
+                            if deleted_rows > 0:
+                                did_prune_rows = True
                     except sqlite3.Error:
                         try:
                             conn.rollback()
@@ -1730,7 +1744,11 @@ def compact_codex_home_storage(
             conn.execute("PRAGMA optimize")
             free_row = conn.execute("PRAGMA freelist_count").fetchone()
             free_pages = int(free_row[0]) if free_row and free_row[0] is not None else 0
-            if did_prune_rows or free_pages >= SQLITE_VACUUM_MIN_FREE_PAGES:
+            # Avoid rewriting massive (>256 MiB) databases if no rows were actually deleted.
+            allow_vacuum = did_prune_rows or (
+                free_pages >= SQLITE_VACUUM_MIN_FREE_PAGES and before_sz <= 256 * 1024 * 1024
+            )
+            if allow_vacuum:
                 conn.execute("VACUUM")
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             dbs_compacted += 1
@@ -3139,6 +3157,11 @@ def main() -> int:
         help="Compact target SQLite WAL/free pages and prune excess rotated backups & temp files to bound disk/RAM usage",
     )
     parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="With --compact-storage: run fast non-blocking backup/tmp rotation + PASSIVE WAL checkpoint (skips slow VACUUM on huge DBs)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Inspect schemas and report what would be synced without writing any file",
@@ -3195,11 +3218,11 @@ def main() -> int:
 
         if args.compact_storage:
             fwd_stats["compaction"] = compact_codex_home_storage(
-                args.lane2, max_backups=args.max_backups, dry_run=args.dry_run
+                args.lane2, max_backups=args.max_backups, dry_run=args.dry_run, fast=args.fast
             )
             if args.bidirectional and rev_stats is not None:
                 rev_stats["compaction"] = compact_codex_home_storage(
-                    args.lane1, max_backups=args.max_backups, dry_run=args.dry_run
+                    args.lane1, max_backups=args.max_backups, dry_run=args.dry_run, fast=args.fast
                 )
 
         if args.bidirectional and rev_stats is not None:

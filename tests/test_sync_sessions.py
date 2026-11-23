@@ -1994,6 +1994,63 @@ class TestSyncSessionsSafetyAndUpsert(unittest.TestCase):
         self.assertEqual(remaining_turns, [("turn-1", "schema-drift-row")])
         self.assertLess(hist_db.stat().st_size, 1024 * 1024)
 
+    def test_storage_compaction_fast_mode_skips_heavy_thread_history_vacuum(self) -> None:
+        """
+        WHAT: Verifies `compact_codex_home_storage(..., fast=True)` and CLI
+              `--compact-storage --fast` still rotate excess backups and prune
+              `.tmp` files while skipping slow `thread_history_*.sqlite` pruning
+              and full `VACUUM`.
+        PREVENTS: 1-Touch QuickThirdParty / Launch from freezing for minutes on
+                  multi-hundred-MiB `thread_history_*.sqlite` databases.
+        """
+        for idx in range(5):
+            bkp = Path(self.lane2) / f"config.toml.backup-20261120-00000{idx}"
+            bkp.write_text(f"v={idx}\n", encoding="utf-8")
+            ts_ns = (1700000000 + idx * 10) * 1_000_000_000
+            os.utime(bkp, ns=(ts_ns, ts_ns))
+        tmp_f = Path(self.lane2) / ".session_index.jsonl.9999.tmp"
+        tmp_f.write_text("stale\n", encoding="utf-8")
+
+        hist_db = Path(self.lane2) / "thread_history_1.sqlite"
+        c_hist = sqlite3.connect(str(hist_db))
+        c_hist.execute("CREATE TABLE thread_items (id TEXT PRIMARY KEY, thread_id TEXT, payload BLOB)")
+        c_hist.execute("INSERT INTO thread_items VALUES (?, ?, ?)", ("item-1", "t-old", b"X" * 1024))
+        c_hist.commit()
+        c_hist.close()
+
+        out_buf = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "sync-sessions.py",
+                    "--source",
+                    self.lane1,
+                    "--target",
+                    self.lane2,
+                    "--compact-storage",
+                    "--fast",
+                    "--max-backups",
+                    "2",
+                    "--json",
+                ],
+            ),
+            contextlib.redirect_stdout(out_buf),
+        ):
+            rc = sync_mod.main()
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(out_buf.getvalue())
+        comp = payload["forward"]["compaction"]
+        self.assertEqual(comp["backups_pruned"], 3)
+        self.assertEqual(comp["tmp_pruned"], 1)
+        self.assertFalse(tmp_f.exists())
+        # thread_history_1.sqlite must remain untouched in --fast mode.
+        c_after = sqlite3.connect(str(hist_db))
+        self.assertEqual(c_after.execute("SELECT COUNT(*) FROM thread_items").fetchone()[0], 1)
+        c_after.close()
+
 
 if __name__ == "__main__":
     unittest.main()

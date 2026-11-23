@@ -3665,7 +3665,7 @@ function Invoke-ActionQuickThirdParty {
         Write-Ok "Da cap nhat & khoa 2-step NTFS DACL cho: $lane2Cfg (daemon_auto_start=false, zero plaintext key)"
 
         [void](Invoke-HistorySync -SourceHome $Lane1Home -TargetHome $Lane2Home -Bidirectional)
-        [void](Invoke-ActionCleanupStorage)
+        [void](Invoke-ActionCleanupStorage -Fast)
         return 0
     } finally {
         $plainKey = $null
@@ -3673,9 +3673,18 @@ function Invoke-ActionQuickThirdParty {
 }
 
 function Invoke-ActionCleanupStorage {
-    Write-Section '[8] Quan Ly & Toi Uu Dung Luong RAM / ROM (CleanupStorage)'
+    param(
+        [switch]$Fast
+    )
+    if ($Fast) {
+        Write-Info 'Don dep nhanh backup/tmp & WAL Sandbox 2 (che do nhanh, khong khoa DB lon)...'
+    } else {
+        Write-Section '[8] Quan Ly & Toi Uu Dung Luong RAM / ROM (CleanupStorage)'
+    }
     $beforeUsage = Get-BoundedDirectoryUsage -DirPath $Lane2Home
-    Write-Info ("Dung luong Sandbox 2 truoc don dep: total={0} (sqlite={1}, backups={2}, files={3})" -f (Format-ByteSize $beforeUsage.TotalBytes), (Format-ByteSize $beforeUsage.SqliteBytes), (Format-ByteSize $beforeUsage.BackupBytes), $beforeUsage.FileCount)
+    if (-not $Fast) {
+        Write-Info ("Dung luong Sandbox 2 truoc don dep: total={0} (sqlite={1}, backups={2}, files={3})" -f (Format-ByteSize $beforeUsage.TotalBytes), (Format-ByteSize $beforeUsage.SqliteBytes), (Format-ByteSize $beforeUsage.BackupBytes), $beforeUsage.FileCount)
+    }
 
     $prunedCfg = Rotate-FileBackups -BaseFilePath (Join-Path $Lane2Home 'config.toml') -MaxKeep $MaxBackups
     $prunedAuth = Rotate-FileBackups -BaseFilePath (Join-Path $Lane2Home 'auth.json') -MaxKeep $MaxBackups
@@ -3699,7 +3708,11 @@ function Invoke-ActionCleanupStorage {
     $syncScript = Join-Path $script:KitRoot 'scripts\sync-sessions.py'
     if ($py -and (Test-Path -LiteralPath $syncScript -PathType Leaf) -and (Test-Path -LiteralPath $Lane1Home -PathType Container) -and (Test-Path -LiteralPath $Lane2Home -PathType Container)) {
         $cArgs = @('-B', $syncScript, '--source', $Lane1Home, '--target', $Lane2Home, '--compact-storage', '--max-backups', "$MaxBackups")
+        if ($Fast) { $cArgs += '--fast' }
         if ($script:IsDryRun) { $cArgs += '--dry-run' }
+        if (-not $Fast -and (-not $script:IsDryRun) -and $beforeUsage.SqliteBytes -gt 33554432) {
+            Write-Info 'Dang toi uu & nen SQLite (co the mat 10-60 giay voi DB > 32 MiB; vui long doi)...'
+        }
         $prevPref = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
@@ -3765,7 +3778,7 @@ function Invoke-ActionLaunch {
         return 0
     }
 
-    [void](Invoke-ActionCleanupStorage)
+    [void](Invoke-ActionCleanupStorage -Fast)
     Push-Location -LiteralPath $selectedRepo
     try {
         if (Test-Path -LiteralPath $codexWrapper -PathType Leaf) {

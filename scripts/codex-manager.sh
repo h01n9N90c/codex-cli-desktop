@@ -2152,11 +2152,18 @@ select_mandatory_project_dir() {
 }
 
 action_cleanup_storage() {
-  echo "=== [8] Quan Ly & Toi Uu Dung Luong RAM / ROM (cleanup-storage) ==="
-  [ "${DRY_RUN}" -eq 1 ] && echo "[DRY-RUN MODE] Inspecting storage without mutating disk."
+  local fast_mode=0
+  if [ "${1:-}" = "--fast" ]; then
+    fast_mode=1
+  fi
+  if [ "${fast_mode}" -eq 0 ]; then
+    echo "=== [8] Quan Ly & Toi Uu Dung Luong RAM / ROM (cleanup-storage) ==="
+    [ "${DRY_RUN}" -eq 1 ] && echo "[DRY-RUN MODE] Inspecting storage without mutating disk."
+  fi
 
   if [ -n "${PY_BIN}" ] && [ -f "${KIT_ROOT}/scripts/sync-sessions.py" ] && [ -d "${LANE1_HOME}" ] && [ -d "${LANE2_HOME}" ]; then
     local c_args=("${KIT_ROOT}/scripts/sync-sessions.py" --source "${LANE1_HOME}" --target "${LANE2_HOME}" --compact-storage --max-backups "${MAX_BACKUPS}")
+    [ "${fast_mode}" -eq 1 ] && c_args+=(--fast)
     [ "${DRY_RUN}" -eq 1 ] && c_args+=(--dry-run)
     "${PY_BIN}" -B "${c_args[@]}" >/dev/null 2>&1 || true
   fi
@@ -2352,7 +2359,7 @@ PY
   validate_toml_file "${cfg2}"
   lock_file_0600 "${cfg2}"
   run_bidirectional_sync 0
-  action_cleanup_storage >/dev/null 2>&1 || true
+  action_cleanup_storage --fast >/dev/null 2>&1 || true
   echo "[OK] Quick 3rd-party gateway configured cleanly for Sandbox 2 (provider=${eff_prov}, model=${eff_model})."
 }
 
@@ -2382,7 +2389,7 @@ action_launch() {
     return 0
   fi
 
-  action_cleanup_storage >/dev/null 2>&1 || true
+  action_cleanup_storage --fast >/dev/null 2>&1 || true
   cd -P -- "${chosen_repo}"
   exec "${LOCAL_BIN}/codex"
 }
