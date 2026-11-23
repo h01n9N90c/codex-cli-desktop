@@ -1845,6 +1845,16 @@ function Invoke-OnlineModelsProbe {
         Write-FailLine "Invalid probe URL: $endpoint"
         return 1
     }
+    # SECURITY: the Bearer key is only ever sent over HTTPS. Plain HTTP is allowed solely for loopback
+    # hosts (local mock servers / tests); any other http:// URL is refused BEFORE a request is built.
+    if ($parsedUri.Scheme -ne 'https' -and -not $parsedUri.IsLoopback) {
+        Write-FailLine "Online API Key Check: REFUSED (https_required: API key is never sent over plain HTTP to non-loopback hosts) | endpoint=$endpoint"
+        return 1
+    }
+    if (-not [string]::IsNullOrEmpty($parsedUri.UserInfo)) {
+        Write-FailLine 'Online API Key Check: REFUSED (credentials_in_url_not_allowed)'
+        return 1
+    }
 
     try {
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
@@ -1857,13 +1867,19 @@ function Invoke-OnlineModelsProbe {
         $req.Timeout = 10000
         $req.ReadWriteTimeout = 10000
         $req.Accept = 'application/json'
-        $req.UserAgent = 'codex-dual-lane-kit/1.4.0'
+        $req.UserAgent = 'codex-dual-lane-kit/1.4.1'
+        # SECURITY: never follow redirects while carrying the Authorization header.
+        $req.AllowAutoRedirect = $false
         $req.Headers['Authorization'] = "Bearer $ApiKey"
 
         $resp = $req.GetResponse()
         try {
             $httpResp = [System.Net.HttpWebResponse]$resp
             $statusCode = [int]$httpResp.StatusCode
+            if ($statusCode -ge 300 -and $statusCode -lt 400) {
+                Write-WarnLine "Online API Key Check: REDIRECT_BLOCKED (HTTP $statusCode; redirects are never followed with an API key) | endpoint=$endpoint"
+                return 1
+            }
             $sr = New-Object System.IO.StreamReader($httpResp.GetResponseStream(), [System.Text.Encoding]::UTF8)
             try { $body = $sr.ReadToEnd() } finally { $sr.Dispose() }
 
@@ -1894,6 +1910,9 @@ function Invoke-OnlineModelsProbe {
                 } elseif ($code -eq 429) {
                     Write-WarnLine "Online API Key Check: QUOTA/RATE_LIMITED (HTTP 429) | endpoint=$endpoint"
                     return 0
+                } elseif ($code -ge 300 -and $code -lt 400) {
+                    Write-WarnLine "Online API Key Check: REDIRECT_BLOCKED (HTTP $code; redirects are never followed with an API key) | endpoint=$endpoint"
+                    return 1
                 } else {
                     Write-WarnLine "Online API Key Check: HTTP $code | endpoint=$endpoint"
                     return 1

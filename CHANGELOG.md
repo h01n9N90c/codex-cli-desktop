@@ -6,6 +6,23 @@ The format follows semantic versioning (`MAJOR.MINOR.PATCH`).
 
 ---
 
+## [1.4.1] — 2026-11-23 (Online API Probe HTTPS/No-Redirect Hardening & Explicit Opt-In Project Trust)
+
+### Fixed
+- **Fixed (Security — High): Online API Key Probe HTTPS-Only & No-Redirect Enforcement (`scripts/codex-manager.sh` & `scripts/codex-manager.ps1`):**
+  - Enforced **HTTPS-only** for all remote `/models` probe URLs (plain `http://` is permitted strictly on loopback `127.0.0.1` / `localhost` / `::1` for local mock testing; any non-loopback `http://` URL or URL containing embedded `user:pass@` credentials is refused fail-closed with `REFUSED (https_required...)` BEFORE building an HTTP request).
+  - Disabled automatic HTTP redirect following while carrying the `Authorization: Bearer ...` header (`_NoRedirect` `HTTPRedirectHandler` in Python `urllib` on Unix; `$req.AllowAutoRedirect = $false` in .NET `HttpWebRequest` on Windows), blocking `3xx` redirects (`REDIRECT_BLOCKED`) so an attacker-controlled or misconfigured endpoint can never redirect an API key to another host.
+- **Fixed (Security — Medium): Explicit Opt-In Project Trust (`-TrustRepoPath` / `--trust-repo-path` in `scripts/setup-dual-lane.ps1` & `scripts/setup-dual-lane.sh`):**
+  - Setup scripts no longer implicitly write `trust_level = "trusted"` for `-RepoPath` / `--repo-path` (or the Lane 2 worktree) without explicit user confirmation: pre-existing `trusted`, `untrusted`, or unset trust states are preserved untouched by default (allowing Codex itself to prompt for trust on first open).
+  - Added explicit opt-in switch `-TrustRepoPath` (Windows) / `--trust-repo-path` (Unix), default OFF, for users who deliberately want setup to record `-RepoPath` as `trust_level = "trusted"`.
+
+### Added
+- **Regression Tests (Windows Stage 12d / 13d2 & Unix CI Section 9f / 10d):**
+  - Verified remote plain-HTTP probe refusal (`REFUSED (https_required...)`) and two-endpoint loopback `302`/`307` redirect leak tests confirming the redirect target receives `0` requests and `0` `Authorization` headers on both Windows and Unix.
+  - Verified pre-existing `untrusted` `-RepoPath` stays `untrusted`, absent `-RepoPath` is not auto-trusted, and explicit `-TrustRepoPath` / `--trust-repo-path` is required to record `trust_level = "trusted"`.
+
+---
+
 ## [1.4.0] — 2026-11-23 (Interactive Sandbox 2 Control Center, API/Account Checkers & History-Preserving CLI Uninstall)
 
 ### Added

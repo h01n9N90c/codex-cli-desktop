@@ -1693,10 +1693,12 @@ Write-Output ("CRUD_OK|CWD=" + $cwd + "|FILES=" + $postTree.Count)
         Assert-True ($p12ProjMapL2.ContainsKey('c:\lane2\missing-trust-preexisting') -and $p12ProjMapL2['c:\lane2\missing-trust-preexisting'].Count -eq 1) 'Lane 2 pre-existing project missing trust_level was lost or duplicated!'
         Assert-True ($p12ProjMapL2['c:\lane2\missing-trust-preexisting'].Body -match 'custom_note = "preserve-without-trust-promotion"') 'Lane 2 pre-existing project missing trust_level lost its original body!'
         Assert-True ($p12ProjMapL2['c:\lane2\missing-trust-preexisting'].Body -notmatch 'trust_level\s*=') 'SECURITY REGRESSION: Lane 2 project missing trust_level had trust_level injected!'
-        # 6) Explicitly targeted relative -RepoPath '.' (canonicalized) and Lane 2 worktree ARE trusted.
-        Assert-True ($p12ProjMapL2.ContainsKey($p12Repo) -and $p12ProjMapL2[$p12Repo].Count -eq 1 -and $p12ProjMapL2[$p12Repo].Body -match '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') "Lane 2 config.toml did not record canonicalized trusted path for relative -RepoPath '.' ($p12Repo)!"
+        # 6) SECURITY: trust is NEVER raised implicitly. Without -TrustRepoPath, neither the relative -RepoPath '.'
+        #    nor the Lane 2 worktree may be written as trusted (Codex asks the user on first use instead).
         $p12ExpectedWt = Get-CanonicalLongPath -Path "$p12Repo-lane2"
-        Assert-True ($p12ProjMapL2.ContainsKey($p12ExpectedWt) -and $p12ProjMapL2[$p12ExpectedWt].Count -eq 1 -and $p12ProjMapL2[$p12ExpectedWt].Body -match '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') "Lane 2 config.toml did not trust Lane 2 worktree ($p12ExpectedWt)!"
+        Assert-True (-not $p12ProjMapL2.ContainsKey($p12Repo)) "SECURITY REGRESSION: -RepoPath '$p12Repo' was auto-trusted without explicit -TrustRepoPath!"
+        Assert-True (-not $p12ProjMapL2.ContainsKey($p12ExpectedWt)) "SECURITY REGRESSION: Lane 2 worktree '$p12ExpectedWt' was auto-trusted without explicit -TrustRepoPath!"
+        Assert-True ($resP12Inst.Output -match 'Project trust left unchanged') "Setup did not announce that project trust was left unchanged:`n$($resP12Inst.Output)"
         # Validate generated Lane 2 config.toml parses cleanly as valid TOML (catches duplicate headers/syntax bugs on Python 3.11+).
         $tomlCheckPy = @'
 import pathlib, sys
@@ -1829,7 +1831,36 @@ if sys.version_info >= (3, 11):
         Assert-True ($p12BothMapL1.ContainsKey('c:\desktop\missing-trust-from-lane1') -and $p12BothMapL1['c:\desktop\missing-trust-from-lane1'].Body -notmatch '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') 'Lane 1 missing-trust project must NOT be promoted to trusted under -GatewayTargetLane Both!'
         $tomlCheckPy | & $py -B - $p12Cfg1
         Assert-True ($LASTEXITCODE -eq 0) "Generated Lane 1 config.toml (-GatewayTargetLane Both) failed strict TOML parse validation!"
-        Write-Host "    [OK] Strict Project Trust Boundaries + -ShareAuthToLane2 Guardrails + -ConfigureCliGateway/-CliApiKeyEnv + Relative -RepoPath + Git Bash POSIX Shims + Full Workspace File CRUD verified" -ForegroundColor Green
+        # 12d) Explicit-consent project trust (-TrustRepoPath):
+        #   - Pre-existing `untrusted` -RepoPath entry is PRESERVED when the switch is omitted.
+        #   - Absent -RepoPath entry is NOT created when the switch is omitted.
+        #   - Only an explicit -TrustRepoPath records -RepoPath as trusted.
+        $p12RepoEsc = ($p12Repo -replace '\\', '\\')
+        $p12Utf8 = New-Object System.Text.UTF8Encoding($false)
+        $p12TrustArgs = @(
+            '-RepoPath', $p12Repo, '-CodexPath', $p12CrudExe,
+            '-Lane1Home', $p12L1, '-Lane2Home', $p12L2, '-LocalBin', $p12Bin, '-SkipPathUpdate'
+        )
+        $p12UntrustedSeed = "[projects.`"$p12RepoEsc`"]`ntrust_level = `"untrusted`"`n"
+        [System.IO.File]::WriteAllText($p12Cfg2, $p12UntrustedSeed, $p12Utf8)
+        $resP12TrustOff = Invoke-PsScript -ScriptPath $SetupScript -Arguments $p12TrustArgs
+        Assert-True ($resP12TrustOff.ExitCode -eq 0) "Test 12d (no -TrustRepoPath, pre-existing untrusted) failed (exit=$($resP12TrustOff.ExitCode)):`n$($resP12TrustOff.Output)"
+        $p12TrustOffMap = & $parseProjectSections (Get-Content -LiteralPath $p12Cfg2 -Raw -Encoding UTF8)
+        Assert-True ($p12TrustOffMap.ContainsKey($p12Repo) -and $p12TrustOffMap[$p12Repo].Count -eq 1) 'Pre-existing untrusted -RepoPath entry was lost or duplicated without -TrustRepoPath!'
+        Assert-True ($p12TrustOffMap[$p12Repo].Body -match '(?m)^\s*trust_level\s*=\s*"untrusted"\s*$' -and $p12TrustOffMap[$p12Repo].Body -notmatch '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') 'SECURITY REGRESSION: untrusted -RepoPath was promoted to trusted without explicit -TrustRepoPath!'
+
+        [System.IO.File]::WriteAllText($p12Cfg2, "model = `"gpt-5.4`"`n", $p12Utf8)
+        $resP12TrustAbsent = Invoke-PsScript -ScriptPath $SetupScript -Arguments $p12TrustArgs
+        Assert-True ($resP12TrustAbsent.ExitCode -eq 0) "Test 12d (no -TrustRepoPath, absent entry) failed (exit=$($resP12TrustAbsent.ExitCode)):`n$($resP12TrustAbsent.Output)"
+        $p12TrustAbsentMap = & $parseProjectSections (Get-Content -LiteralPath $p12Cfg2 -Raw -Encoding UTF8)
+        Assert-True (-not $p12TrustAbsentMap.ContainsKey($p12Repo)) 'SECURITY REGRESSION: -RepoPath was auto-added as trusted without explicit -TrustRepoPath!'
+
+        $resP12TrustOn = Invoke-PsScript -ScriptPath $SetupScript -Arguments ($p12TrustArgs + @('-TrustRepoPath'))
+        Assert-True ($resP12TrustOn.ExitCode -eq 0) "Test 12d (-TrustRepoPath) failed (exit=$($resP12TrustOn.ExitCode)):`n$($resP12TrustOn.Output)"
+        Assert-True ($resP12TrustOn.Output -match '-TrustRepoPath \(explicit opt-in\)') "Setup did not announce explicit -TrustRepoPath opt-in:`n$($resP12TrustOn.Output)"
+        $p12TrustOnMap = & $parseProjectSections (Get-Content -LiteralPath $p12Cfg2 -Raw -Encoding UTF8)
+        Assert-True ($p12TrustOnMap.ContainsKey($p12Repo) -and $p12TrustOnMap[$p12Repo].Count -eq 1 -and $p12TrustOnMap[$p12Repo].Body -match '(?m)^\s*trust_level\s*=\s*"trusted"\s*$') 'Explicit -TrustRepoPath did not record -RepoPath as trusted!'
+        Write-Host "    [OK] Strict Project Trust Boundaries + -TrustRepoPath explicit consent (no implicit trust raise) + -ShareAuthToLane2 Guardrails + -ConfigureCliGateway/-CliApiKeyEnv + Relative -RepoPath + Git Bash POSIX Shims + Full Workspace File CRUD verified" -ForegroundColor Green
     } finally {
         Remove-TempTreeSafely -RootDir $null -Lane2Dir $p12L2
         try { git -C $p12Repo worktree remove -f "$p12Repo-lane2" 2>$null } catch {}
@@ -2336,6 +2367,107 @@ env_key = "CODEX_P13_PROBE_KEY"
             try { $null = $httpPs.EndInvoke($httpAsync) } catch {}
             $httpPs.Dispose()
             $httpReadyEvt.Dispose()
+        }
+
+        # 13d2) SECURITY: the online probe must (1) refuse plain HTTP to non-loopback hosts BEFORE any request is
+        #       made, and (2) NEVER follow an HTTP redirect while carrying the Bearer key (the redirect target
+        #       must never receive the Authorization header).
+        $redirKey = 'sk-CANARY-P13-REDIRECT-55667788'
+        $prevProbeEnv2 = $env:CODEX_P13_PROBE_KEY
+        try {
+            $env:CODEX_P13_PROBE_KEY = $redirKey
+
+            # (1) Remote plain-HTTP URL is refused (nothing is ever sent).
+            $p13RemoteCfg = @"
+model_provider = "remotehttp"
+sandbox_mode = "workspace-write"
+
+[model_providers.remotehttp]
+name = "RemoteHttp"
+base_url = "http://remote-gateway.example.invalid/v1"
+wire_api = "responses"
+env_key = "CODEX_P13_PROBE_KEY"
+"@
+            [System.IO.File]::WriteAllText($p13Cfg2Path, $p13RemoteCfg, (New-Object System.Text.UTF8Encoding($false)))
+            $res13dHttp = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                '-Action', 'CheckApiKey', '-OnlineCheck', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+                '-LocalBin', $p13Bin, '-NonInteractive'
+            )
+            Assert-True ($res13dHttp.ExitCode -eq 1) "CheckApiKey must exit 1 for a remote http:// probe URL (got $($res13dHttp.ExitCode)):`n$($res13dHttp.Output)"
+            Assert-True ($res13dHttp.Output -match 'REFUSED \(https_required') "CheckApiKey did not refuse remote plain-HTTP probe:`n$($res13dHttp.Output)"
+            Assert-True (-not $res13dHttp.Output.Contains($redirKey)) 'CRITICAL: CheckApiKey leaked plaintext API key on refused HTTP probe!'
+
+            # (2) Loopback redirect: server A answers 302 -> server B; B must NEVER be contacted.
+            $tcpA = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0); $tcpA.Start()
+            $redirPortA = ([System.Net.IPEndPoint]$tcpA.LocalEndpoint).Port; $tcpA.Stop()
+            $tcpB = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0); $tcpB.Start()
+            $redirPortB = ([System.Net.IPEndPoint]$tcpB.LocalEndpoint).Port; $tcpB.Stop()
+            $p13RedirCfg = @"
+model_provider = "redirmock"
+sandbox_mode = "workspace-write"
+
+[model_providers.redirmock]
+name = "RedirMock"
+base_url = "http://127.0.0.1:$redirPortA/v1"
+wire_api = "responses"
+env_key = "CODEX_P13_PROBE_KEY"
+"@
+            [System.IO.File]::WriteAllText($p13Cfg2Path, $p13RedirCfg, (New-Object System.Text.UTF8Encoding($false)))
+
+            $redirState = [hashtable]::Synchronized(@{ TargetHits = 0; TargetAuth = '' })
+            $redirReady = New-Object System.Threading.ManualResetEventSlim($false)
+            $redirListener = New-Object System.Net.HttpListener
+            $redirListener.Prefixes.Add("http://127.0.0.1:$redirPortA/")
+            $redirListener.Prefixes.Add("http://127.0.0.1:$redirPortB/")
+            $redirPs = [PowerShell]::Create()
+            $null = $redirPs.AddScript({
+                param($Listener, $Ready, $State, $PortA, $PortB)
+                try {
+                    $Listener.Start()
+                    $Ready.Set()
+                    while ($Listener.IsListening) {
+                        try { $ctx = $Listener.GetContext() } catch { break }
+                        try {
+                            if ($ctx.Request.Url.Port -eq $PortA) {
+                                $ctx.Response.StatusCode = 302
+                                $ctx.Response.RedirectLocation = "http://127.0.0.1:$PortB/v1/models"
+                                $payload = [System.Text.Encoding]::UTF8.GetBytes('redirect')
+                            } else {
+                                $State.TargetHits = [int]$State.TargetHits + 1
+                                $State.TargetAuth = [string]$ctx.Request.Headers['Authorization']
+                                $ctx.Response.StatusCode = 200
+                                $payload = [System.Text.Encoding]::UTF8.GetBytes('{"data":[{"id":"leaked"}]}')
+                            }
+                            $ctx.Response.ContentLength64 = $payload.Length
+                            $ctx.Response.OutputStream.Write($payload, 0, $payload.Length)
+                        } finally {
+                            try { $ctx.Response.Close() } catch {}
+                        }
+                    }
+                } finally {
+                    $Ready.Set()
+                }
+            }).AddArgument($redirListener).AddArgument($redirReady).AddArgument($redirState).AddArgument($redirPortA).AddArgument($redirPortB)
+            $redirAsync = $redirPs.BeginInvoke()
+            try {
+                Assert-True ($redirReady.Wait(5000)) 'Local redirect mock HttpListener did not start in time'
+                $res13dRedir = Invoke-PsScript -ScriptPath $ManagerScript -Arguments @(
+                    '-Action', 'CheckApiKey', '-OnlineCheck', '-Lane1Home', $p13L1, '-Lane2Home', $p13L2,
+                    '-LocalBin', $p13Bin, '-NonInteractive'
+                )
+                Assert-True ($res13dRedir.ExitCode -eq 1) "CheckApiKey must exit 1 when the probe endpoint redirects (got $($res13dRedir.ExitCode)):`n$($res13dRedir.Output)"
+                Assert-True ($res13dRedir.Output -match 'REDIRECT_BLOCKED \(HTTP 302') "CheckApiKey did not report REDIRECT_BLOCKED:`n$($res13dRedir.Output)"
+                Assert-True ([int]$redirState.TargetHits -eq 0) "SECURITY REGRESSION: probe followed a redirect (target hit $($redirState.TargetHits)x, Authorization header seen: '$($redirState.TargetAuth)')!"
+                Assert-True (-not $res13dRedir.Output.Contains($redirKey)) 'CRITICAL: CheckApiKey leaked plaintext API key on redirect probe!'
+            } finally {
+                try { $redirListener.Stop() } catch {}
+                try { $redirListener.Close() } catch {}
+                try { $null = $redirPs.EndInvoke($redirAsync) } catch {}
+                $redirPs.Dispose()
+                $redirReady.Dispose()
+            }
+        } finally {
+            if ($null -eq $prevProbeEnv2) { Remove-Item Env:CODEX_P13_PROBE_KEY -ErrorAction SilentlyContinue } else { $env:CODEX_P13_PROBE_KEY = $prevProbeEnv2 }
         }
 
         # 13e) CheckAccounts strictly 100% read-only on BOTH Lane 1 & Lane 2 + via codex-manage.cmd wrapper!

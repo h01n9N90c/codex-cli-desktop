@@ -140,6 +140,12 @@
     Prompts securely via Read-Host -AsSecureString and stores the key only in User environment
     variable -GatewayApiKeyEnv (never echoed, never written to config.toml).
 
+.PARAMETER TrustRepoPath
+    Explicit opt-in (default OFF): record `-RepoPath` (and the Lane 2 worktree, if any) as
+    `trust_level = "trusted"` in the generated Codex config.toml. Without this switch setup NEVER
+    raises trust: existing `trusted`/`untrusted`/unset entries are preserved exactly, and Codex asks
+    for trust itself the first time it opens an unknown project.
+
 .PARAMETER ShareAuthToLane2
     Opt-in (off by default): copies Lane 1's authenticated `auth.json` (if present) into Lane 2
     (`~/.codex-official\auth.json`), tracks it in the rollback journal, and locks its NTFS DACL via
@@ -224,6 +230,7 @@ param(
     [switch]$PromptGatewayApiKey,
     [Alias('ShareOfficialAuth')]
     [switch]$ShareAuthToLane2,
+    [switch]$TrustRepoPath,
     [switch]$SyncSessions,
     [switch]$PinnedOnlySync,
     [switch]$InstallBridgeTemplate,
@@ -2152,11 +2159,20 @@ Assert-NotReparsePoint -PathValue $lane2ConfigPath -Label 'Lane 2 config.toml'
 # Strictly read-only harvest of `[projects.*]` trust boundaries from Lane 2 and Lane 1 (Codex Desktop):
 #   - `trusted` stays `trusted`, `untrusted` stays `untrusted` (never promoted to `trusted`).
 #   - Missing/unrecognized `trust_level` entries are skipped from Lane 1 and preserved verbatim on Lane 2.
-#   - Only explicitly targeted `-RepoPath` (and optional Lane 2 worktree) is ensured `trust_level = "trusted"`.
+#   - `-RepoPath` (and optional Lane 2 worktree) is ensured `trust_level = "trusted"` ONLY with explicit `-TrustRepoPath`.
+# SECURITY: trust is NEVER raised implicitly. -RepoPath / the Lane 2 worktree are written as `trusted`
+# ONLY when the user explicitly passes -TrustRepoPath; otherwise their current trust_level (trusted,
+# untrusted, or unset) is preserved exactly and Codex prompts for trust on first use.
+$repoTrustTargets = if ($TrustRepoPath) { @($RepoPath, $effectiveLane2Repo) } else { @() }
+if ($TrustRepoPath) {
+    Write-Host "    [INFO] -TrustRepoPath (explicit opt-in): '$RepoPath' will be recorded as trust_level = ""trusted""." -ForegroundColor Yellow
+} else {
+    Write-Host "    [INFO] Project trust left unchanged for '$RepoPath' (pass -TrustRepoPath to explicitly mark it trusted; Codex will ask on first use otherwise)." -ForegroundColor DarkGray
+}
 $lane2ProjectState = Resolve-MergedProjectTrustState `
     -PrimaryConfigPath $lane2ConfigPath `
     -SecondaryConfigPath (Join-Path $Lane1Home 'config.toml') `
-    -EnsureTrustedPaths @($RepoPath, $effectiveLane2Repo)
+    -EnsureTrustedPaths $repoTrustTargets
 
 if ($configureGatewayLane2) {
     $lane2CleanBackup = Join-Path $Lane2Home 'config.backup.toml'
@@ -2384,7 +2400,7 @@ if ($configureGatewayLane1) {
     $lane1ProjectState = Resolve-MergedProjectTrustState `
         -PrimaryConfigPath $lane1ConfigPath `
         -SecondaryConfigPath $lane2ConfigPath `
-        -EnsureTrustedPaths @($RepoPath, $effectiveLane2Repo)
+        -EnsureTrustedPaths $repoTrustTargets
     $lane1ProjectsSection = if ($lane1ProjectState.ProjectsBlock) { "`r`n`r`n" + $lane1ProjectState.ProjectsBlock } else { '' }
 
     $lane1SectionsBlock = @"

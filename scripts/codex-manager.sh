@@ -1432,19 +1432,42 @@ action_check_api_key() {
       local probe_result=""
       # Pass API key strictly via Bash builtin printf -> stdin pipe (ZERO exposure in ps / argv / env!).
       probe_result="$(printf '%s\n' "${probe_key}" | "${PY_BIN}" -B -c '
-import json, sys, urllib.error, urllib.request
+import json, sys, urllib.error, urllib.parse, urllib.request
 url = sys.argv[1]
 key = sys.stdin.read().strip()
-if not url.startswith(("http://", "https://")):
+try:
+    parsed_url = urllib.parse.urlsplit(url)
+    scheme = parsed_url.scheme.lower()
+    host = (parsed_url.hostname or "").lower()
+except Exception:
     print("NETWORK_ERROR (invalid_url)")
     sys.exit(0)
+# SECURITY: the Bearer key is only ever sent over HTTPS. Plain HTTP is allowed solely for loopback
+# hosts (local mock servers / tests); any other http:// URL is refused BEFORE a request is built.
+if scheme == "https" and host:
+    pass
+elif scheme == "http" and host in ("127.0.0.1", "localhost", "::1"):
+    pass
+else:
+    print("REFUSED (https_required: API key is never sent over plain HTTP to non-loopback hosts)")
+    sys.exit(0)
+if parsed_url.username or parsed_url.password:
+    print("REFUSED (credentials_in_url_not_allowed)")
+    sys.exit(0)
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # SECURITY: never follow redirects while carrying the Authorization header.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+opener = urllib.request.build_opener(_NoRedirect())
 req = urllib.request.Request(
     url,
-    headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "codex-dual-lane-manager/1.4.0"},
+    headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "codex-dual-lane-manager/1.4.1"},
     method="GET",
 )
 try:
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with opener.open(req, timeout=10) as resp:
         code = resp.getcode()
         body = resp.read().decode("utf-8", errors="replace")
         n_models = None
@@ -1465,6 +1488,8 @@ except urllib.error.HTTPError as e:
         print(f"INVALID/EXPIRED (HTTP {e.code})")
     elif e.code == 429:
         print(f"QUOTA/RATE_LIMITED (HTTP {e.code})")
+    elif 300 <= e.code < 400:
+        print(f"REDIRECT_BLOCKED (HTTP {e.code}: redirects are never followed with an API key)")
     else:
         print(f"HTTP_ERROR (HTTP {e.code})")
 except Exception as e:

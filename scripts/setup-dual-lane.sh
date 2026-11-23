@@ -88,7 +88,8 @@ Options:
   --gateway-model SLUG        Optional default model and review_model slug for the gateway lane
   --gateway-api-key-env VAR   Environment variable referenced by env_key (default: CODEX_GATEWAY_API_KEY)
   --cli-api-key-env VAR       Alias for --gateway-api-key-env
-  --share-auth-to-lane2       Opt-in: read-only copy Lane 1 Desktop auth.json to Lane 2 CLI (0600, tracked; avoid mixing with third-party gateways) (alias: --share-official-auth)
+  --trust-repo-path           Explicit opt-in: write REPO_PATH (and Lane 2 worktree) as trust_level = "trusted"; default OFF (trust is never raised implicitly)
+--share-auth-to-lane2       Opt-in: read-only copy Lane 1 Desktop auth.json to Lane 2 CLI (0600, tracked; avoid mixing with third-party gateways) (alias: --share-official-auth)
   --install-bridge            Copy templates/DUAL_LANE_BRIDGE.md into <repo>/artifacts/dual-lane/
   --sync-sessions             Run scripts/sync-sessions.py after install (requires python3)
   --pinned-only               With --sync-sessions, only sync pinned threads
@@ -475,6 +476,7 @@ GATEWAY_BASE_URL="${CODEX_GATEWAY_BASE_URL:-}"
 GATEWAY_MODEL="${CODEX_GATEWAY_MODEL:-}"
 GATEWAY_API_KEY_ENV="${CODEX_GATEWAY_API_KEY_ENV:-CODEX_GATEWAY_API_KEY}"
 SHARE_AUTH_TO_LANE2=0
+TRUST_REPO_PATH=0
 INSTALL_BRIDGE=0
 SYNC_SESSIONS=0
 PINNED_ONLY=0
@@ -542,6 +544,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --share-auth-to-lane2|--share-official-auth)
       SHARE_AUTH_TO_LANE2=1
+      shift
+      ;;
+    --trust-repo-path)
+      TRUST_REPO_PATH=1
       shift
       ;;
     --install-bridge)
@@ -941,6 +947,14 @@ fi
 #     with full workspace directory tree traversal and file read/write/edit/delete inside
 #     `sandbox_mode = "workspace-write"`.
 
+# SECURITY: trust is NEVER raised implicitly. REPO_PATH / the Lane 2 worktree are written as
+# trust_level = "trusted" ONLY with explicit --trust-repo-path; otherwise any existing trust_level
+# (trusted / untrusted / unset) is preserved and Codex prompts for trust on first use.
+if [ "${TRUST_REPO_PATH}" -eq 1 ]; then
+  echo "    [INFO] --trust-repo-path (explicit opt-in): '${REPO_PATH}' will be recorded as trust_level = \"trusted\"."
+else
+  echo "    [INFO] Project trust left unchanged for '${REPO_PATH}' (pass --trust-repo-path to explicitly mark it trusted; Codex will ask on first use otherwise)."
+fi
 ESC_REPO="$(escape_toml "${REPO_PATH}")"
 ESC_LANE2_REPO="$(escape_toml "${EFFECTIVE_LANE2_REPO}")"
 ESC_CARGO="$(escape_toml "${CARGO_TARGET_LANE2}")"
@@ -1232,9 +1246,14 @@ extract_harvested_lane1_projects() {
   if [ ! -f "${lane1_cfg}" ] || [ -L "${lane1_cfg}" ]; then
     return 0
   fi
+  local awk_repo_raw="" awk_wt_raw=""
+  if [ "${TRUST_REPO_PATH}" -eq 1 ]; then
+    awk_repo_raw="${REPO_PATH}"
+    awk_wt_raw="${EFFECTIVE_LANE2_REPO}"
+  fi
   AWK_EXISTING_SECTIONS="${existing_sections}" \
-  AWK_REPO_RAW="${REPO_PATH}" \
-  AWK_WT_RAW="${EFFECTIVE_LANE2_REPO}" \
+  AWK_REPO_RAW="${awk_repo_raw}" \
+  AWK_WT_RAW="${awk_wt_raw}" \
   awk '
     function strip_comment(s,    i, c, in_dq, in_sq, esc, out) {
       in_dq = 0; in_sq = 0; esc = 0; out = ""
@@ -1512,11 +1531,11 @@ render_lane2_config() {
     printf 'wire_api = "responses"\n'
     printf 'env_key = "%s"\n\n' "${ESC_GW_ENV}"
   fi
-  if ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${REPO_PATH}"; then
+  if [ "${TRUST_REPO_PATH}" -eq 1 ] && ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${REPO_PATH}"; then
     printf '[projects."%s"]\n' "${ESC_REPO}"
     printf 'trust_level = "trusted"\n\n'
   fi
-  if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}"; then
+  if [ "${TRUST_REPO_PATH}" -eq 1 ] && [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${PRESERVED_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}"; then
     printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
     printf 'trust_level = "trusted"\n\n'
   fi
@@ -1640,11 +1659,11 @@ if [ "${GATEWAY_ON_LANE1}" -eq 1 ]; then
     printf 'model_catalog_url = "%s"\n' "${ESC_GW_MODELS_URL}"
     printf 'wire_api = "responses"\n'
     printf 'env_key = "%s"\n\n' "${ESC_GW_ENV}"
-    if ! has_project_section_in "${CFG1_USER_SECTIONS}" "${REPO_PATH}"; then
+    if [ "${TRUST_REPO_PATH}" -eq 1 ] && ! has_project_section_in "${CFG1_USER_SECTIONS}" "${REPO_PATH}"; then
       printf '[projects."%s"]\n' "${ESC_REPO}"
       printf 'trust_level = "trusted"\n\n'
     fi
-    if [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${CFG1_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}"; then
+    if [ "${TRUST_REPO_PATH}" -eq 1 ] && [ "${EFFECTIVE_LANE2_REPO}" != "${REPO_PATH}" ] && ! has_project_section_in "${CFG1_USER_SECTIONS}" "${EFFECTIVE_LANE2_REPO}"; then
       printf '[projects."%s"]\n' "${ESC_LANE2_REPO}"
       printf 'trust_level = "trusted"\n\n'
     fi

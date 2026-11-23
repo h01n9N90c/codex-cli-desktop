@@ -168,6 +168,7 @@
 | `-PromptGatewayApiKey` | `switch` | `false` | Nhập ẩn API key lúc chạy qua `Read-Host -AsSecureString` rồi lưu vào biến môi trường User `-GatewayApiKeyEnv` |
 | `-GatewayApiKey` | `string` | *(trống)* | *(Tương thích ngược — hạn chế dùng để tránh lưu trong lịch sử PowerShell)* Lưu key vào biến môi trường User `-GatewayApiKeyEnv`, không ghi vào `config.toml` |
 | `-ShareAuthToLane2` *(alias: `-ShareOfficialAuth`)* | `switch` | `false` | **Tùy chọn opt-in (tắt mặc định):** Sao chép nguyên tử `~/.codex/auth.json` (nếu có) sang `~/.codex-official/auth.json` kèm sao lưu rollback, khóa ACL 2 bước và cảnh báo `[WARN]` (giữ `~/.codex/auth.json` nguyên vẹn 100%). **Cảnh báo:** Tạo bản sao thứ 2 của `auth.json` trong Luồng 2 — **nên tránh hoặc thận trọng khi Luồng 2 cấu hình cổng API bên thứ 3**. |
+| `-TrustRepoPath` | `switch` | `false` | **Tùy chọn opt-in (tắt mặc định — v1.4.1):** Chỉ ghi `trust_level = "trusted"` cho `-RepoPath` (và worktree Luồng 2 nếu có) khi người dùng chủ động xác nhận bằng cờ này; mặc định không tự nâng mức tin cậy (giữ nguyên `trusted`/`untrusted`/chưa đặt để Codex tự hỏi xác nhận khi mở lần đầu). |
 | `-SyncSessions` | `switch` | `false` | Gọi `sync-sessions.py` để đồng bộ UPSERT `session_index.jsonl`, `Pinned` và `Goals` |
 | `-PinnedOnlySync` | `switch` | `false` | Khi dùng cùng `-SyncSessions`, chỉ đồng bộ các phiên đã ghim (`Pinned`) |
 | `-InstallBridgeTemplate` | `switch` | `false` | Tạo tệp mẫu `artifacts/dual-lane/DUAL_LANE_BRIDGE.md` trong `-RepoPath` |
@@ -213,6 +214,7 @@
 | `--gateway-model SLUG` | *(trống)* | Model mặc định cho luồng đích khi bật `--configure-cli-gateway` / `--configure-gateway` |
 | `--gateway-api-key-env VAR` *(alias: `--cli-api-key-env VAR`)* | `CODEX_GATEWAY_API_KEY` | Tên biến môi trường chứa API key được tham chiếu qua `env_key` |
 | `--share-auth-to-lane2` *(alias: `--share-official-auth`)* | tắt | **Tùy chọn opt-in (tắt mặc định):** Sao chép nguyên tử `~/.codex/auth.json` (nếu có) sang `~/.codex-official/auth.json` với `chmod 600`, theo dõi rollback và cảnh báo `[WARN]` (giữ `~/.codex/auth.json` nguyên vẹn 100%). **Cảnh báo:** Tạo bản sao thứ 2 của `auth.json` trong Luồng 2 — **nên tránh hoặc thận trọng khi Luồng 2 cấu hình cổng API bên thứ 3**. |
+| `--trust-repo-path` | tắt | **Tùy chọn opt-in (tắt mặc định — v1.4.1):** Chỉ ghi `trust_level = "trusted"` cho `--repo-path` (và worktree Luồng 2 nếu có) khi người dùng chủ động xác nhận bằng cờ này; mặc định không tự nâng mức tin cậy. |
 | `--install-bridge` | tắt | Chép `templates/DUAL_LANE_BRIDGE.md` vào `<repo>/artifacts/dual-lane/` |
 | `--sync-sessions` | tắt | Chạy `scripts/sync-sessions.py` sau khi cài |
 | `--pinned-only` | tắt | Đi cùng `--sync-sessions`, chỉ đồng bộ các phiên đã ghim |
@@ -255,7 +257,7 @@
 | `-Lane2Home` | `--lane2-home` | `~/.codex-official` | Thư mục `CODEX_HOME` của **Sandbox 2** (Codex CLI) |
 | `-LocalBin` | `--local-bin` | `~/.local/bin` | Thư mục chứa 4 launcher CLI (`codex`, `codex-official`, `codex-t3`, `codex-manage`) |
 | `-CodexPath` | `--codex-path` | *(tự dò)* | Đường dẫn tường minh tới tệp thực thi `codex` |
-| `-OnlineCheck` | `--online-check` | `false` | Dùng cùng `CheckApiKey`/`check-api-key`: gửi probe `GET <base_url>/models` an toàn qua bộ nhớ tiến trình để kiểm tra `200 OK` / `401` / `429` / `NETWORK_ERROR` (0 rò rỉ key) |
+| `-OnlineCheck` | `--online-check` | `false` | Dùng cùng `CheckApiKey`/`check-api-key`: gửi probe `GET <base_url>/models` an toàn qua bộ nhớ tiến trình **chỉ qua HTTPS** (loopback `http://127.0.0.1`/`localhost`/`::1` chỉ dành cho test cục bộ) với **tắt tự động redirect** để kiểm tra `200 OK` / `401` / `429` / `REFUSED` / `REDIRECT_BLOCKED` / `NETWORK_ERROR` (0 rò rỉ key) |
 | `-DeviceAuth` | `--device-auth` | `false` | Dùng cùng `Login`/`login`: chạy `codex login --device-auth` cho môi trường terminal/SSH không mở trình duyệt |
 | `-Editor` | `--editor` | `$env:EDITOR` / `notepad.exe` *(Unix: `${VISUAL:-${EDITOR:-vi}}`)* | Trình soạn thảo mở trực tiếp `~/.codex-official/config.toml` khi chạy `ApiOther`/`api-other` |
 | `-ApiKeySecure` | *(chỉ Windows)* | *(trống)* | Truyền `[SecureString]` trong kịch bản PowerShell tự động cho `ApiGpt` (tuyệt đối không chấp nhận chuỗi plaintext trên CLI argv) |

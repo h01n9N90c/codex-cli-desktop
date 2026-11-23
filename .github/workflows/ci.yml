@@ -801,7 +801,8 @@ jobs:
           grep -Fq 'model = "p9-original"' "${P9_L2}/config.toml"
           grep -Fq '[projects."/tmp/desktop-trusted-proj"]' "${P9_L2}/config.toml"
           grep -Fq '[projects."/tmp/desktop-untrusted-proj"]' "${P9_L2}/config.toml"
-          grep -Fq "[projects.\"${P9_REPO_CANON}\"]" "${P9_L2}/config.toml"
+          # SECURITY: without --trust-repo-path the target repo must NOT be auto-trusted.
+          ! grep -Fq "[projects.\"${P9_REPO_CANON}\"]" "${P9_L2}/config.toml"
           ! grep -Fq '/tmp/desktop-no-trust-proj' "${P9_L2}/config.toml"
           ! grep -Fq '/tmp/desktop-invalid-trust-proj' "${P9_L2}/config.toml"
           ! grep -Eq '^[[:space:]]*(api_key|experimental_bearer_token)[[:space:]]*=' "${P9_L2}/config.toml"
@@ -818,7 +819,7 @@ jobs:
           assert "/tmp/lane2-preexisting-untrusted/" not in projects, projects
           assert "/tmp/desktop-no-trust-proj" not in projects, projects
           assert "/tmp/desktop-invalid-trust-proj" not in projects, projects
-          assert projects.get(repo_canon, {}).get("trust_level") == "trusted", projects
+          assert repo_canon not in projects, ("--repo-path was auto-trusted without --trust-repo-path", projects)
           PY
           [ -f "${P9_L2}/auth.json" ] && [ ! -L "${P9_L2}/auth.json" ]
           [ "$(sha256_of "${P9_L2}/auth.json")" = "${P9_L1_AUTH_HASH}" ]
@@ -849,6 +850,49 @@ jobs:
           [ ! -e "${P9_BIN}/codex-manage" ]
           [ -L "${P9_L2}/skills" ]
 
+          # 9f) v1.4.1 explicit-consent project trust (--trust-repo-path): trust is NEVER raised implicitly.
+          cat > "${P9_L2}/config.toml" <<EOF
+          model = "p9-original"
+          
+          [projects."${P9_REPO_CANON}"]
+          trust_level = "untrusted"
+          EOF
+          P9F_OFF_OUT="$(
+            cd "${P9_REPO}"
+            PATH="${FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+              "${KIT_ROOT_ABS}/scripts/setup-dual-lane.sh" --repo-path . 2>&1
+          )"
+          printf '%s\n' "${P9F_OFF_OUT}" | grep -Fq 'Project trust left unchanged'
+          python3 -B - "${P9_L2}/config.toml" "${P9_REPO_CANON}" <<'PY'
+          import pathlib, sys, tomllib
+          data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert data["projects"][sys.argv[2]]["trust_level"] == "untrusted", data
+          PY
+          printf 'model = "p9-original"\n' > "${P9_L2}/config.toml"
+          (
+            cd "${P9_REPO}"
+            PATH="${FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+              "${KIT_ROOT_ABS}/scripts/setup-dual-lane.sh" --repo-path . >/dev/null 2>&1
+          )
+          python3 -B - "${P9_L2}/config.toml" "${P9_REPO_CANON}" <<'PY'
+          import pathlib, sys, tomllib
+          data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert sys.argv[2] not in data.get("projects", {}), ("auto-trusted without --trust-repo-path", data)
+          PY
+          P9F_ON_OUT="$(
+            cd "${P9_REPO}"
+            PATH="${FAKE_BIN}:${PATH}" CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+              "${KIT_ROOT_ABS}/scripts/setup-dual-lane.sh" --repo-path . --trust-repo-path 2>&1
+          )"
+          printf '%s\n' "${P9F_ON_OUT}" | grep -Fq -- '--trust-repo-path (explicit opt-in)'
+          python3 -B - "${P9_L2}/config.toml" "${P9_REPO_CANON}" <<'PY'
+          import pathlib, sys, tomllib
+          data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert data["projects"][sys.argv[2]]["trust_level"] == "trusted", data
+          PY
+          CODEX_LANE1_HOME="${P9_L1}" CODEX_LANE2_HOME="${P9_L2}" CODEX_LOCAL_BIN="${P9_BIN}" \
+            ./scripts/restore-original.sh
+          
           # 10) v1.4.0 Interactive Sandbox 2 Control Center (`scripts/codex-manager.sh` & `codex-manage`):
           #     Tests ALL 6 actions end-to-end inside a path with spaces:
           #       10a) check-accounts (strictly read-only on GPT 1 & Sandbox 2, zero secret leakage, via codex-manage)
@@ -1091,7 +1135,9 @@ jobs:
           P10_PORT_FILE="${P10_DIR}/mock-port.txt"
           rm -f "${P10_PORT_FILE}"
 
-          P10_MOCK_VALID="${P10_VALID_KEY}" P10_MOCK_QUOTA="${P10_QUOTA_KEY}" \
+          P10_LEAK_FILE="${P10_DIR}/redirect-leak.txt"
+          rm -f "${P10_LEAK_FILE}"
+          P10_MOCK_VALID="${P10_VALID_KEY}" P10_MOCK_QUOTA="${P10_QUOTA_KEY}" P10_MOCK_LEAK="${P10_LEAK_FILE}" \
           "${PY_CMD}" -B - "${P10_PORT_FILE}" <<'PY' &
           import http.server, json, os, sys
 
@@ -1103,6 +1149,17 @@ jobs:
               def log_message(self, fmt, *args):
                   pass
               def do_GET(self):
+                  if self.path == "/redir/v1/models":
+                      self.send_response(302)
+                      self.send_header("Location", f"http://{self.headers.get('Host')}/leak/v1/models")
+                      self.end_headers()
+                      return
+                  if self.path == "/leak/v1/models":
+                      with open(os.environ["P10_MOCK_LEAK"], "a", encoding="utf-8") as fh:
+                          fh.write("HIT auth=" + ("yes" if self.headers.get("Authorization") else "no") + "\n")
+                      self.send_response(200)
+                      self.end_headers()
+                      return
                   if self.path != "/v1/models":
                       self.send_response(404)
                       self.end_headers()
@@ -1219,6 +1276,70 @@ jobs:
             echo "[FAIL] Section 10d: online 429 check-api-key leaked plaintext key!" >&2; exit 1
           fi
 
+          # SECURITY: remote plain-HTTP probe URLs are refused and redirects are NEVER followed with the key.
+          P10_ED_REMOTE="${P10_DIR}/fake-editor-remote-http.sh"
+          cat > "${P10_ED_REMOTE}" <<'EOF'
+          #!/usr/bin/env bash
+          cat > "$1" <<'TOML'
+          model_provider = "RemoteHttp"
+          sandbox_mode = "workspace-write"
+          
+          [model_providers."RemoteHttp"]
+          name = "RemoteHttp"
+          base_url = "http://remote-gateway.example.invalid/v1"
+          wire_api = "responses"
+          env_key = "MOCK_GW_API_KEY"
+          TOML
+          EOF
+          chmod +x "${P10_ED_REMOTE}"
+          ./scripts/codex-manager.sh --action api-other \
+            --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" \
+            --editor "${P10_ED_REMOTE}" --non-interactive
+          P10_REMOTE_OUT="$(
+            MOCK_GW_API_KEY="${P10_VALID_KEY}" \
+            ./scripts/codex-manager.sh --action check-api-key --online-check \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" --non-interactive 2>&1
+          )"
+          printf '%s\n' "${P10_REMOTE_OUT}" | grep -Fq 'REFUSED (https_required'
+          if printf '%s' "${P10_REMOTE_OUT}" | grep -Fq "${P10_VALID_KEY}"; then
+            echo "[FAIL] Section 10d: refused http probe leaked plaintext key!" >&2; exit 1
+          fi
+          
+          P10_ED_REDIR="${P10_DIR}/fake-editor-redirect.sh"
+          cat > "${P10_ED_REDIR}" <<EOF
+          #!/usr/bin/env bash
+          cat > "\$1" <<'TOML'
+          model_provider = "RedirMock"
+          sandbox_mode = "workspace-write"
+          
+          [model_providers."RedirMock"]
+          name = "RedirMock"
+          base_url = "http://127.0.0.1:${P10_MOCK_PORT}/redir/v1"
+          wire_api = "responses"
+          env_key = "MOCK_GW_API_KEY"
+          TOML
+          EOF
+          chmod +x "${P10_ED_REDIR}"
+          ./scripts/codex-manager.sh --action api-other \
+            --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" \
+            --editor "${P10_ED_REDIR}" --non-interactive
+          P10_REDIR_OUT="$(
+            MOCK_GW_API_KEY="${P10_VALID_KEY}" \
+            ./scripts/codex-manager.sh --action check-api-key --online-check \
+              --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" --non-interactive 2>&1
+          )"
+          printf '%s\n' "${P10_REDIR_OUT}" | grep -Fq 'REDIRECT_BLOCKED (HTTP 302'
+          if [ -s "${P10_LEAK_FILE}" ]; then
+            echo "[FAIL] Section 10d: probe FOLLOWED a redirect while carrying the API key: $(cat "${P10_LEAK_FILE}")" >&2; exit 1
+          fi
+          if printf '%s' "${P10_REDIR_OUT}" | grep -Fq "${P10_VALID_KEY}"; then
+            echo "[FAIL] Section 10d: redirect probe leaked plaintext key!" >&2; exit 1
+          fi
+          # Restore the clean MockLocal provider config used by the following sections.
+          ./scripts/codex-manager.sh --action api-other \
+            --lane1-home "${P10_L1}" --lane2-home "${P10_L2}" --local-bin "${P10_BIN}" \
+            --editor "${P10_ED_CLEAN}" --non-interactive
+          
           kill "${P10_MOCK_PID}" 2>/dev/null || true
           wait "${P10_MOCK_PID}" 2>/dev/null || true
           P10_MOCK_PID=""
