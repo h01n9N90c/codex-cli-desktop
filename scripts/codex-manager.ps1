@@ -721,6 +721,74 @@ function ConvertFrom-SecureStringPlain([System.Security.SecureString]$Sec) {
     }
 }
 
+function Read-MaskedSecretInteractive([string]$Prompt) {
+    <#
+    .SYNOPSIS
+        Reliable masked API-key input for Windows PowerShell 5.1 & 7+ (fixes the notorious
+        Read-Host -AsSecureString bug in Windows Terminal/ConPTY where Ctrl+V or Right-Click
+        paste only captures 1 character). Supports both direct paste and raw Ctrl+V clipboard read.
+    #>
+    try {
+        if ([Console]::IsInputRedirected) {
+            $line = Read-SingleLineFromStdinNoBom
+            if ($null -ne $line) { return $line.Trim() }
+            return ''
+        }
+    } catch {}
+
+    Write-Host -NoNewline ("$Prompt (Ctrl+V hoac Chuot phai de dan, xong bam Enter): ") -ForegroundColor Cyan
+    $sb = New-Object 'System.Text.StringBuilder'
+    try {
+        while ($true) {
+            $k = [Console]::ReadKey($true)
+            if ($k.Key -eq [System.ConsoleKey]::Enter) {
+                Write-Host ""
+                break
+            }
+            if ($k.Key -eq [System.ConsoleKey]::Escape) {
+                $sb.Clear() | Out-Null
+                Write-Host " [Huy]" -ForegroundColor DarkGray
+                return ''
+            }
+            if ($k.Key -eq [System.ConsoleKey]::Backspace) {
+                if ($sb.Length -gt 0) {
+                    $sb.Remove($sb.Length - 1, 1) | Out-Null
+                    Write-Host -NoNewline "`b `b"
+                }
+                continue
+            }
+            if ($k.Key -eq [System.ConsoleKey]::V -and (($k.Modifiers -band [System.ConsoleModifiers]::Control) -ne 0)) {
+                $clip = ''
+                try { $clip = [string](Get-Clipboard -Raw -ErrorAction Stop) } catch { $clip = '' }
+                if (-not [string]::IsNullOrWhiteSpace($clip)) {
+                    $firstLine = (($clip -split "\r?\n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+                    if ($null -ne $firstLine) {
+                        $cleanClip = $firstLine.Trim()
+                        if ($cleanClip.Length -gt 0) {
+                            [void]$sb.Append($cleanClip)
+                            Write-Host -NoNewline ("*" * [Math]::Min($cleanClip.Length, 16))
+                            Write-Host -NoNewline (" [Clipboard: $($cleanClip.Length) ky tu]") -ForegroundColor Green
+                        }
+                    }
+                }
+                continue
+            }
+            $ch = $k.KeyChar
+            if ([int]$ch -ge 32 -and [int]$ch -ne 127) {
+                [void]$sb.Append($ch)
+                Write-Host -NoNewline '*'
+            }
+        }
+        $val = $sb.ToString().Trim()
+        if ($val.Length -gt 0) {
+            Write-Info ("Da nhan API Key an toan: " + (Format-MaskedSecret $val))
+        }
+        return $val
+    } finally {
+        $sb.Clear() | Out-Null
+    }
+}
+
 function Get-EnvVarValueAndScope([string]$VarName) {
     if ([string]::IsNullOrWhiteSpace($VarName)) {
         return [PSCustomObject]@{ Value = ''; Scope = 'None' }
@@ -1872,10 +1940,9 @@ function Invoke-ActionApiGpt {
             }
         } elseif (-not $NonInteractive) {
             if ($script:IsDryRun) {
-                Write-Info '[DRY-RUN] Would prompt securely via Read-Host -AsSecureString for 1 OpenAI / GPT API key.'
+                Write-Info '[DRY-RUN] Would prompt securely via Read-MaskedSecretInteractive for 1 OpenAI / GPT API key.'
             } else {
-                $secInput = Read-Host -Prompt 'Nhap duy nhat 1 OpenAI / GPT API Key (an ky tu)' -AsSecureString
-                $plainKey = ConvertFrom-SecureStringPlain $secInput
+                $plainKey = Read-MaskedSecretInteractive -Prompt 'Nhap/Dan duy nhat 1 OpenAI / GPT API Key'
             }
         } else {
             if ($script:IsDryRun) {
@@ -3526,8 +3593,7 @@ function Invoke-ActionQuickThirdParty {
             if ($script:IsDryRun) {
                 Write-Info '[DRY-RUN] Would prompt securely for 3rd-party API key.'
             } else {
-                $secIn = Read-Host -Prompt '3/3. Dan API Key ben thu 3 (an ky tu, tu dong Trim)' -AsSecureString
-                $plainKey = (ConvertFrom-SecureStringPlain $secIn).Trim()
+                $plainKey = Read-MaskedSecretInteractive -Prompt '3/3. Dan API Key ben thu 3'
             }
         } elseif (-not $script:IsDryRun) {
             Write-FailLine 'NonInteractive QuickThirdParty requires -ApiKeySecure or -ApiKeyFromStdin.'
