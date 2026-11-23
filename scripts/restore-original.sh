@@ -699,12 +699,30 @@ if [ -n "${MANIFEST_FILE}" ] && { [ "${HAS_LINK_RECORDS}" -eq 1 ] || [ "${MANIFE
       lr_prior=""
       IFS=$'\t' read -r lr_created lr_target lr_bkp lr_prior <<< "${lrec}"
       if [ "${lr_created}" != "1" ]; then
-        if [ "${DRY_RUN}" -eq 0 ]; then
-          echo "    Preserved pre-existing symlink (not created by kit): ${lr_target}"
-        else
-          echo "    [DRY-RUN] Would preserve pre-existing symlink (not created by kit): ${lr_target}"
+        is_lane1_bridge_link=0
+        if [ "${REMOVE_LANE2_HOME}" -eq 1 ] && [ -L "${lr_target}" ]; then
+          lr_leaf="$(basename -- "${lr_target}")"
+          for sd in "${SHARED_DIRS[@]}"; do
+            if [ "${lr_leaf}" = "${sd}" ]; then
+              raw_link_dest="$(readlink "${lr_target}" 2>/dev/null || true)"
+              exp_l1="${LANE1_HOME%/}/${lr_leaf}"
+              norm_dest="${raw_link_dest%/}"
+              if [ -n "${norm_dest}" ] && [ "${norm_dest}" = "${exp_l1}" ]; then
+                is_lane1_bridge_link=1
+              fi
+              break
+            fi
+          done
         fi
-        continue
+        if [ "${is_lane1_bridge_link}" -ne 1 ]; then
+          if [ "${DRY_RUN}" -eq 0 ]; then
+            echo "    Preserved pre-existing symlink (not created by kit): ${lr_target}"
+          else
+            echo "    [DRY-RUN] Would preserve pre-existing symlink (not created by kit): ${lr_target}"
+          fi
+          continue
+        fi
+        echo "    Unlinking pre-existing Dual-Lane bridge symlink pointing to Lane 1 (--remove-lane2-home): ${lr_target}"
       fi
 
       unlinked_or_would_unlink=0

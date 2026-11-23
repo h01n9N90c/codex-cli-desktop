@@ -793,12 +793,41 @@ if ($hasSharedLinkRecordsProp) {
         $lrBkpRaw = [string](Get-JsonProp -Obj $lr -Name 'BackupDirPath')
 
         if (-not $lrCreated) {
-            if ($script:IsDryRun) {
-                Write-Host "    [DRY-RUN] Would preserve pre-existing Junction/link (not created by kit): $jPath" -ForegroundColor DarkGray
-            } else {
-                Write-Host "    Preserved pre-existing Junction/link (not created by kit): $jPath" -ForegroundColor DarkGray
+            # When -RemoveLane2Home is explicitly requested (e.g., RemoveSandbox2 after a 2nd/upgrade
+            # setup run recorded the prior kit Junctions as preexisting_link), safely detach a
+            # standard shared-dir Junction ONLY if its actual target points inside Lane1Home\<name>.
+            $isLane1BridgeJunction = $false
+            if ($RemoveLane2Home -and (Test-Path -LiteralPath $jPath)) {
+                $leafName = Split-Path -Leaf $jPath
+                if ($sharedDirs -contains $leafName) {
+                    try {
+                        $jItem = Get-Item -LiteralPath $jPath -Force -ErrorAction Stop
+                        if ($jItem.LinkType -eq 'Junction' -or ($jItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                            $rawTargets = @($jItem.Target | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                            $expectedL1 = (Resolve-CanonicalLongPath -PathValue (Join-Path $Lane1Home $leafName)).TrimEnd('\')
+                            foreach ($rt in $rawTargets) {
+                                $normRt = ([string]$rt) -replace '^(\\\\\?\\|\\\?\?\\)', ''
+                                try { $normRt = (Resolve-CanonicalLongPath -PathValue $normRt).TrimEnd('\') } catch { $normRt = $normRt.TrimEnd('\') }
+                                if ($normRt.Equals($expectedL1, [System.StringComparison]::OrdinalIgnoreCase)) {
+                                    $isLane1BridgeJunction = $true
+                                    break
+                                }
+                            }
+                        }
+                    } catch {
+                        $isLane1BridgeJunction = $false
+                    }
+                }
             }
-            continue
+            if (-not $isLane1BridgeJunction) {
+                if ($script:IsDryRun) {
+                    Write-Host "    [DRY-RUN] Would preserve pre-existing Junction/link (not created by kit): $jPath" -ForegroundColor DarkGray
+                } else {
+                    Write-Host "    Preserved pre-existing Junction/link (not created by kit): $jPath" -ForegroundColor DarkGray
+                }
+                continue
+            }
+            Write-Host "    Detaching pre-existing Dual-Lane bridge Junction pointing to Lane 1 (-RemoveLane2Home): $jPath" -ForegroundColor Yellow
         }
 
         $junctionDetachedOrWouldDetach = $false
